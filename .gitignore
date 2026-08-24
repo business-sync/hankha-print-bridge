@@ -7,3 +7,9 @@ dist-installers/
 *.zip
 *.log
 .DS_Store
+
+# Environment (keep .env.example tracked — it is the fallback the build reads, not just a
+# template, so a fresh clone still produces a correctly-numbered release)
+.env
+.env.local
+.env.*.local

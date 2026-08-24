@@ -16,9 +16,14 @@
  * install a runtime. Cross-compiling the Windows exe works from macOS; building the macOS .pkg
  * does not work anywhere else, so those steps are skipped with a warning rather than failing.
  *
+ * The version comes from APP_VERSION in `.env` (falling back to the tracked `.env.example`),
+ * read through the app's own loader so this script and the compiled binary can never disagree
+ * about how a value parses. It names the artifacts, stamps the macOS bundle and the Windows
+ * installer, and is inlined into the binary — which is then made to report it back.
+ *
  * Signing is opt-in through the environment and every hook is a no-op when its variable is
  * unset — the default build is unsigned, which is what the README's Gatekeeper/SmartScreen
- * notes are about:
+ * notes are about. Set these in `.env`, never in `.env.example`:
  *
  *   HANKHA_MACOS_SIGN_IDENTITY        Developer ID Application — signs the binary
  *   HANKHA_MACOS_INSTALLER_IDENTITY   Developer ID Installer   — signs the .pkg
@@ -40,14 +45,14 @@ import {
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { appVersion, syncManifestVersion } from './sync-version.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BIN_DIR = join(ROOT, 'dist-bin');
 const OUT_DIR = join(ROOT, 'dist-installers');
 const INSTALLER = join(ROOT, 'installer');
 
-const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
-const VERSION = pkg.version;
+const VERSION = appVersion();
 const IDENTIFIER = 'la.hankha.print-bridge';
 
 const args = process.argv.slice(2);
@@ -113,6 +118,11 @@ function compile(target, outfile) {
     'build',
     '--compile',
     '--minify',
+    // A shipped binary has no `.env` and no `package.json` beside it, so the version has to be
+    // substituted into the source expression at build time. `version.ts` is written to read
+    // exactly `process.env.APP_VERSION` for this reason.
+    '--define',
+    `process.env.APP_VERSION=${JSON.stringify(VERSION)}`,
     '--target',
     target,
     '--outfile',
@@ -145,9 +155,45 @@ function sha256(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
 }
 
+/**
+ * Make the binary say its own version back.
+ *
+ * The number is inlined by `--define`, and a `--define` that silently fails to apply leaves the
+ * binary reporting `0.0.0-dev` while every filename, plist and installer around it still says
+ * 1.2.0. The POS gates features on what `/health` reports, so that artifact would be wrong in
+ * the one place nobody checks by eye.
+ */
+function assertBinaryVersion(binary) {
+  const res = spawnSync(binary, ['--version'], { encoding: 'utf8' });
+  const reported = (res.stdout ?? '').trim();
+  if (res.status !== 0 || reported !== VERSION) {
+    throw new Error(
+      `The compiled binary reports ${JSON.stringify(reported) || '(nothing)'}, but this build ` +
+        `is ${VERSION}. Check that --define reached \`bun build\`.`
+    );
+  }
+  console.log(`   binary reports v${reported}`);
+}
+
+/**
+ * The same check for a binary this machine cannot execute. Weaker by nature — it only proves
+ * the string is in there — but the failure it is aimed at (the fallback compiled in instead of
+ * the real version) does not leave the number behind, so it still catches it.
+ */
+function assertVersionEmbedded(binary, label) {
+  if (!readFileSync(binary).includes(VERSION)) {
+    throw new Error(`The ${label} does not contain the string ${VERSION} — --define did not apply.`);
+  }
+}
+
 // ---------------------------------------------------------------- binaries
 
 step(`Building hankha-print-bridge v${VERSION}`);
+
+// `.env` is the source of truth; package.json only mirrors it, and `version.test.ts` fails when
+// the two drift. Rewrite the mirror here rather than making a bump two hand-edits.
+const synced = syncManifestVersion(VERSION);
+if (synced.length > 0) console.log(`   version ${VERSION} written to ${synced.join(', ')}`);
 rmSync(BIN_DIR, { recursive: true, force: true });
 mkdirSync(BIN_DIR, { recursive: true });
 mkdirSync(OUT_DIR, { recursive: true });
@@ -189,7 +235,7 @@ if (buildMac) {
     '--timestamp' + (identity ? '' : '=none'),
     ...(identity ? ['--options', 'runtime'] : []),
     '--sign',
-    identity ?? '-',
+    identity || '-',
     macBinary,
   ]);
   if (!identity) {
@@ -198,12 +244,16 @@ if (buildMac) {
         '`xattr -dr com.apple.quarantine <pkg>`, the first time.'
     );
   }
+
+  // After signing, so what is checked is byte-for-byte what goes into the .pkg and .dmg.
+  assertBinaryVersion(macBinary);
 }
 
 let winBinary = null;
 if (buildWin) {
   winBinary = join(BIN_DIR, 'hankha-print-bridge.exe');
   compile('bun-windows-x64', winBinary);
+  assertVersionEmbedded(winBinary, 'Windows exe');
   if (process.platform !== 'win32') {
     warn(
       'Cross-built from ' + process.platform + ', so the .exe carries no version/publisher ' +
@@ -407,7 +457,11 @@ if (buildWin) {
 
 // ---------------------------------------------------------------- checksums
 
-const artifacts = readdirSync(OUT_DIR).filter((f) => f !== 'SHA256SUMS.txt').sort();
+// Dotfiles are never artifacts, and Finder drops a .DS_Store in here the moment anyone opens
+// the folder or mounts the built .dmg — which then ships as a checksummed "release file".
+const artifacts = readdirSync(OUT_DIR)
+  .filter((f) => f !== 'SHA256SUMS.txt' && !f.startsWith('.'))
+  .sort();
 writeFileSync(
   join(OUT_DIR, 'SHA256SUMS.txt'),
   artifacts.map((f) => `${sha256(join(OUT_DIR, f))}  ${f}\n`).join('')
