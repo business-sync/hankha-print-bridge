@@ -1,0 +1,168 @@
+#!/bin/sh
+#
+# What runs when someone double-clicks Hankha Print Bridge.app.
+#
+# The app is a CONTROLLER, not the server. Opening it registers a per-user LaunchAgent that
+# points at the binary inside this bundle and hands the actual running to launchd — which is
+# what makes the bridge come back after a restart without anyone opening anything. That is why
+# this needs no administrator password: a LaunchAgent lives in the user's own home folder,
+# unlike the LaunchDaemon the .pkg installs.
+#
+# Every path out of here ends in a dialog. A helper that silently succeeds and a helper that
+# silently fails look identical on a till, and the till is where that difference is discovered.
+
+set -u
+
+APP_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+BIN="$APP_DIR/Contents/MacOS/hankha-print-bridge"
+LABEL="la.hankha.print-bridge"
+AGENTS="$HOME/Library/LaunchAgents"
+PLIST="$AGENTS/$LABEL.plist"
+LOG="$HOME/Library/Logs/hankha-print-bridge.log"
+PORT="${PRINT_BRIDGE_PORT:-9200}"
+UID_NUM="$(id -u)"
+
+# --------------------------------------------------------------------------- dialogs
+
+# Escape for an AppleScript string literal — a backslash or quote in a path would otherwise
+# end the literal and turn the dialog into a syntax error.
+esc() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+say() { # message, icon(note|caution|stop)
+  osascript -e "display dialog \"$(esc "$1")\" with title \"Hankha Print Bridge\" buttons {\"OK\"} default button 1 with icon ${2:-note}" >/dev/null 2>&1
+}
+
+ask() { # message, right-button, left-button -> prints the button that was pressed
+  osascript -e "display dialog \"$(esc "$1")\" with title \"Hankha Print Bridge\" buttons {\"$(esc "$3")\", \"$(esc "$2")\"} default button 2 with icon note" 2>/dev/null |
+    sed -n 's/.*button returned:\([^,]*\).*/\1/p'
+}
+
+health() {
+  /usr/bin/curl -fsS -m 2 "http://127.0.0.1:$PORT/health" 2>/dev/null
+}
+
+version_of() { # reads "version":"x.y.z" out of a /health body without needing a JSON parser
+  printf '%s' "$1" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'
+}
+
+# --------------------------------------------------------------------------- guards
+
+if [ ! -x "$BIN" ]; then
+  say "This copy of Hankha Print Bridge is incomplete — the helper program is missing.
+
+Download the disk image again and drag a fresh copy to Applications." stop
+  exit 1
+fi
+
+# Running straight from the mounted disk image is the trap this whole script exists to catch.
+# The LaunchAgent would record a /Volumes/... path, work perfectly until the image is ejected,
+# and then fail every print at some later date with nothing connecting the two events.
+case "$APP_DIR" in
+  /Volumes/*)
+    say "Drag Hankha Print Bridge to your Applications folder first, then open it from there.
+
+Started from the disk image it would stop working as soon as the image is ejected." caution
+    exit 1
+    ;;
+esac
+
+# --------------------------------------------------------------------------- uninstall
+
+uninstall() {
+  launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null
+  rm -f "$PLIST"
+  say "Hankha Print Bridge has been stopped and will no longer start automatically.
+
+To finish removing it, drag the app from your Applications folder to the Trash. The log stays at ~/Library/Logs/hankha-print-bridge.log"
+  exit 0
+}
+
+if [ "${1:-}" = "--uninstall" ]; then
+  uninstall
+fi
+
+# Already up and already ours: nothing to do but confirm it, and offer the way back out.
+RUNNING="$(health)"
+if [ -n "$RUNNING" ] && [ -f "$PLIST" ] && grep -qF "$BIN" "$PLIST" 2>/dev/null; then
+  case "$(ask "Hankha Print Bridge v$(version_of "$RUNNING") is already running on port $PORT, and starts automatically when you log in.
+
+In the POS terminal, open Settings > Printing to use it." "OK" "Uninstall")" in
+    Uninstall*) uninstall ;;
+  esac
+  exit 0
+fi
+
+# --------------------------------------------------------------------------- install
+
+# Anything already on the port — an older copy of this app, or a bridge started by hand from a
+# terminal — must go, or the freshly bootstrapped agent just dies on EADDRINUSE.
+launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null
+
+mkdir -p "$AGENTS" "$(dirname "$LOG")"
+
+# Loopback only. A POS served over https can reach a bridge on localhost and nowhere else —
+# every other address is refused by the browser as mixed content before a request is even
+# made — so listening wider on a till would widen exposure and buy nothing.
+cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BIN</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PRINT_BRIDGE_PORT</key>
+    <string>$PORT</string>
+    <key>PRINT_BRIDGE_HOST</key>
+    <string>127.0.0.1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>$LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG</string>
+</dict>
+</plist>
+PLISTEOF
+
+launchctl enable "gui/$UID_NUM/$LABEL" 2>/dev/null
+if ! launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null; then
+  say "Hankha Print Bridge could not be registered to start automatically.
+
+Try opening the app again. If it keeps failing, check $LOG" stop
+  exit 1
+fi
+
+# Don't claim success until it actually answers — an installer that reports "done" while
+# nothing is listening is the failure this replaces, not a variation of it.
+i=0
+while [ $i -lt 20 ]; do
+  BODY="$(health)"
+  if [ -n "$BODY" ]; then
+    say "Hankha Print Bridge v$(version_of "$BODY") is running on port $PORT, and will start again every time you log in.
+
+In the POS terminal, open Settings > Printing — the Print Bridge card should turn green. Then press Search to find your printers."
+    exit 0
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+
+say "Hankha Print Bridge was installed but nothing answered on port $PORT.
+
+The usual cause is another program already using that port. The reason is in $LOG" stop
+exit 1

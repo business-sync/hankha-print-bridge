@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Hankha Print Bridge</string>
+  <key>CFBundleDisplayName</key>
+  <string>Hankha Print Bridge</string>
+  <key>CFBundleIdentifier</key>
+  <string>la.hankha.print-bridge</string>
+  <key>CFBundleExecutable</key>
+  <string>HankhaPrintBridge</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>__VERSION__</string>
+  <key>CFBundleVersion</key>
+  <string>__VERSION__</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <!--
+    Not a background-only app. Opening it is a deliberate act — install, check, or uninstall —
+    and every one of those answers with a dialog, so it needs to be able to come to the front.
+    The long-running server is started by launchd, not by this bundle staying open.
+  -->
+  <key>LSBackgroundOnly</key>
+  <false/>
+</dict>
+</plist>

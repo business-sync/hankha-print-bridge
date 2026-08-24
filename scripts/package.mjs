@@ -3,8 +3,14 @@
  * Builds every installable artifact for the print bridge.
  *
  *   bun run package          everything this machine can produce
- *   bun run package --macos  just the .pkg
+ *   bun run package --macos  just the macOS .dmg and .pkg
  *   bun run package --windows
+ *
+ * macOS gets TWO artifacts because they suit different situations:
+ *   .dmg  drag to Applications, opens with no password, registers a per-user LaunchAgent that
+ *         starts the bridge at login. What a venue installing one till should use.
+ *   .pkg  needs an admin password, installs a system LaunchDaemon that starts at boot for
+ *         every user. For managed fleets and unattended installs.
  *
  * The bridge ships as a self-contained binary (`bun build --compile`) so a venue never has to
  * install a runtime. Cross-compiling the Windows exe works from macOS; building the macOS .pkg
@@ -22,7 +28,16 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  cpSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -260,6 +275,68 @@ if (buildMac) {
     run('xcrun', ['stapler', 'staple', finalPkg]);
   } else if (notaryProfile) {
     warn('HANKHA_NOTARY_PROFILE is set but HANKHA_MACOS_INSTALLER_IDENTITY is not — cannot notarize an unsigned package.');
+  }
+}
+
+// ---------------------------------------------------------------- macOS .app + .dmg
+
+if (buildMac) {
+  step('Building the macOS app bundle');
+  const appName = 'Hankha Print Bridge.app';
+  const dmgStage = join(BIN_DIR, 'dmg');
+  const app = join(dmgStage, appName);
+  const macOsDir = join(app, 'Contents/MacOS');
+  const resources = join(app, 'Contents/Resources');
+  mkdirSync(macOsDir, { recursive: true });
+  mkdirSync(resources, { recursive: true });
+
+  const appSrc = join(INSTALLER, 'macos/app');
+  writeFileSync(
+    join(app, 'Contents/Info.plist'),
+    readFileSync(join(appSrc, 'Info.plist'), 'utf8').replaceAll('__VERSION__', VERSION)
+  );
+  cpSync(join(appSrc, 'AppIcon.icns'), join(resources, 'AppIcon.icns'));
+  // The bundle's entry point is the control script; the server binary rides alongside it and
+  // is what the LaunchAgent the script writes actually points at.
+  cpSync(join(appSrc, 'HankhaPrintBridge'), join(macOsDir, 'HankhaPrintBridge'));
+  chmodSync(join(macOsDir, 'HankhaPrintBridge'), 0o755);
+  cpSync(macBinary, join(macOsDir, 'hankha-print-bridge'));
+  chmodSync(join(macOsDir, 'hankha-print-bridge'), 0o755);
+
+  // Sign inside-out: a nested Mach-O signed after its enclosing bundle invalidates the outer
+  // signature, and macOS then refuses the whole app.
+  const identity = process.env.HANKHA_MACOS_SIGN_IDENTITY;
+  const signArgs = identity
+    ? ['--force', '--timestamp', '--options', 'runtime', '--sign', identity]
+    : ['--force', '--timestamp=none', '--sign', '-'];
+  run('codesign', [...signArgs, join(macOsDir, 'hankha-print-bridge')]);
+  run('codesign', [...signArgs, app]);
+
+  step('Building the disk image');
+  // The symlink is what makes the window a drag target: the user sees the app beside a folder
+  // labelled Applications and drops one on the other.
+  run('ln', ['-s', '/Applications', join(dmgStage, 'Applications')]);
+  const dmg = join(OUT_DIR, `hankha-print-bridge-${VERSION}-macos.dmg`);
+  run('hdiutil', [
+    'create',
+    '-volname', 'Hankha Print Bridge',
+    '-srcfolder', dmgStage,
+    '-fs', 'HFS+',
+    '-format', 'UDZO',
+    '-ov',
+    '-quiet',
+    dmg,
+  ]);
+
+  if (process.env.HANKHA_MACOS_INSTALLER_IDENTITY) {
+    run('codesign', ['--force', '--sign', process.env.HANKHA_MACOS_INSTALLER_IDENTITY, dmg]);
+  }
+
+  const notaryProfile = process.env.HANKHA_NOTARY_PROFILE;
+  if (notaryProfile && identity) {
+    step('Notarizing the disk image');
+    run('xcrun', ['notarytool', 'submit', dmg, '--keychain-profile', notaryProfile, '--wait']);
+    run('xcrun', ['stapler', 'staple', dmg]);
   }
 }
 
