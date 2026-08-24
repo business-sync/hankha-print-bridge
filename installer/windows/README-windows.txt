@@ -25,10 +25,13 @@ http://127.0.0.1:9200 and only this computer can reach it.
 
 CHECK IT WORKS
 --------------
-Open http://127.0.0.1:9200/health in a browser. You should see a line starting {"ok":true.
+Start Menu > Hankha > Print Bridge status  -- tells you in a sentence whether it is running,
+which port, and for how long.
 
 Then open the POS terminal on this computer and go to Settings > Printing. The Print Bridge
 card should read "Print Bridge is running".
+
+(The raw version, if you prefer: http://127.0.0.1:9200/health should start with {"ok":true.)
 
 
 LET OTHER COMPUTERS USE THIS BRIDGE
@@ -51,3 +54,6 @@ LOGS
     C:\ProgramData\Hankha\PrintBridge\logs\bridge.log
 
 The most common failure is another program already holding port 9200; the log says so.
+
+The bridge restarts by itself if it crashes, and again every time this computer boots. You do
+not need to start it by hand.

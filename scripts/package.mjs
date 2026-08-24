@@ -149,7 +149,6 @@ function sha256(file) {
 
 step(`Building hankha-print-bridge v${VERSION}`);
 rmSync(BIN_DIR, { recursive: true, force: true });
-rmSync(OUT_DIR, { recursive: true, force: true });
 mkdirSync(BIN_DIR, { recursive: true });
 mkdirSync(OUT_DIR, { recursive: true });
 
@@ -158,6 +157,17 @@ const buildWin = wantAll || only.windows;
 
 if ((wantAll || only.macos) && !onMac) {
   warn('Skipping the macOS .pkg — pkgbuild/productbuild only exist on macOS.');
+}
+
+// Clear only what this run will replace. Wiping the whole directory meant `--windows` threw
+// away the macOS .dmg and .pkg, and the checksum file — built from whatever is present — then
+// listed half a release without saying so.
+const platformOf = (f) => (f.includes('macos') ? 'macos' : f.includes('windows') ? 'windows' : null);
+for (const file of readdirSync(OUT_DIR)) {
+  const platform = platformOf(file);
+  if ((platform === 'macos' && buildMac) || (platform === 'windows' && buildWin)) {
+    rmSync(join(OUT_DIR, file), { force: true });
+  }
 }
 
 let macBinary = null;
@@ -347,7 +357,7 @@ if (buildWin) {
   const stage = join(BIN_DIR, 'windows-x64');
   mkdirSync(stage, { recursive: true });
   cpSync(winBinary, join(stage, 'hankha-print-bridge.exe'));
-  for (const file of ['print-bridge.cmd', 'install.ps1', 'uninstall.ps1']) {
+  for (const file of ['print-bridge.cmd', 'install.ps1', 'uninstall.ps1', 'status.ps1']) {
     cpSync(join(INSTALLER, 'windows', file), join(stage, file));
   }
   cpSync(join(ROOT, 'installer/windows/README-windows.txt'), join(stage, 'README.txt'));

@@ -17,8 +17,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
   throw 'Run this from an elevated PowerShell (right-click PowerShell, "Run as administrator").'
 }
 
-schtasks /End /TN "$TaskName" 2>$null | Out-Null
-schtasks /Delete /TN "$TaskName" /F 2>$null | Out-Null
+# Match install.ps1: the ScheduledTasks cmdlets, not schtasks.exe.
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 Get-Process -Name 'hankha-print-bridge' -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 

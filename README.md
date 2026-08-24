@@ -70,9 +70,13 @@ xattr -dr com.apple.quarantine "/Applications/Hankha Print Bridge.app"
 
 ### Windows
 
-Run `hankha-print-bridge-<version>-windows-x64-setup.exe`. SmartScreen will say *"Windows
+Run **`hankha-print-bridge-<version>-windows-x64-setup.exe`**. SmartScreen will say *"Windows
 protected your PC"* because the build is unsigned — click **More info** then **Run anyway**.
-Uninstall from **Settings → Apps** like any other program.
+The bridge starts immediately and on every boot. Uninstall from **Settings → Apps** like any
+other program.
+
+**Start Menu → Hankha → Print Bridge status** answers "is the printer thing working?" in a
+sentence — version, port, which computer, how long it has been up.
 
 For a scripted rollout, unzip `…-windows-x64.zip` and run from an elevated PowerShell:
 
@@ -81,11 +85,26 @@ For a scripted rollout, unzip `…-windows-x64.zip` and run from an elevated Pow
 .\uninstall.ps1
 ```
 
+`install.ps1` is the **only** implementation of "install" — Setup.exe calls it too, so the
+wizard and a scripted rollout cannot drift apart or fail in different ways.
+
 Both paths install to `%ProgramFiles%\Hankha\Print Bridge` and register a **scheduled task**
 (`Hankha Print Bridge`, at startup, as SYSTEM). Not a Windows service: the bridge is a plain
 console program and does not implement the service-control handshake, so `sc.exe create` would
 register a service that dies with error 1053 on every start. A task avoids bundling a
 third-party service wrapper.
+
+The task is registered through PowerShell's `ScheduledTasks` cmdlets rather than `schtasks.exe`.
+`schtasks /TR` takes the whole command as one string, so a path under "Program Files" has to
+survive nested quoting through the shell, `CreateProcess` and schtasks' own parser — three
+chances to get it wrong, on something that cannot be tested from a macOS build machine.
+`-Execute` takes the path as a value and there is nothing to quote. (Removal still uses
+`schtasks`: deleting **by name** carries none of that risk.)
+
+It also carries what macOS gets from launchd's `KeepAlive`: **restart on failure** every minute,
+plus a five-minute repeating trigger as a backstop (`MultipleInstances IgnoreNew` makes that a
+no-op whenever it is already up). Without them a crash at 11am meant every print failed
+silently until the next reboot.
 
 Log: `C:\ProgramData\Hankha\PrintBridge\logs\bridge.log`
 

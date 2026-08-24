@@ -7,6 +7,11 @@
 ; and does not implement the service-control handshake, so `sc.exe create` would register a
 ; service that dies with error 1053 on every start. The usual workaround is bundling a service
 ; wrapper (WinSW/NSSM); a task avoids the extra binary entirely.
+;
+; Registering that task is DELEGATED to install.ps1 rather than duplicated here. Both paths
+; used to call schtasks with their own quoting of a "Program Files" path, so the wizard and a
+; scripted rollout could fail independently -- on the one thing that cannot be tested from the
+; build machine. One implementation, one set of bugs.
 
 Unicode true
 
@@ -83,18 +88,20 @@ Section "Print Bridge (required)" SecCore
   SetOutPath "$INSTDIR"
   File "${STAGE}\hankha-print-bridge.exe"
   File "${STAGE}\print-bridge.cmd"
+  File "${STAGE}\install.ps1"
   File "${STAGE}\uninstall.ps1"
+  File "${STAGE}\status.ps1"
 
   CreateDirectory "$APPDATA\Hankha\PrintBridge\logs"
 
   DetailPrint "Registering the startup task..."
-  nsExec::ExecToLog 'schtasks /Create /TN "${TASKNAME}" /TR "\"$INSTDIR\print-bridge.cmd\"" /SC ONSTART /RU SYSTEM /RL HIGHEST /F'
+  ; -SkipCopy because the files are already where they belong; install.ps1 registers the task,
+  ; starts it, and waits for /health to answer before returning 0.
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\install.ps1" -SkipCopy -InstallDir "$INSTDIR" -Port ${PORT}'
   Pop $0
   ${If} $0 != 0
-    Abort "Could not register the startup task (schtasks exit $0). The bridge will not start on its own."
+    Abort "The Print Bridge was copied, but could not be started (exit $0). See the details above, and $APPDATA\Hankha\PrintBridge\logs\bridge.log"
   ${EndIf}
-  nsExec::ExecToLog 'schtasks /Run /TN "${TASKNAME}"'
-  Pop $0
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
@@ -110,8 +117,13 @@ Section "Print Bridge (required)" SecCore
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD HKLM "${REGKEY}" "EstimatedSize" "$0"
 
+  ; A link straight to /health would show raw JSON to someone whose question is "is the
+  ; printer thing working?". status.ps1 answers that in a sentence.
   CreateDirectory "$SMPROGRAMS\Hankha"
-  WriteINIStr "$SMPROGRAMS\Hankha\Print Bridge status.url" "InternetShortcut" "URL" "http://127.0.0.1:${PORT}/health"
+  CreateShortcut "$SMPROGRAMS\Hankha\Print Bridge status.lnk" \
+    "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
+    '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$INSTDIR\status.ps1"' \
+    "$INSTDIR\hankha-print-bridge.exe" 0
 SectionEnd
 
 Section /o "Serve other terminals on this network" SecLan
@@ -119,23 +131,10 @@ Section /o "Serve other terminals on this network" SecLan
   ; Off by default. A POS served over https can only reach a bridge on localhost -- every other
   ; address is blocked as mixed content -- so opening the port usually buys nothing and only
   ; widens what is reachable inside the venue.
+  ; Same script again with -Lan: it writes bridge.env, adds the firewall rule, and re-registers
+  ; the task so the new bind address takes effect. Nothing about it is duplicated here.
   DetailPrint "Allowing other terminals on this network..."
-  FileOpen $0 "$APPDATA\Hankha\PrintBridge\bridge.env" w
-  FileWrite $0 "# Overrides read by print-bridge.cmd at startup.$\r$\n"
-  FileWrite $0 "PRINT_BRIDGE_HOST=0.0.0.0$\r$\n"
-  FileWrite $0 "PRINT_BRIDGE_PORT=${PORT}$\r$\n"
-  FileClose $0
-
-  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="${APPNAME}"'
-  Pop $0
-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="${APPNAME}" dir=in action=allow protocol=TCP localport=${PORT} profile=private'
-  Pop $0
-
-  ; The task started before this section ran, so restart it to pick up the new bind address.
-  nsExec::ExecToLog 'schtasks /End /TN "${TASKNAME}"'
-  Pop $0
-  Sleep 500
-  nsExec::ExecToLog 'schtasks /Run /TN "${TASKNAME}"'
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\install.ps1" -SkipCopy -InstallDir "$INSTDIR" -Port ${PORT} -Lan'
   Pop $0
 SectionEnd
 
@@ -147,6 +146,10 @@ SectionEnd
 Section "Uninstall"
   SetShellVarContext all
 
+  ; schtasks, not the cmdlets, on purpose: deleting BY NAME has none of the nested-quoting
+  ; risk that made registration (which passes a "Program Files" path) worth moving to
+  ; PowerShell. NSIS single-quoted strings have no backslash escapes, so a PowerShell command
+  ; with its own quotes is the more fragile option here, not the safer one.
   nsExec::ExecToLog 'schtasks /End /TN "${TASKNAME}"'
   Pop $0
   nsExec::ExecToLog 'schtasks /Delete /TN "${TASKNAME}" /F'
@@ -159,7 +162,9 @@ Section "Uninstall"
 
   Delete "$INSTDIR\hankha-print-bridge.exe"
   Delete "$INSTDIR\print-bridge.cmd"
+  Delete "$INSTDIR\install.ps1"
   Delete "$INSTDIR\uninstall.ps1"
+  Delete "$INSTDIR\status.ps1"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   RMDir "$PROGRAMFILES64\Hankha"
@@ -167,7 +172,7 @@ Section "Uninstall"
   Delete "$APPDATA\Hankha\PrintBridge\bridge.env"
   ; Logs stay: they are the only record of why a till stopped printing.
 
-  Delete "$SMPROGRAMS\Hankha\Print Bridge status.url"
+  Delete "$SMPROGRAMS\Hankha\Print Bridge status.lnk"
   RMDir "$SMPROGRAMS\Hankha"
 
   DeleteRegKey HKLM "${REGKEY}"
