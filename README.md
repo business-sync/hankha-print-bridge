@@ -26,19 +26,30 @@ bridge to `127.0.0.1` and it is installed per till.
 
 ### macOS
 
-Double-click `hankha-print-bridge-<version>-macos-universal.pkg` and follow the steps. It
-installs to `/usr/local/hankha/print-bridge`, registers a LaunchDaemon, and starts immediately —
-and on every boot after that.
+Two builds, for two situations. **Install one, not both** — they both want port 9200, and the
+app will tell you so rather than fighting the package.
 
-The build is **unsigned**, so the first open shows *"cannot be opened because it is from an
-unidentified developer"*. Right-click the `.pkg` and choose **Open**, or clear the quarantine
-flag first:
+#### `.dmg` — drag to Applications (use this one)
 
-```bash
-xattr -dr com.apple.quarantine hankha-print-bridge-*.pkg
-```
+1. Open `hankha-print-bridge-<version>-macos.dmg`.
+2. Drag **Hankha Print Bridge** onto the **Applications** folder in the same window.
+3. Open it from Applications. **Right-click → Open** the first time (see below).
 
-Verify, and uninstall:
+A dialog confirms it is running. That is all — opening the app registers a LaunchAgent in your
+own home folder and hands the running to launchd, so it comes back at every login. **No
+administrator password.** Open the app again any time to check on it or to uninstall.
+
+Open it from the disk image rather than from Applications and it refuses, because the shortcut
+it records would break the moment the image is ejected — and it would break silently, weeks
+later.
+
+Log: `~/Library/Logs/hankha-print-bridge.log`
+
+#### `.pkg` — for managed fleets
+
+`hankha-print-bridge-<version>-macos-universal.pkg` installs to `/usr/local/hankha/print-bridge`
+and registers a system LaunchDaemon: it starts at **boot** rather than at login, and serves
+every user account. Costs one administrator password, and suits unattended/MDM rollout.
 
 ```bash
 curl http://127.0.0.1:9200/health
@@ -46,6 +57,16 @@ sudo /usr/local/hankha/print-bridge/uninstall.sh
 ```
 
 Log: `/var/log/hankha-print-bridge.log`
+
+#### Gatekeeper
+
+Both builds are **unsigned**, so the first open shows *"cannot be opened because it is from an
+unidentified developer"*. Right-click the app or the package and choose **Open** — that
+offers an "Open anyway" button the plain double-click does not. Or clear the flag first:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Hankha Print Bridge.app"
+```
 
 ### Windows
 
@@ -84,7 +105,8 @@ bun run package:windows
 Artifacts land in `dist-installers/` with a `SHA256SUMS.txt`.
 
 Requirements: **Bun** for the binaries (cross-compiles all targets from any host); **macOS**
-for the `.pkg` (`pkgbuild`/`productbuild` exist nowhere else); **NSIS** for `setup.exe`. The
+for the `.dmg` and `.pkg` (`hdiutil`/`pkgbuild`/`productbuild` exist nowhere else); **NSIS**
+for `setup.exe`. The
 script prefers a local `makensis` but verifies it actually compiles first — Homebrew's
 makensis 3.12 aborts with `std::bad_alloc` on macOS 26 for *any* script — and otherwise falls
 back to a container built from `installer/windows/Dockerfile.nsis`. With neither, it warns and
@@ -154,6 +176,10 @@ page from using the bridge to scan the public internet from inside the venue's n
 
 **"Print Bridge is not answering"** — almost always another program on port 9200. The log says
 so explicitly. Change it with `PRINT_BRIDGE_PORT` and set the matching address in the POS.
+
+**On macOS, both the .dmg and the .pkg were installed** — they both want port 9200, so the
+second one to start dies on `EADDRINUSE` in a restart loop. Opening the app says which one
+currently owns the port and how to remove the other. Keep one.
 
 **"That is not the Print Bridge"** — something else answered on that port. The classic cause is
 a URL pointing at `:3100` (the admin portal) or `:3101` (the POS itself) instead of `:9200`.

@@ -49,6 +49,20 @@ version_of() { # reads "version":"x.y.z" out of a /health body without needing a
   printf '%s' "$1" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p'
 }
 
+pid_of() { # the pid the bridge on the port reports for itself
+  printf '%s' "$1" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p'
+}
+
+# The pid launchd currently has for a job, empty when it is not running. Asking launchd
+# rather than matching on a name is what lets every branch below tell OUR bridge apart from
+# the .pkg's system-wide one, and both apart from an unrelated program on the same port.
+job_pid() { # $1 = domain target, e.g. gui/501 or system
+  launchctl print "$1/$LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9]*\).*/\1/p' | head -1
+}
+
+agent_pid() { job_pid "gui/$UID_NUM"; }
+system_pid() { job_pid system; }
+
 # --------------------------------------------------------------------------- guards
 
 if [ ! -x "$BIN" ]; then
@@ -85,15 +99,42 @@ if [ "${1:-}" = "--uninstall" ]; then
   uninstall
 fi
 
-# Already up and already ours: nothing to do but confirm it, and offer the way back out.
+# Whatever is on the port already, say WHOSE it is. Deciding from the plist file alone gets
+# this wrong the moment both installers have been used on one Mac: the .pkg's plist exists,
+# our agent is the one actually answering, and the app reports the opposite of the truth.
 RUNNING="$(health)"
-if [ -n "$RUNNING" ] && [ -f "$PLIST" ] && grep -qF "$BIN" "$PLIST" 2>/dev/null; then
-  case "$(ask "Hankha Print Bridge v$(version_of "$RUNNING") is already running on port $PORT, and starts automatically when you log in.
+if [ -n "$RUNNING" ]; then
+  ANSWERING="$(pid_of "$RUNNING")"
+  RUNNING_VERSION="$(version_of "$RUNNING")"
+
+  if [ -n "$ANSWERING" ] && [ "$ANSWERING" = "$(agent_pid)" ]; then
+    # Ours. Confirm it, and offer the way back out.
+    case "$(ask "Hankha Print Bridge v$RUNNING_VERSION is already running on port $PORT, and starts automatically when you log in.
 
 In the POS terminal, open Settings > Printing to use it." "OK" "Uninstall")" in
-    Uninstall*) uninstall ;;
-  esac
-  exit 0
+      Uninstall*) uninstall ;;
+    esac
+    exit 0
+  fi
+
+  if [ -n "$ANSWERING" ] && [ "$ANSWERING" = "$(system_pid)" ]; then
+    # The .pkg's system-wide LaunchDaemon owns the port for every user on this Mac. Adding a
+    # per-user agent on top just crash-loops on EADDRINUSE, while something still answers
+    # /health — an install that looks successful and prints nothing.
+    say "Hankha Print Bridge v$RUNNING_VERSION is already installed on this Mac for all users, and is running on port $PORT.
+
+You do not need this app as well — the POS can use it now. Open Settings > Printing in the POS terminal.
+
+To replace it with this app instead, first run in Terminal:
+sudo /usr/local/hankha/print-bridge/uninstall.sh"
+    exit 0
+  fi
+
+  # Answering, but neither ours nor the package's.
+  say "Port $PORT is already being used by another program, so Hankha Print Bridge cannot start.
+
+Something is answering on that port, but it is not this app. Quit whatever is using port $PORT and open this app again." stop
+  exit 1
 fi
 
 # --------------------------------------------------------------------------- install
@@ -151,10 +192,14 @@ fi
 
 # Don't claim success until it actually answers — an installer that reports "done" while
 # nothing is listening is the failure this replaces, not a variation of it.
+# "Something answered" is not the same as "we are running". If another program holds the port,
+# our agent dies on EADDRINUSE while the stranger keeps answering /health — which is exactly
+# how an install can report success and print nothing. Match the pids before believing it.
 i=0
 while [ $i -lt 20 ]; do
   BODY="$(health)"
-  if [ -n "$BODY" ]; then
+  MINE="$(agent_pid)"
+  if [ -n "$BODY" ] && [ -n "$MINE" ] && [ "$(pid_of "$BODY")" = "$MINE" ]; then
     say "Hankha Print Bridge v$(version_of "$BODY") is running on port $PORT, and will start again every time you log in.
 
 In the POS terminal, open Settings > Printing — the Print Bridge card should turn green. Then press Search to find your printers."
@@ -164,7 +209,16 @@ In the POS terminal, open Settings > Printing — the Print Bridge card should t
   sleep 1
 done
 
-say "Hankha Print Bridge was installed but nothing answered on port $PORT.
+launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null
+rm -f "$PLIST"
 
-The usual cause is another program already using that port. The reason is in $LOG" stop
+if [ -n "$(health)" ]; then
+  say "Port $PORT is already being used by another program, so Hankha Print Bridge could not start.
+
+Something is answering on that port, but it is not this app. Quit whatever is using port $PORT and open this app again." stop
+else
+  say "Hankha Print Bridge was installed but nothing answered on port $PORT.
+
+The reason is in $LOG" stop
+fi
 exit 1
