@@ -99,32 +99,90 @@ export function tcpPing(ip: string, port: number, timeoutMs: number): Promise<Pi
 }
 
 /**
+ * Whether the bytes could conceivably have reached the printer when a send failed.
+ *
+ * The distinction is the whole basis of retry safety upstream. RAW/9100 has NO application
+ * acknowledgement: a `write` callback firing without error means only that the bytes left this
+ * machine's kernel buffer, never that anything was printed. So the honest answer is often
+ * "unknown", and the relay must never auto-retry those.
+ *
+ *  - `none`    → the socket never opened. ECONNREFUSED, EHOSTUNREACH, a connect timeout. The
+ *                printer received nothing, so a retry is provably safe.
+ *  - `unknown` → we were connected when it went wrong. A retry might print a second copy.
+ */
+export type PrintedCertainty = 'none' | 'unknown';
+
+export type PrintFailureReason =
+  | 'connect-refused'
+  | 'unreachable'
+  | 'connect-timeout'
+  | 'write-timeout';
+
+export type PrintOutcome =
+  | { ok: true; duration_ms: number }
+  | {
+      ok: false;
+      reason: PrintFailureReason;
+      printed_certainty: PrintedCertainty;
+      detail: string;
+      duration_ms: number;
+    };
+
+/**
  * The one thing a browser can't do itself: open a raw TCP socket to the printer's LAN IP and
  * write the raw ESC/POS bytes. Everything else (building the receipt, base64-encoding it) already
  * happens in the POS terminal — this is a pure forwarder.
+ *
+ * Resolves with an OUTCOME rather than throwing, because "it failed" is not enough information
+ * for the caller: it has to know whether the failure happened before or after the socket opened.
+ * Collapsing both into one error is what would make a receipt print twice.
  */
 export function sendToPrinter(
   ip: string,
   port: number,
   payload: Buffer,
   timeoutMs: number
-): Promise<void> {
-  return new Promise((resolve, reject) => {
+): Promise<PrintOutcome> {
+  return new Promise((resolve) => {
     const socket = new Socket();
+    const startedAt = Date.now();
+    // The single fact that decides retry safety. Set inside the connect callback, so anything
+    // that fails before it ran provably never reached the printer.
+    let connected = false;
     let settled = false;
-    const finish = (err?: Error) => {
+
+    const finish = (outcome: PrintOutcome) => {
       if (settled) return;
       settled = true;
       socket.destroy();
-      if (err) reject(err);
-      else resolve();
+      resolve(outcome);
     };
 
+    const fail = (reason: PrintFailureReason, detail: string) =>
+      finish({
+        ok: false,
+        reason,
+        printed_certainty: connected ? 'unknown' : 'none',
+        detail,
+        duration_ms: Date.now() - startedAt,
+      });
+
     socket.setTimeout(timeoutMs);
-    socket.once('timeout', () => finish(new Error('timeout')));
-    socket.once('error', (err) => finish(err));
+    socket.once('timeout', () =>
+      fail(connected ? 'write-timeout' : 'connect-timeout', `timed out after ${timeoutMs}ms`)
+    );
+    socket.once('error', (err: NodeJS.ErrnoException) => {
+      const reason: PrintFailureReason =
+        err.code === 'ECONNREFUSED' ? 'connect-refused' : connected ? 'write-timeout' : 'unreachable';
+      fail(reason, err.code ? `${err.code} ${ip}:${port}` : err.message);
+    });
     socket.connect(port, ip, () => {
-      socket.write(payload, (err) => finish(err ?? undefined));
+      connected = true;
+      socket.write(payload, (err) =>
+        err
+          ? fail('write-timeout', err.message)
+          : finish({ ok: true, duration_ms: Date.now() - startedAt })
+      );
     });
   });
 }

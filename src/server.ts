@@ -220,14 +220,19 @@ export function createBridgeServer(): Server {
           return;
         }
 
-        try {
-          await sendToPrinter(body.ip, body.port, payload, PRINT_TIMEOUT_MS);
+        const outcome = await sendToPrinter(body.ip, body.port, payload, PRINT_TIMEOUT_MS);
+        if (outcome.ok) {
           sendJson(res, 200, { ok: true });
-        } catch (err) {
-          const reason =
-            err instanceof Error && err.message === 'timeout' ? 'timeout' : 'connect-refused';
-          sendJson(res, 502, { ok: false, reason });
+          return;
         }
+        // `timeout` is kept as an alias for the connect case so terminals older than 1.3 keep
+        // reading the reason they were written against; the richer classification is additive.
+        sendJson(res, 502, {
+          ok: false,
+          reason: outcome.reason === 'connect-timeout' ? 'timeout' : outcome.reason,
+          printed_certainty: outcome.printed_certainty,
+          detail: outcome.detail,
+        });
       })();
       return;
     }
