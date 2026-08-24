@@ -1,0 +1,13 @@
+# NSIS toolchain for cross-building the Windows installer.
+#
+# Homebrew's makensis 3.12 aborts with std::bad_alloc on macOS 26 for any script at all -- even
+# an empty one -- so a container is the reliable way to produce setup.exe from a Mac. Debian's
+# nsis package is a stock build and needs no configuration.
+FROM debian:stable-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nsis \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /w
+ENTRYPOINT ["makensis"]

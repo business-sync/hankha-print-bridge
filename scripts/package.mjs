@@ -59,7 +59,33 @@ function tryRun(cmd, cmdArgs, opts = {}) {
 }
 
 function has(cmd) {
-  return spawnSync('command', ['-v', cmd], { shell: true, stdio: 'ignore' }).status === 0;
+  return spawnSync('/bin/sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
+}
+
+/**
+ * Being on PATH is not enough. Homebrew's makensis 3.12 aborts with std::bad_alloc on macOS 26
+ * for every script, including an empty one, so "installed" and "usable" are separate questions
+ * — and finding that out at the last step of a four-minute build is a bad way to learn it.
+ */
+function makensisWorks() {
+  if (!has('makensis')) return false;
+  const probe = join(BIN_DIR, 'makensis-probe.nsi');
+  writeFileSync(probe, `OutFile "${join(BIN_DIR, 'makensis-probe.exe')}"\nSection\nSectionEnd\n`);
+  const ok = spawnSync('makensis', ['-V1', probe], { stdio: 'ignore' }).status === 0;
+  rmSync(probe, { force: true });
+  rmSync(join(BIN_DIR, 'makensis-probe.exe'), { force: true });
+  return ok;
+}
+
+/** `docker build` is cached after the first run, so this costs a second or two thereafter. */
+function dockerNsisAvailable() {
+  if (!has('docker')) return false;
+  if (spawnSync('docker', ['info'], { stdio: 'ignore' }).status !== 0) return false;
+  return tryRun('docker', [
+    'build', '-q', '-t', 'hankha-nsis',
+    '-f', join(INSTALLER, 'windows/Dockerfile.nsis'),
+    join(INSTALLER, 'windows'),
+  ]);
 }
 
 function step(label) {
@@ -253,13 +279,28 @@ if (buildWin) {
   run('zip', ['-q', '-r', '-X', zip, 'windows-x64'], { cwd: BIN_DIR });
 
   step('Building the Windows setup.exe');
-  if (has('makensis')) {
-    const setup = join(OUT_DIR, `hankha-print-bridge-${VERSION}-windows-x64-setup.exe`);
-    run('makensis', [
+  const setup = join(OUT_DIR, `hankha-print-bridge-${VERSION}-windows-x64-setup.exe`);
+  const nsisRunner = makensisWorks()
+    ? { cmd: 'makensis', prefix: [], path: (p) => p }
+    : dockerNsisAvailable()
+      ? {
+          cmd: 'docker',
+          prefix: ['run', '--rm', '-v', `${ROOT}:/w`, '-w', '/w', 'hankha-nsis'],
+          // Everything the container touches is under the app root, mounted at /w.
+          path: (p) => p.replace(ROOT, '/w'),
+        }
+      : null;
+
+  if (nsisRunner) {
+    if (nsisRunner.cmd === 'docker') {
+      console.log('   using the containerised NSIS (local makensis unusable or absent)');
+    }
+    run(nsisRunner.cmd, [
+      ...nsisRunner.prefix,
       `-DVERSION=${VERSION}`,
-      `-DSTAGE=${stage}`,
-      `-DOUTFILE=${setup}`,
-      join(INSTALLER, 'windows/hankha-print-bridge.nsi'),
+      `-DSTAGE=${nsisRunner.path(stage)}`,
+      `-DOUTFILE=${nsisRunner.path(setup)}`,
+      nsisRunner.path(join(INSTALLER, 'windows/hankha-print-bridge.nsi')),
     ]);
     const pfx = process.env.HANKHA_WINDOWS_PFX;
     if (pfx && has('osslsigncode')) {
@@ -271,8 +312,8 @@ if (buildWin) {
     }
   } else {
     warn(
-      'makensis is not installed, so NO setup.exe was produced \u2014 only the .zip. ' +
-        'Install it with `brew install makensis` and run this again.'
+      'No usable NSIS, so NO setup.exe was produced \u2014 only the .zip. Start Docker Desktop ' +
+        '(the containerised toolchain is built automatically), or install a working makensis.'
     );
   }
 }

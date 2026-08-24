@@ -31,7 +31,7 @@ OutFile "${OUTFILE}"
 InstallDir "$PROGRAMFILES64\Hankha\Print Bridge"
 InstallDirRegKey HKLM "${REGKEY}" "InstallLocation"
 RequestExecutionLevel admin
-SetCompressor /SOLID zlib
+SetCompressor /SOLID lzma
 
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName"     "${APPNAME}"
