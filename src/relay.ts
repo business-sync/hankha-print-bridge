@@ -1,11 +1,10 @@
-import { DEFAULT_PRINTER_PORT } from './server.js';
 import { loadState, saveState, type RelayState } from './identity.js';
 import {
-  hostsForInterfaces,
+  containerSuspect,
+  DEFAULT_PRINTER_PORT,
   localInterfaces,
+  runScan,
   sendToPrinter,
-  sweep,
-  type LocalInterface,
 } from './lan.js';
 import { BRIDGE_VERSION } from './version.js';
 import { arch, hostname, platform } from 'node:os';
@@ -23,9 +22,6 @@ const DEFAULT_RELAY_URL = 'https://api.hankha.la';
 const POLL_WAIT_S = 25;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const PRINT_TIMEOUT_MS = 5000;
-const SCAN_HOST_TIMEOUT_MS = 500;
-const SCAN_CONCURRENCY = 64;
-const SCAN_MAX_HOSTS = 1024;
 /** Remembered results, so a redelivered job is answered rather than reprinted. */
 const RECENT_JOBS_MAX = 200;
 const MAX_BACKOFF_MS = 30_000;
@@ -54,23 +50,6 @@ type Work =
       };
     }
   | { type: 'scan'; command_id: string; port: number };
-
-/**
- * Docker's default bridge networks. A process whose every interface sits in one of these is
- * almost certainly containerised WITHOUT host networking.
- *
- * Worth detecting because the failure is so misleading: printing still works (outbound NATs
- * fine), but `/scan` sweeps the container bridge and finds nothing, and the interfaces reported
- * upstream drive the POS's subnet comparison — which then tells an operator their printer is
- * "on a different network" when it is sitting right there. A UI that lies is worse than one
- * that admits it cannot see.
- */
-export function containerSuspect(interfaces: LocalInterface[]): boolean {
-  if (interfaces.length === 0) return true;
-  return interfaces.every((i) =>
-    ['172.17.', '172.18.', '172.19.', '172.20.'].some((p) => i.address.startsWith(p))
-  );
-}
 
 function relayUrl(state: RelayState): string {
   const configured = process.env.PRINT_BRIDGE_RELAY_URL?.trim() || state.relay_url;
@@ -204,19 +183,17 @@ async function handlePrint(base: string, token: string, work: Extract<Work, { ty
 }
 
 async function handleScan(base: string, token: string, work: Extract<Work, { type: 'scan' }>) {
-  const interfaces = localInterfaces();
-  const hosts = hostsForInterfaces(interfaces, SCAN_MAX_HOSTS);
-  const printers = await sweep(hosts, work.port || DEFAULT_PRINTER_PORT, {
-    concurrency: SCAN_CONCURRENCY,
-    timeoutMs: SCAN_HOST_TIMEOUT_MS,
-  });
+  // Shares `runScan`'s in-flight map with the LAN /scan route, so a cloud-requested scan and a
+  // button press on the same port join one sweep instead of doubling the SYN traffic.
+  const scan = await runScan(work.port || DEFAULT_PRINTER_PORT);
   await fetch(`${base}/api/v1/modules/print/bridge/scan-result`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({
       command_id: work.command_id,
-      subnets: interfaces.map((i) => i.cidr),
-      printers,
+      subnets: scan.subnets,
+      duration_ms: scan.duration_ms,
+      printers: scan.printers,
     }),
     signal: AbortSignal.timeout(15_000),
   });

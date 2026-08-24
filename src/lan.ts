@@ -276,3 +276,71 @@ export async function sweep(
   found.sort((a, b) => (parseIpv4(a.ip) ?? 0) - (parseIpv4(b.ip) ?? 0));
   return found;
 }
+
+/** The de-facto standard RAW/JetDirect port. Every thermal printer here listens on it. */
+export const DEFAULT_PRINTER_PORT = 9100;
+
+/** Short on purpose: a live LAN device answers in single-digit ms; this only bounds dead hosts. */
+const SCAN_HOST_TIMEOUT_MS = 500;
+const SCAN_CONCURRENCY = 64;
+const SCAN_MAX_HOSTS = 1024;
+
+export interface ScanResult {
+  ok: true;
+  subnets: string[];
+  duration_ms: number;
+  printers: FoundPrinter[];
+}
+
+/**
+ * One scan at a time, per port. A scan is ~1000 sockets; an operator tapping "Find printers"
+ * twice should join the run already in flight, not start a second one.
+ *
+ * Lives here rather than in the HTTP layer because BOTH callers are equal peers: the LAN
+ * `/scan` route and the relay's cloud-issued scan command. Sharing this map is what stops a
+ * button press and a remote command from racing two sweeps against the same subnet — and
+ * keeping it out of `server.ts` is what keeps `server` and `relay` from importing each other.
+ */
+const scansInFlight = new Map<number, Promise<ScanResult>>();
+
+export function runScan(port: number): Promise<ScanResult> {
+  const existing = scansInFlight.get(port);
+  if (existing) return existing;
+
+  const started = performance.now();
+  const promise = (async (): Promise<ScanResult> => {
+    const { subnets, hosts } = hostsForInterfaces(localInterfaces(), SCAN_MAX_HOSTS);
+    const printers = await sweep(hosts, port, {
+      concurrency: SCAN_CONCURRENCY,
+      timeoutMs: SCAN_HOST_TIMEOUT_MS,
+    });
+    return {
+      ok: true,
+      subnets,
+      duration_ms: Math.round(performance.now() - started),
+      printers,
+    };
+  })().finally(() => {
+    scansInFlight.delete(port);
+  });
+
+  scansInFlight.set(port, promise);
+  return promise;
+}
+
+/**
+ * Docker's default bridge networks. A process whose every interface sits in one of these is
+ * almost certainly containerised WITHOUT host networking.
+ *
+ * Worth detecting because the failure is so misleading: printing still works (outbound NATs
+ * fine), but a scan sweeps the container bridge and finds nothing, and the interfaces reported
+ * upstream drive the POS's subnet comparison — which then tells an operator their printer is
+ * "on a different network" when it is sitting right there. A UI that lies is worse than one
+ * that admits it cannot see.
+ */
+export function containerSuspect(interfaces: LocalInterface[]): boolean {
+  if (interfaces.length === 0) return true;
+  return interfaces.every((i) =>
+    ['172.17.', '172.18.', '172.19.', '172.20.'].some((p) => i.address.startsWith(p))
+  );
+}

@@ -1,26 +1,23 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { arch, hostname, platform } from 'node:os';
 import {
-  type FoundPrinter,
-  hostsForInterfaces,
+  containerSuspect,
+  DEFAULT_PRINTER_PORT,
   isPrivateIpv4,
   localInterfaces,
+  runScan,
   sendToPrinter,
-  sweep,
   tcpPing,
 } from './lan.js';
+import { relayStatus } from './relay.js';
 import { BRIDGE_SERVICE, BRIDGE_VERSION } from './version.js';
 
 // Re-exported so existing importers of `server.js` keep working after the constants moved.
 export { BRIDGE_SERVICE, BRIDGE_VERSION };
+export { DEFAULT_PRINTER_PORT, type ScanResult } from './lan.js';
 
-export const DEFAULT_PRINTER_PORT = 9100;
 const PRINT_TIMEOUT_MS = 5000;
 const PROBE_TIMEOUT_MS = 2000;
-/** Short on purpose: a live LAN device answers in single-digit ms; this only bounds dead hosts. */
-const SCAN_HOST_TIMEOUT_MS = 500;
-const SCAN_CONCURRENCY = 64;
-const SCAN_MAX_HOSTS = 1024;
 
 interface PrintJob {
   ip: string;
@@ -89,43 +86,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(data);
 }
 
-export interface ScanResult {
-  ok: true;
-  subnets: string[];
-  duration_ms: number;
-  printers: FoundPrinter[];
-}
 
 export function createBridgeServer(): Server {
-  // One scan at a time. A scan is ~1000 sockets; an operator tapping "Find printers" twice
-  // should join the run already in flight, not start a second one.
-  const scansInFlight = new Map<number, Promise<ScanResult>>();
-
-  const runScan = (port: number): Promise<ScanResult> => {
-    const existing = scansInFlight.get(port);
-    if (existing) return existing;
-
-    const started = performance.now();
-    const promise = (async (): Promise<ScanResult> => {
-      const { subnets, hosts } = hostsForInterfaces(localInterfaces(), SCAN_MAX_HOSTS);
-      const printers = await sweep(hosts, port, {
-        concurrency: SCAN_CONCURRENCY,
-        timeoutMs: SCAN_HOST_TIMEOUT_MS,
-      });
-      return {
-        ok: true,
-        subnets,
-        duration_ms: Math.round(performance.now() - started),
-        printers,
-      };
-    })().finally(() => {
-      scansInFlight.delete(port);
-    });
-
-    scansInFlight.set(port, promise);
-    return promise;
-  };
-
   return createServer((req, res) => {
     withCors(res);
 
@@ -143,16 +105,23 @@ export function createBridgeServer(): Server {
       // launchd daemon or a scheduled task: the POS settings screen is the only place an
       // operator can see WHICH machine is answering, which is the difference between "the
       // bridge is fine" and "the bridge is fine, but it's the one on the office PC".
+      const interfaces = localInterfaces();
       sendJson(res, 200, {
         ok: true,
         service: BRIDGE_SERVICE,
         version: BRIDGE_VERSION,
-        interfaces: localInterfaces(),
+        interfaces,
         hostname: hostname(),
         platform: platform(),
         arch: arch(),
         pid: process.pid,
         uptime_s: Math.round(process.uptime()),
+        // Containerised without host networking: printing still works, but a scan sweeps the
+        // container bridge and the interfaces above would make the POS claim the printer is on
+        // a different network. Saying so is the difference between a confusing UI and an
+        // honest one.
+        net_warning: containerSuspect(interfaces) ? 'container-suspect' : null,
+        relay: relayStatus(),
       });
       return;
     }

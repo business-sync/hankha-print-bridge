@@ -1,5 +1,7 @@
 import { localInterfaces } from './lan.js';
+import { enroll, startRelay } from './relay.js';
 import { createBridgeServer } from './server.js';
+import { statePath } from './identity.js';
 import { BRIDGE_SERVICE, BRIDGE_VERSION } from './version.js';
 
 const DEFAULT_PORT = 9200;
@@ -27,13 +29,18 @@ TCP socket, so the POS terminal POSTs its bytes here and this dials the printer'
 Usage: hankha-print-bridge [options]
 
 Options:
-  -v, --version   Print the version and exit
-  -h, --help      Print this help and exit
+  -v, --version      Print the version and exit
+  -h, --help         Print this help and exit
+  --enroll <code>    Redeem an enrollment code from Settings > Printing, then exit.
+                     Links this bridge to your organization so the POS can send it jobs
+                     from any device, including a phone.
 
 Environment:
   PRINT_BRIDGE_PORT   TCP port to listen on               (default ${DEFAULT_PORT})
   PRINT_BRIDGE_HOST   Address to bind                     (default ${DEFAULT_HOST})
                       Set to 127.0.0.1 to accept only connections from this machine.
+  PRINT_BRIDGE_RELAY_URL   Cloud API to poll for jobs    (default https://api.hankha.la)
+  PRINT_BRIDGE_STATE_DIR   Where to keep relay.json      (default per-OS, see --enroll)
 
 Endpoints:
   GET  /health   liveness, identity, version and this machine's networks
@@ -43,6 +50,35 @@ Endpoints:
   process.exit(0);
 }
 
+/**
+ * `--enroll <code>` redeems a one-time code from Settings > Printing and exits.
+ *
+ * A separate invocation rather than a flag on the long-running service, because enrolling is a
+ * one-off act by a person: the installed daemon keeps running untouched, and the operator gets
+ * an exit code and a sentence instead of having to read a service log.
+ */
+const enrollAt = args.indexOf('--enroll');
+if (enrollAt !== -1) {
+  const code = args[enrollAt + 1];
+  if (!code || code.startsWith('-')) {
+    console.error('--enroll needs a code, e.g. `hankha-print-bridge --enroll ABCD-2345`');
+    process.exit(2);
+  }
+  enroll(code)
+    .then(({ bridge_id }) => {
+      console.log(`Enrolled as bridge ${bridge_id}. Credentials saved to ${statePath()}`);
+      console.log('Restart the Print Bridge service to start accepting cloud print jobs.');
+      process.exit(0);
+    })
+    .catch((err: unknown) => {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
+} else {
+  runService();
+}
+
+function runService(): void {
 const unknown = args.filter((a) => a.startsWith('-'));
 if (unknown.length > 0) {
   console.error(`Unknown option: ${unknown[0]}\nRun with --help to see the supported options.`);
@@ -90,6 +126,11 @@ server.listen(PORT, HOST, () => {
   }
 });
 
+// The outbound half: dial the cloud API and long-poll for jobs, so a phone or a till on
+// mobile data can print through this bridge without reaching the LAN itself. A no-op (with one
+// log line) until someone runs `--enroll`, so an existing LAN-only install is unaffected.
+startRelay();
+
 // launchd and Task Scheduler both stop the process with a signal; exiting cleanly keeps a
 // restart from being logged as a crash.
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
@@ -98,4 +139,5 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     // Don't let an in-flight scan (up to ~2s per subnet) hold shutdown open indefinitely.
     setTimeout(() => process.exit(0), 3000).unref();
   });
+}
 }
