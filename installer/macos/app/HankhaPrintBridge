@@ -30,12 +30,14 @@ esc() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+# `giving up after` matters more than it looks: a till left at the lock screen with a modal
+# nobody will ever click is a process stuck forever, and the reason is invisible.
 say() { # message, icon(note|caution|stop)
-  osascript -e "display dialog \"$(esc "$1")\" with title \"Hankha Print Bridge\" buttons {\"OK\"} default button 1 with icon ${2:-note}" >/dev/null 2>&1
+  osascript -e "display dialog \"$(esc "$1")\" with title \"Hankha Print Bridge\" buttons {\"OK\"} default button 1 with icon ${2:-note} giving up after 300" >/dev/null 2>&1
 }
 
 ask() { # message, right-button, left-button -> prints the button that was pressed
-  osascript -e "display dialog \"$(esc "$1")\" with title \"Hankha Print Bridge\" buttons {\"$(esc "$3")\", \"$(esc "$2")\"} default button 2 with icon note" 2>/dev/null |
+  osascript -e "display dialog \"$(esc "$1")\" with title \"Hankha Print Bridge\" buttons {\"$(esc "$3")\", \"$(esc "$2")\"} default button 2 with icon note giving up after 300" 2>/dev/null |
     sed -n 's/.*button returned:\([^,]*\).*/\1/p'
 }
 
