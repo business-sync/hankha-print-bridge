@@ -1,4 +1,7 @@
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createTlsServer } from 'node:https';
+import { readFileSync } from 'node:fs';
 import { arch, hostname, platform } from 'node:os';
 import {
   containerSuspect,
@@ -71,10 +74,38 @@ function withCors(res: ServerResponse): void {
   // keeps the open CORS policy from mattering.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // `Authorization` is listed even when no token is configured. Omitting it makes the browser
+  // fail the PREFLIGHT for any request that carries the header, and a failed preflight is
+  // indistinguishable from an unreachable bridge — the request never leaves the browser and
+  // nothing is logged on either side.
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   // Chrome's Private Network Access preflight: a page on a public origin reaching a private
   // address needs this or the request is blocked before it arrives.
   res.setHeader('Access-Control-Allow-Private-Network', 'true');
+}
+
+/**
+ * Shared secret for the LAN surface, when one is configured.
+ *
+ * Empty by default, because the shipped default binds loopback where the OS is the boundary.
+ * It matters the moment a bridge binds 0.0.0.0 on a shop box: without it, anything on the
+ * venue's Wi-Fi — including a guest phone — can drive the printers.
+ */
+const BRIDGE_TOKEN = process.env.PRINT_BRIDGE_TOKEN?.trim() ?? '';
+
+/**
+ * Constant-time bearer check.
+ *
+ * `timingSafeEqual` throws on a length mismatch, so the length is compared first — and that
+ * comparison leaks only the token's LENGTH, which is not the secret.
+ */
+function isAuthorized(req: IncomingMessage): boolean {
+  if (!BRIDGE_TOKEN) return true;
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return false;
+  const given = Buffer.from(header.slice('Bearer '.length).trim());
+  const expected = Buffer.from(BRIDGE_TOKEN);
+  return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -87,9 +118,37 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 
+/**
+ * Bring-your-own TLS.
+ *
+ * Deliberately NOT a certificate this project issues or renews: a scheme that mints a public
+ * cert per bridge needs a DNS zone, an ACME pipeline on every shop PC, and public A records
+ * pointing at private IPs — which DNS-rebinding protection drops on many venue routers, and
+ * which cannot resolve at all during the internet outage it would exist to survive. A venue
+ * that already has its own cert (or an MDM-pushed CA) can use it here in two env vars.
+ */
+function tlsOptions(): { key: Buffer; cert: Buffer } | null {
+  const certPath = process.env.PRINT_BRIDGE_TLS_CERT?.trim();
+  const keyPath = process.env.PRINT_BRIDGE_TLS_KEY?.trim();
+  if (!certPath || !keyPath) return null;
+  return { cert: readFileSync(certPath), key: readFileSync(keyPath) };
+}
+
+export function isTlsEnabled(): boolean {
+  return Boolean(process.env.PRINT_BRIDGE_TLS_CERT?.trim() && process.env.PRINT_BRIDGE_TLS_KEY?.trim());
+}
+
 export function createBridgeServer(): Server {
-  return createServer((req, res) => {
+  const handler = (req: IncomingMessage, res: ServerResponse) => {
     withCors(res);
+
+    // `/health` stays open even when a token is set: the POS uses it to tell "the bridge is
+    // down" from "the bridge is up but this terminal has the wrong token", and it discloses
+    // nothing an attacker on the same LAN could not learn by scanning.
+    if (req.url !== '/health' && req.method !== 'OPTIONS' && !isAuthorized(req)) {
+      sendJson(res, 401, { ok: false, reason: 'unauthorized' });
+      return;
+    }
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -121,6 +180,9 @@ export function createBridgeServer(): Server {
         // a different network. Saying so is the difference between a confusing UI and an
         // honest one.
         net_warning: containerSuspect(interfaces) ? 'container-suspect' : null,
+        // Lets the terminal prompt for a token instead of showing a bare 401, which otherwise
+        // reads to an operator as "the bridge is broken".
+        auth_required: BRIDGE_TOKEN.length > 0,
         relay: relayStatus(),
       });
       return;
@@ -207,5 +269,8 @@ export function createBridgeServer(): Server {
     }
 
     sendJson(res, 404, { ok: false, reason: 'not-found' });
-  });
+  };
+
+  const tls = tlsOptions();
+  return tls ? createTlsServer(tls, handler) : createServer(handler);
 }

@@ -1,6 +1,6 @@
 import { localInterfaces } from './lan.js';
 import { enroll, startRelay } from './relay.js';
-import { createBridgeServer } from './server.js';
+import { createBridgeServer, isTlsEnabled } from './server.js';
 import { statePath } from './identity.js';
 import { BRIDGE_SERVICE, BRIDGE_VERSION } from './version.js';
 
@@ -41,6 +41,11 @@ Environment:
                       Set to 127.0.0.1 to accept only connections from this machine.
   PRINT_BRIDGE_RELAY_URL   Cloud API to poll for jobs    (default https://api.hankha.la)
   PRINT_BRIDGE_STATE_DIR   Where to keep relay.json      (default per-OS, see --enroll)
+  PRINT_BRIDGE_TOKEN       Require an 'Authorization: Bearer <token>' header on every
+                           route but /health. Set this whenever the bridge binds beyond
+                           loopback.
+  PRINT_BRIDGE_TLS_CERT    PEM certificate — serve https instead of http (both required)
+  PRINT_BRIDGE_TLS_KEY     PEM private key
 
 Endpoints:
   GET  /health   liveness, identity, version and this machine's networks
@@ -112,7 +117,15 @@ server.on('error', (err: NodeJS.ErrnoException) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`${BRIDGE_SERVICE} v${BRIDGE_VERSION} listening on http://${HOST}:${PORT}`);
+  const scheme = isTlsEnabled() ? 'https' : 'http';
+  console.log(`${BRIDGE_SERVICE} v${BRIDGE_VERSION} listening on ${scheme}://${HOST}:${PORT}`);
+  if (process.env.PRINT_BRIDGE_TOKEN?.trim()) {
+    console.log('  a bearer token is required on every route except /health');
+  } else if (HOST !== '127.0.0.1' && HOST !== 'localhost') {
+    // Not fatal, but worth saying out loud: on a shop box this means every device on the
+    // venue Wi-Fi, guest phones included, can drive the printers.
+    console.warn('  WARNING: bound beyond loopback with no PRINT_BRIDGE_TOKEN set');
+  }
   if (HOST === '127.0.0.1' || HOST === 'localhost') {
     // Not a warning — this is the intended setup on a till, and saying so out loud stops
     // someone "fixing" it when another terminal can't connect.
@@ -121,7 +134,7 @@ server.listen(PORT, HOST, () => {
     // The operator needs this to point other terminals at the right address, and it's the
     // fastest way to spot "the printers are on a different network than this PC".
     for (const iface of localInterfaces()) {
-      console.log(`  reachable on this LAN at http://${iface.address}:${PORT}  (${iface.cidr})`);
+      console.log(`  reachable on this LAN at ${scheme}://${iface.address}:${PORT}  (${iface.cidr})`);
     }
   }
 });
