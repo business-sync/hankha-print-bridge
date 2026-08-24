@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, sans-serif; margin: 0; color: #1d1d1f; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  p { margin: 0 0 10px; line-height: 1.5; }
+  code { background: #f0f0f2; padding: 1px 4px; border-radius: 3px; }
+  ol { margin: 0 0 10px; padding-left: 18px; line-height: 1.6; }
+</style></head>
+<body>
+<h2>The Print Bridge is running</h2>
+<ol>
+  <li>Open the POS terminal on this Mac.</li>
+  <li>Go to <strong>Settings &rarr; Printing</strong>.</li>
+  <li>The Print Bridge card should read <em>Print Bridge is running</em>. Then press
+      <strong>Search</strong> to find your printers.</li>
+</ol>
+<p>To check it by hand: <code>curl http://127.0.0.1:9200/health</code></p>
+<p>To remove it later: <code>sudo /usr/local/hankha/print-bridge/uninstall.sh</code></p>
+</body></html>

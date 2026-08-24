@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>la.hankha.print-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/hankha/print-bridge/hankha-print-bridge</string>
+  </array>
+
+  <!--
+    Loopback, not 0.0.0.0. A POS served over https can only reach a bridge on localhost —
+    every other address is blocked as mixed content before a request leaves the browser — so
+    on a till there is nothing to gain from listening wider. Edit this plist and reload the
+    daemon if one bridge really must serve several terminals over plain http.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PRINT_BRIDGE_PORT</key>
+    <string>9200</string>
+    <key>PRINT_BRIDGE_HOST</key>
+    <string>127.0.0.1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- launchd's own floor is 10s; naming it stops a misconfigured bridge spinning the CPU. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/hankha-print-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/hankha-print-bridge.log</string>
+</dict>
+</plist>

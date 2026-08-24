@@ -1,0 +1,27 @@
+{
+  "name": "hankha-print-bridge",
+  "version": "1.2.0",
+  "private": true,
+  "description": "Local LAN helper that forwards POS print jobs to a network (ESC/POS-over-TCP) printer. Runs on a venue PC, NOT inside the POS terminal's PWA \u2014 a browser cannot open a raw TCP socket itself, so the PWA calls this over HTTP and this dials the printer's IP:port.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test src/lan.test.ts src/server.test.ts src/version.test.ts",
+    "typecheck": "tsc --noEmit",
+    "package": "node scripts/package.mjs",
+    "package:macos": "node scripts/package.mjs --macos",
+    "package:windows": "node scripts/package.mjs --windows"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.2",
+    "tsx": "4.23.0",
+    "typescript": "5.7.3"
+  }
+}

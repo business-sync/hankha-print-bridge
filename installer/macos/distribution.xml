@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Hankha Print Bridge</title>
+    <organization>la.hankha</organization>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <!-- Universal binary; Apple silicon and Intel Macs both run it. -->
+    <options customize="never" require-scripts="true" hostArchitectures="arm64,x86_64"/>
+    <domains enable_localSystem="true" enable_anywhere="false" enable_currentUserHome="false"/>
+    <volume-check>
+        <allowed-os-versions><os-version min="12.0"/></allowed-os-versions>
+    </volume-check>
+
+    <choices-outline>
+        <line choice="default"/>
+    </choices-outline>
+    <choice id="default" visible="false">
+        <pkg-ref id="la.hankha.print-bridge"/>
+    </choice>
+    <pkg-ref id="la.hankha.print-bridge" version="__VERSION__" onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>

@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+LABEL=la.hankha.print-bridge
+PLIST="/Library/LaunchDaemons/$LABEL.plist"
+BINARY=/usr/local/hankha/print-bridge/hankha-print-bridge
+LOG=/var/log/hankha-print-bridge.log
+PORT=9200
+
+# launchd refuses a daemon plist that isn't owned by root with tight permissions, and the
+# refusal is silent from the installer's point of view — the package "succeeds" and nothing
+# ever runs. pkgbuild stamps the building user's ownership, so re-stamp it here.
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+chown -R root:wheel /usr/local/hankha/print-bridge
+chmod 755 "$BINARY" /usr/local/hankha/print-bridge/uninstall.sh
+
+launchctl bootout "system/$LABEL" 2>/dev/null || true
+launchctl bootstrap system "$PLIST"
+launchctl enable "system/$LABEL"
+
+# Don't report success until the bridge actually answers. Installing a print helper that
+# silently never started is the exact failure this package exists to eliminate.
+i=0
+while [ $i -lt 20 ]; do
+  if /usr/bin/curl -fsS -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    echo "hankha-print-bridge is running on http://127.0.0.1:$PORT"
+    exit 0
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+
+echo "hankha-print-bridge was installed but did not answer on port $PORT within 20s." >&2
+echo "Most likely another process already holds that port. Check $LOG for the reason:" >&2
+tail -n 20 "$LOG" >&2 2>/dev/null || true
+exit 1

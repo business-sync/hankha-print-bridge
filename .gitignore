@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-bin/
+dist-installers/
+*.pkg
+*.exe
+*.zip
+*.log
+.DS_Store

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stop any running copy before the payload lands, so an upgrade never leaves the old process
+# holding port 9200 while the new binary is on disk — a state whose only symptom is the POS
+# reporting a version that doesn't match what was just installed.
+LABEL=la.hankha.print-bridge
+launchctl bootout "system/$LABEL" 2>/dev/null || true
+exit 0
