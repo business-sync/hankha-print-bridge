@@ -13,7 +13,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "node --import tsx --test src/lan.test.ts src/server.test.ts src/version.test.ts",
+    "test": "node --import tsx --test src/lan.test.ts src/server.test.ts src/version.test.ts src/env.test.ts",
     "typecheck": "tsc --noEmit",
     "package": "node --import tsx scripts/package.mjs",
     "package:macos": "node --import tsx scripts/package.mjs --macos",

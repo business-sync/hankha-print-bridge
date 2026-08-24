@@ -113,6 +113,48 @@ Log: `C:\ProgramData\Hankha\PrintBridge\logs\bridge.log`
 Open the POS on the same computer → **Settings → Printing**. The Print Bridge card should read
 *"Print Bridge is running"* and name this machine. Then press **Search** to find printers.
 
+## Configuration
+
+Everything is read from the environment. `.env` supplies it during development and packaging:
+
+```bash
+cp .env.example .env
+```
+
+`.env` is gitignored; `.env.example` is tracked and acts as the **fallback**, not only a
+template, so a fresh clone with no `.env` still builds a correctly-numbered release. A real
+environment variable beats both files, which is how CI overrides one without editing anything.
+
+| Variable | Default | |
+|---|---|---|
+| `APP_VERSION` | `1.2.0` | the release number, and the only place to bump it |
+| `PRINT_BRIDGE_PORT` | `9200` | the POS terminal defaults to `http://localhost:9200` |
+| `PRINT_BRIDGE_HOST` | `0.0.0.0` | `127.0.0.1` accepts only this machine |
+
+An **installed** bridge reads none of this. Its configuration comes from the service definition
+instead: `EnvironmentVariables` in the launchd plist on macOS, and
+`%ProgramData%\Hankha\PrintBridge\bridge.env` (read by `print-bridge.cmd`) on Windows, which
+overrides port and host without touching the scheduled task.
+
+### Bumping the version
+
+Edit `APP_VERSION` in **both** `.env` and `.env.example`, then:
+
+```bash
+npm run version:sync     # rewrites package.json / package-lock.json to match
+```
+
+`bun run package` runs that sync itself, then names the artifacts, stamps the macOS bundle and
+the Windows installer, and inlines the number into the binary with `bun build --define` — a
+shipped binary has neither `.env` nor `package.json` beside it. It then makes the compiled
+binary report its version back, because a `--define` that failed to apply would leave every
+artifact *labelled* 1.2.0 wrapped around a bridge that tells the POS `0.0.0-dev`.
+
+`npm test` fails if `package.json` or `.env.example` has drifted.
+
+Keep it to three numeric parts: the POS terminal compares it against its own
+`MIN_BRIDGE_VERSION` and silently ignores anything it cannot parse.
+
 ## Building the installers
 
 ```bash
@@ -133,7 +175,8 @@ ships only the `.zip`.
 
 ### Signing
 
-Unsigned by default. Every hook below is a no-op when its variable is unset:
+Unsigned by default. Every hook below is a no-op when its variable is unset — put real values
+in `.env`, which is gitignored, and never in `.env.example`:
 
 | Variable | Effect |
 |---|---|
@@ -154,16 +197,8 @@ npm test         # node:test, no test framework dependency
 npm run typecheck
 ```
 
-`npm run dev` binds `0.0.0.0` (unchanged from before packaging existed); the installers set
-`PRINT_BRIDGE_HOST=127.0.0.1`.
-
-| Variable | Default | |
-|---|---|---|
-| `PRINT_BRIDGE_PORT` | `9200` | |
-| `PRINT_BRIDGE_HOST` | `0.0.0.0` | `127.0.0.1` accepts only this machine |
-
-On Windows, `%ProgramData%\Hankha\PrintBridge\bridge.env` overrides both without touching the
-scheduled task.
+`npm run dev` reads `.env` (see [Configuration](#configuration)) and binds `0.0.0.0`, unchanged
+from before packaging existed; the installers set `PRINT_BRIDGE_HOST=127.0.0.1`.
 
 ## API
 

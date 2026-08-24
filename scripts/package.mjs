@@ -53,6 +53,11 @@ const OUT_DIR = join(ROOT, 'dist-installers');
 const INSTALLER = join(ROOT, 'installer');
 
 const VERSION = appVersion();
+/**
+ * A shipped binary has no `.env` and no `package.json` beside it, so the version is substituted
+ * into the source at build time. `version.ts` is written to read exactly this expression.
+ */
+const DEFINE_VERSION = ['--define', `process.env.APP_VERSION=${JSON.stringify(VERSION)}`];
 const IDENTIFIER = 'la.hankha.print-bridge';
 
 const args = process.argv.slice(2);
@@ -118,11 +123,7 @@ function compile(target, outfile) {
     'build',
     '--compile',
     '--minify',
-    // A shipped binary has no `.env` and no `package.json` beside it, so the version has to be
-    // substituted into the source expression at build time. `version.ts` is written to read
-    // exactly `process.env.APP_VERSION` for this reason.
-    '--define',
-    `process.env.APP_VERSION=${JSON.stringify(VERSION)}`,
+    ...DEFINE_VERSION,
     '--target',
     target,
     '--outfile',
@@ -176,13 +177,26 @@ function assertBinaryVersion(binary) {
 }
 
 /**
- * The same check for a binary this machine cannot execute. Weaker by nature — it only proves
- * the string is in there — but the failure it is aimed at (the fallback compiled in instead of
- * the real version) does not leave the number behind, so it still catches it.
+ * The same question for the targets this machine cannot execute, asked of the transform instead
+ * of the artifact. `--define` is a source rewrite, so bundling the one module that reads the
+ * version settles it for every target at once — and in well under a second.
  */
-function assertVersionEmbedded(binary, label) {
-  if (!readFileSync(binary).includes(VERSION)) {
-    throw new Error(`The ${label} does not contain the string ${VERSION} — --define did not apply.`);
+function assertDefineApplies() {
+  const res = spawnSync('bun', ['build', ...DEFINE_VERSION, '--target', 'node', 'src/version.ts'], {
+    cwd: ROOT,
+    encoding: 'utf8',
+  });
+  if (res.status !== 0) {
+    throw new Error(`bun build failed while checking --define:\n${res.stderr}`);
+  }
+  if (
+    res.stdout.includes('process.env.APP_VERSION') ||
+    !res.stdout.includes(JSON.stringify(VERSION))
+  ) {
+    throw new Error(
+      `--define did not substitute the version. Every binary this build produced would report ` +
+        `the unset fallback instead of ${VERSION}.`
+    );
   }
 }
 
@@ -194,6 +208,7 @@ step(`Building hankha-print-bridge v${VERSION}`);
 // the two drift. Rewrite the mirror here rather than making a bump two hand-edits.
 const synced = syncManifestVersion(VERSION);
 if (synced.length > 0) console.log(`   version ${VERSION} written to ${synced.join(', ')}`);
+assertDefineApplies();
 rmSync(BIN_DIR, { recursive: true, force: true });
 mkdirSync(BIN_DIR, { recursive: true });
 mkdirSync(OUT_DIR, { recursive: true });
@@ -253,7 +268,6 @@ let winBinary = null;
 if (buildWin) {
   winBinary = join(BIN_DIR, 'hankha-print-bridge.exe');
   compile('bun-windows-x64', winBinary);
-  assertVersionEmbedded(winBinary, 'Windows exe');
   if (process.platform !== 'win32') {
     warn(
       'Cross-built from ' + process.platform + ', so the .exe carries no version/publisher ' +
