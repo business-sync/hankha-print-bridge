@@ -1,0 +1,49 @@
+# An always-on print bridge for one venue.
+#
+# Use this instead of a cashier's laptop when printing must survive someone going home: the
+# box stays on, the bridge stays enrolled, and every device in the shop — phones included —
+# prints through it.
+services:
+  print-bridge:
+    image: ghcr.io/business-sync/hankha-print-bridge:latest
+    # Or build locally:  docker compose build
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+
+    # MANDATORY, and the single most common way to get this wrong.
+    #
+    # On a normal bridge network the container's only interface is 172.x, so:
+    #   - /scan sweeps the DOCKER bridge and finds no printers, and
+    #   - the interfaces it reports upstream drive the POS's subnet comparison, which then
+    #     tells an operator their printer is "on a different network" when it is not.
+    # Printing itself still works (outbound NATs fine), which is exactly what makes this so
+    # confusing to diagnose. The bridge detects the situation and reports
+    # `net_warning: container-suspect`, but host networking is the actual fix. macvlan is the
+    # only other correct option.
+    network_mode: host
+
+    volumes:
+      # relay.json — the install id and bearer token. WITHOUT this the bridge re-enrolls on
+      # every restart, minting a new bridge row each time and leaving the operator choosing
+      # between a dozen identical entries.
+      - print-bridge-state:/var/lib/hankha-print-bridge
+
+    environment:
+      PRINT_BRIDGE_HOST: 0.0.0.0
+      PRINT_BRIDGE_PORT: "9200"
+      PRINT_BRIDGE_STATE_DIR: /var/lib/hankha-print-bridge
+      PRINT_BRIDGE_RELAY_URL: ${PRINT_BRIDGE_RELAY_URL:-https://api.hankha.la}
+      # Bound to 0.0.0.0 above, so everything on the venue Wi-Fi can reach it. Set a token
+      # unless the network is genuinely trusted.
+      PRINT_BRIDGE_TOKEN: ${PRINT_BRIDGE_TOKEN:-}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  print-bridge-state:

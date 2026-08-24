@@ -1,0 +1,81 @@
+name: Prod environment CI and CD
+
+on:
+  # A tag also builds the desktop installers and publishes a Release. That Release is what
+  # `VITE_PRINT_BRIDGE_DOWNLOAD_URL` in the POS points at — until one exists, Settings >
+  # Printing shows install instructions with no download button.
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+concurrency:
+  group: print-bridge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+
+  build-and-push-docker-image:
+    name: Build Docker image and push to ghcr.io
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup SHA
+        run: echo "GITHUB_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
+      - name: Login ghcr.io
+        uses: docker/login-action@v2.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.WORKFLOW_TOKEN }}
+          logout: true
+      - name: Build the Docker image
+        run: |
+          docker build . --file ./docker/Dockerfile \
+            --tag ghcr.io/business-sync/hankha-print-bridge:${{ env.GITHUB_SHA }} \
+            --tag ghcr.io/business-sync/hankha-print-bridge:latest
+      - name: Push the Docker image
+        run: |
+          docker push ghcr.io/business-sync/hankha-print-bridge:${{ env.GITHUB_SHA }}
+          docker push ghcr.io/business-sync/hankha-print-bridge:latest
+
+  installers:
+    name: Build desktop installers
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test]
+    # macOS runner only: `scripts/package.mjs` cross-builds the Windows binary from macOS with
+    # bun, and needs macOS-only tooling (lipo, pkgbuild, productbuild) for the .pkg and .dmg.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      # `assertDefineApplies` / `assertBinaryVersion` fail the build if APP_VERSION did not get
+      # inlined, so a version mismatch here is a hard error rather than a silently mislabelled
+      # binary that the POS later reports as out of date.
+      - name: Build installers
+        run: npm run package
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-installers/*.pkg
+            dist-installers/*.dmg
+            dist-installers/*.zip
+            dist-installers/*setup.exe
+            dist-installers/SHA256SUMS.txt
+          generate_release_notes: true

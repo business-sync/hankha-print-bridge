@@ -1,0 +1,43 @@
+# systemd unit for an on-site print bridge (Debian/Ubuntu box, no Docker).
+#
+#   sudo cp deploy/hankha-print-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hankha-print-bridge
+#
+# Enroll it once, as the same user the service runs as:
+#   sudo -u hankha /opt/hankha/print-bridge/bin/hankha-print-bridge --enroll ABCD-2345
+
+[Unit]
+Description=Hankha Print Bridge
+Documentation=https://github.com/business-sync/hankha-print-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hankha
+Group=hankha
+WorkingDirectory=/opt/hankha/print-bridge
+ExecStart=/usr/bin/node /opt/hankha/print-bridge/dist/index.js
+EnvironmentFile=-/etc/hankha/print-bridge.env
+
+Restart=always
+RestartSec=5
+
+# Hardening. ProtectSystem=strict makes the whole filesystem read-only, so the relay state
+# file needs an explicit writable home — StateDirectory creates and owns
+# /var/lib/hankha-print-bridge, which is what PRINT_BRIDGE_STATE_DIR points at below. Without
+# it the bridge cannot persist its token and silently re-enrolls on every restart.
+StateDirectory=hankha-print-bridge
+Environment=PRINT_BRIDGE_STATE_DIR=/var/lib/hankha-print-bridge
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# The bridge opens outbound TCP to printers and to the relay; nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
