@@ -244,11 +244,17 @@ export function startRelay(): void {
   status.bridge_id = state.bridge_id;
   console.log(`relay: enrolled as bridge ${state.bridge_id}, polling ${base}`);
 
-  const beat = setInterval(() => {
+  const beatOnce = () =>
     heartbeat(base, token).catch(() => {
       /* the poll loop is the real liveness signal; a missed beat is not worth logging */
     });
-  }, HEARTBEAT_INTERVAL_MS);
+
+  // Beat IMMEDIATELY, not at the first interval. `online` upstream is derived from
+  // `last_seen_at`, so waiting a full interval leaves a freshly-restarted bridge showing as
+  // offline in the POS for 30 seconds — during which an operator is told they cannot print
+  // through a bridge that is in fact running.
+  void beatOnce();
+  const beat = setInterval(beatOnce, HEARTBEAT_INTERVAL_MS);
   beat.unref();
 
   void (async () => {
