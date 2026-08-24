@@ -1,35 +1,137 @@
 # hankha-print-bridge
 
-Local LAN helper that lets the POS terminal (a browser PWA, which cannot open a raw TCP socket)
-print to a network ESC/POS printer. Run this on a PC on the venue's LAN; the POS terminal talks
-to it over HTTP, and it opens the real TCP connection to the printer's IP:port.
+The helper that lets a POS terminal print to a **network** ESC/POS printer. The terminal is a
+browser PWA and cannot open a raw TCP socket; the cloud API cannot reach a venue's private LAN.
+So the terminal POSTs its bytes here over HTTP, and this process dials the printer's `ip:port`.
 
-## Run
+```
+POS terminal (browser)  --POST /print-->  print bridge  --TCP 9100-->  ESC/POS printer
+```
+
+It ships as a **self-contained binary** — a till never needs Node installed.
+
+> Not to be confused with `apps/inkline-agent`, a separate Go daemon on port 9101 serving a
+> different client (`ip-printer-web`) with an incompatible API. The POS terminal only ever talks
+> to this one.
+
+## Install it on every till — not on one shared PC
+
+A POS served over `https` may only call `http://` on `localhost`. Every other address is
+blocked as mixed content **before the request leaves the browser**, so a bridge on another
+machine is unreachable no matter how the network is set up. The installers therefore bind the
+bridge to `127.0.0.1` and it is installed per till.
+
+(The `-Lan` / "serve other terminals" option exists for venues serving the POS over plain
+`http`. It is off by default.)
+
+### macOS
+
+Double-click `hankha-print-bridge-<version>-macos-universal.pkg` and follow the steps. It
+installs to `/usr/local/hankha/print-bridge`, registers a LaunchDaemon, and starts immediately —
+and on every boot after that.
+
+The build is **unsigned**, so the first open shows *"cannot be opened because it is from an
+unidentified developer"*. Right-click the `.pkg` and choose **Open**, or clear the quarantine
+flag first:
+
+```bash
+xattr -dr com.apple.quarantine hankha-print-bridge-*.pkg
+```
+
+Verify, and uninstall:
+
+```bash
+curl http://127.0.0.1:9200/health
+sudo /usr/local/hankha/print-bridge/uninstall.sh
+```
+
+Log: `/var/log/hankha-print-bridge.log`
+
+### Windows
+
+Run `hankha-print-bridge-<version>-windows-x64-setup.exe`. SmartScreen will say *"Windows
+protected your PC"* because the build is unsigned — click **More info** then **Run anyway**.
+Uninstall from **Settings → Apps** like any other program.
+
+For a scripted rollout, unzip `…-windows-x64.zip` and run from an elevated PowerShell:
+
+```powershell
+.\install.ps1          # add -Lan to also serve other terminals on this network
+.\uninstall.ps1
+```
+
+Both paths install to `%ProgramFiles%\Hankha\Print Bridge` and register a **scheduled task**
+(`Hankha Print Bridge`, at startup, as SYSTEM). Not a Windows service: the bridge is a plain
+console program and does not implement the service-control handshake, so `sc.exe create` would
+register a service that dies with error 1053 on every start. A task avoids bundling a
+third-party service wrapper.
+
+Log: `C:\ProgramData\Hankha\PrintBridge\logs\bridge.log`
+
+### Connecting the terminal
+
+Open the POS on the same computer → **Settings → Printing**. The Print Bridge card should read
+*"Print Bridge is running"* and name this machine. Then press **Search** to find printers.
+
+## Building the installers
+
+```bash
+bun run package             # everything this machine can produce
+bun run package:macos
+bun run package:windows
+```
+
+Artifacts land in `dist-installers/` with a `SHA256SUMS.txt`.
+
+Requirements: **Bun** for the binaries (cross-compiles all targets from any host); **macOS**
+for the `.pkg` (`pkgbuild`/`productbuild` exist nowhere else); **NSIS** for `setup.exe`. The
+script prefers a local `makensis` but verifies it actually compiles first — Homebrew's
+makensis 3.12 aborts with `std::bad_alloc` on macOS 26 for *any* script — and otherwise falls
+back to a container built from `installer/windows/Dockerfile.nsis`. With neither, it warns and
+ships only the `.zip`.
+
+### Signing
+
+Unsigned by default. Every hook below is a no-op when its variable is unset:
+
+| Variable | Effect |
+|---|---|
+| `HANKHA_MACOS_SIGN_IDENTITY` | Developer ID Application — signs the binary with a hardened runtime |
+| `HANKHA_MACOS_INSTALLER_IDENTITY` | Developer ID Installer — signs the `.pkg` |
+| `HANKHA_NOTARY_PROFILE` | `notarytool` keychain profile — notarizes and staples |
+| `HANKHA_WINDOWS_PFX` / `HANKHA_WINDOWS_PFX_PASSWORD` | signs the `.exe` and the setup via `osslsigncode` |
+
+The macOS binary is always **ad-hoc** signed regardless: Apple silicon refuses to launch an
+unsigned binary at all, and the failure — `Killed: 9` at exec — never reaches the installer log.
+
+## Development
 
 ```bash
 npm install
-npm run dev     # tsx watch, port 9200 by default
+npm run dev      # tsx watch, port 9200
+npm test         # node:test, no test framework dependency
+npm run typecheck
 ```
 
-or build once and run the compiled output:
+`npm run dev` binds `0.0.0.0` (unchanged from before packaging existed); the installers set
+`PRINT_BRIDGE_HOST=127.0.0.1`.
 
-```bash
-npm run build
-npm start
-```
+| Variable | Default | |
+|---|---|---|
+| `PRINT_BRIDGE_PORT` | `9200` | |
+| `PRINT_BRIDGE_HOST` | `0.0.0.0` | `127.0.0.1` accepts only this machine |
 
-Override the port with `PRINT_BRIDGE_PORT`. On start it prints every LAN address it can be
-reached at — use one of those as the bridge URL on terminals other than this PC.
-
-```bash
-npm test          # node:test, no test framework dependency
-```
+On Windows, `%ProgramData%\Hankha\PrintBridge\bridge.env` overrides both without touching the
+scheduled task.
 
 ## API
 
-- `GET /health` → `{ ok, service: "hankha-print-bridge", version, interfaces: [{ address, cidr }] }`.
-  `service` lets the terminal tell a real bridge from some other app answering on that port;
-  `interfaces` lets it warn when a configured printer sits on a different network.
+- `GET /health` → `{ ok, service, version, interfaces: [{ address, cidr }], hostname, platform,
+  arch, pid, uptime_s }`. `ok` is first and never changes shape — older terminals read only
+  that. `service` lets the terminal tell a real bridge from some other app on the port;
+  `interfaces` lets it warn when a configured printer sits on a different network; the
+  host/platform block is how an operator sees *which* machine answered, which matters once the
+  bridge is an invisible background service.
 - `POST /probe` — body `{ ip, port? }` (port defaults to 9100) →
   `{ ok, reachable, latency_ms, reason? }` with `reason: "timeout" | "refused" | "unreachable"`.
   Opens a TCP connection and drops it **without writing** — a printer that receives stray bytes
@@ -48,9 +150,21 @@ Every endpoint that dials an address refuses anything outside RFC1918 private sp
 (the terminal's origin varies too much to pin down), so that restriction is what stops a random
 page from using the bridge to scan the public internet from inside the venue's network.
 
+## Troubleshooting
+
+**"Print Bridge is not answering"** — almost always another program on port 9200. The log says
+so explicitly. Change it with `PRINT_BRIDGE_PORT` and set the matching address in the POS.
+
+**"That is not the Print Bridge"** — something else answered on that port. The classic cause is
+a URL pointing at `:3100` (the admin portal) or `:3101` (the POS itself) instead of `:9200`.
+
+**"Your browser is blocking the Print Bridge"** — the POS is on `https` and the bridge address
+is not `localhost`. Install the bridge on the till itself; see the top of this file.
+
+**Printing works, discovery doesn't** — the bridge is older than v1.1 (no `/scan`). The POS
+shows an "update the Print Bridge" warning below v1.2.
+
 ## Scope
 
-This process only forwards bytes — it has no printer-specific logic (that's built into the POS
-terminal's ESC/POS payload before it gets here) and no persistence. Packaging it as an
-autostarting service (Windows service, macOS launchd, etc.) for a real venue deployment is a
-separate follow-up.
+This process only forwards bytes: no printer-specific logic (the ESC/POS payload is built in the
+POS terminal, including the Lao raster path) and no persistence.
