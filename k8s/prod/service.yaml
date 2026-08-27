@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hankha-print-bridge-service
+  namespace: hankha
+spec:
+  selector:
+    app: hankha-print-bridge
+  type: NodePort
+  sessionAffinity: None
+  externalTrafficPolicy: Cluster
+  internalTrafficPolicy: Cluster
+  ports:
+    - name: hankha-print-bridge-port
+      protocol: TCP
+      port: 9200
+      targetPort: 9200
+      nodePort: 30020

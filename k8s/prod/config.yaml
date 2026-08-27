@@ -1,0 +1,23 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: hankha-print-bridge-config
+  namespace: hankha
+data:
+  NODE_ENV: "production"
+  APP_VERSION: 1.3.0
+  PRINT_BRIDGE_PORT: '9200'
+  PRINT_BRIDGE_HOST: "0.0.0.0"
+  HANKHA_MACOS_SIGN_IDENTITY: ""
+  HANKHA_MACOS_INSTALLER_IDENTITY: ""
+  HANKHA_NOTARY_PROFILE: ""
+  HANKHA_WINDOWS_PFX: ""
+  HANKHA_WINDOWS_PFX_PASSWORD: ""
+  PRINT_BRIDGE_RELAY_URL: "https://api.hankha.la"
+  PRINT_BRIDGE_STATE_DIR: ""
+  PRINT_BRIDGE_TOKEN: ""
+  PRINT_BRIDGE_TLS_CERT: ""
+  PRINT_BRIDGE_TLS_KEY: ""
+
+
+ 
