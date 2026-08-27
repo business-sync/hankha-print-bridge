@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hankha-print-bridge
+  namespace: hankha
+  labels:
+    app: hankha-print-bridge
+spec:
+  selector:
+    matchLabels:
+      app: hankha-print-bridge
+  replicas: 1
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: hankha-print-bridge
+    spec:
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: hankha-print-bridge
+        image: ghcr.io/business-sync/hankha-print-bridge:7be0e050e07cb69d46e16f6cd796b0708d8d0171
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: 500m
+            memory: 100Mi
+          limits:
+            cpu: 2000m
+            memory: 2048Mi
+        livenessProbe:
+          tcpSocket:
+            port: 80
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 80
+          initialDelaySeconds: 5
+          timeoutSeconds: 2
+          successThreshold: 1
+          failureThreshold: 3
+          periodSeconds: 10
+        envFrom:
+        - configMapRef:
+            name: hankha-print-bridge-config
+        # - secretRef:
+        #     name: sync-db-prod
+        # - secretRef:
+        #     name: s3-storage
+        ports:
+        - containerPort: 80
+          name: http
+        volumeMounts:
+        - name: localtime
+          mountPath: /etc/localtime
+
+      volumes:
+      - name: localtime
+        hostPath:
+          path: /usr/share/zoneinfo/Asia/Bangkok
+      - name: vol-hankha-print-bridge
+        # nfs:
+        #   path: /mnt/gfs
+        #   server: gfs-01
+      restartPolicy: Always
