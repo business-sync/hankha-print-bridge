@@ -120,6 +120,9 @@ const HRI_CODE: Record<HriPosition, number> = { none: 0, above: 1, below: 2, bot
  * `GS k` selector for each symbology, using Function B (m >= 65), which takes an explicit length
  * instead of a NUL terminator — the only form that can carry a value containing a zero byte.
  */
+/** The ceiling `GS k` function B's single length byte can express. */
+const MAX_BARCODE_BYTES = 255;
+
 const BARCODE_CODE: Record<BarcodeSymbology, number> = {
   UPCA: 65, UPCE: 66, EAN13: 67, EAN8: 68, CODE39: 69, ITF: 70, CODE128: 73,
 };
@@ -254,6 +257,19 @@ export class EscPosBuilder {
     // either guesses or refuses, and the guess differs by vendor.
     const payload = symbology === 'CODE128' && !value.startsWith('{') ? `{B${value}` : value;
     const data = Buffer.from(payload, 'ascii');
+    /*
+     * `GS k` function B carries a ONE-byte length, and `Buffer.from(number[])` masks anything
+     * above 255 rather than complaining. So an over-long value does not fail — it announces a
+     * wrong length, the printer reads that many bytes as barcode data, and then reads the rest
+     * of the payload as commands: random cuts, drawer kicks, a metre of garbage. Checked after
+     * the `{B` prefix, because those two bytes count too. `qr()` below bounds itself the same way.
+     */
+    if (data.length > MAX_BARCODE_BYTES) {
+      errors.push(
+        `${where}: ${symbology} value is ${data.length} bytes, over the ${MAX_BARCODE_BYTES} a printer can be told about`
+      );
+      return this;
+    }
     this.push(GS, 0x6b, BARCODE_CODE[symbology], data.length);
     return this.raw(data);
   }
@@ -305,13 +321,41 @@ export class EscPosBuilder {
   }
 }
 
-/** Pad `left` and `right` to fill one line, truncating the left side when they collide. */
+/** What a string occupies on paper: the encoder's output, not its code-unit count. */
+function printedWidth(value: string): number {
+  return encodeText(value).bytes.length;
+}
+
+/** The longest prefix of `value` that fits `max` printed columns, cut on a character boundary. */
+function truncateToWidth(value: string, max: number): string {
+  if (max <= 0) return '';
+  let out = '';
+  let used = 0;
+  for (const char of value) {
+    const next = printedWidth(char);
+    if (used + next > max) break;
+    out += char;
+    used += next;
+  }
+  return out;
+}
+
+/**
+ * Pad `left` and `right` to fill one line, truncating the left side when they collide.
+ *
+ * Measured in ENCODED columns, not code units, because `encodeText` expands: `₭` becomes `LAK`,
+ * `…` becomes `...`, `½` becomes `1/2`, `°` becomes `deg`. `₭25,000` is seven code units and
+ * nine printed columns, so padding by `.length` overran the line by two and wrapped the price
+ * onto a row of its own — on the totals line of every receipt in a kip-denominated venue, which
+ * is the whole fleet.
+ */
 export function twoColumns(left: string, right: string, width: number): string {
-  if (right.length >= width) return right.slice(0, width);
-  const room = width - right.length;
-  if (left.length <= room - 1) return left + ' '.repeat(room - left.length) + right;
+  const rightWidth = printedWidth(right);
+  if (rightWidth >= width) return truncateToWidth(right, width);
+  const room = width - rightWidth;
   // One space minimum, so the price never runs into the name and become unreadable.
-  return `${left.slice(0, Math.max(0, room - 1))} ${right}`;
+  const trimmed = truncateToWidth(left, room - 1);
+  return trimmed + ' '.repeat(room - printedWidth(trimmed)) + right;
 }
 
 function applyElement(
@@ -345,11 +389,16 @@ function applyElement(
       break;
     }
 
-    case 'rule':
+    case 'rule': {
       builder.align('left').font('A');
-      builder.text((element.char ?? '-').repeat(charsPerLine(width, 'A')), errors, where);
+      // Counted in printed columns for the same reason `twoColumns` is: a rule drawn with `°`
+      // encodes to `deg` and would otherwise run three lines long.
+      const mark = element.char ?? '-';
+      const markWidth = printedWidth(mark) || 1;
+      builder.text(mark.repeat(Math.max(1, Math.floor(charsPerLine(width, 'A') / markWidth))), errors, where);
       builder.newline();
       break;
+    }
 
     case 'feed':
       builder.feed(element.lines ?? 1);
