@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { createServer as createTcpServer, type Server as TcpServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { localInterfaces } from './lan.js';
+import { resetRegistryCache } from './registry.js';
 import { BRIDGE_SERVICE, createBridgeServer } from './server.js';
+
+let stateDir = '';
 
 let bridge: Server;
 let baseUrl: string;
@@ -27,13 +33,32 @@ async function post(path: string, body: unknown): Promise<{ status: number; json
   return { status: res.status, json: await res.json().catch(() => null) };
 }
 
+async function put(path: string, body: unknown, token?: string): Promise<{ status: number; json: any }> {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
 before(async () => {
+  // The spool, the settled ring and printers.json all live under stateDir(). Point it at a
+  // scratch directory so a test run never writes into the developer's real install.
+  stateDir = mkdtempSync(join(tmpdir(), 'hankha-server-'));
+  process.env.PRINT_BRIDGE_STATE_DIR = stateDir;
+  // Short, so a test that deliberately targets an unreachable address is not a 15-second wait.
+  process.env.PRINT_BRIDGE_SEND_TIMEOUT_MS = '1000';
+  resetRegistryCache();
   bridge = createBridgeServer();
   baseUrl = `http://127.0.0.1:${await listen(bridge)}`;
 });
 
 after(() => {
   bridge.close();
+  delete process.env.PRINT_BRIDGE_STATE_DIR;
+  delete process.env.PRINT_BRIDGE_SEND_TIMEOUT_MS;
+  rmSync(stateDir, { recursive: true, force: true });
 });
 
 describe('GET /health', () => {
@@ -211,5 +236,234 @@ describe('unknown routes', () => {
   it('404s', async () => {
     const res = await fetch(`${baseUrl}/nope`);
     assert.equal(res.status, 404);
+  });
+});
+
+/*
+ * The POS terminal's contract, pinned.
+ *
+ * `features/printer/transports/network-transport.ts` sends exactly `{ip, port, payload_base64}`
+ * and treats an HTTP 200 whose body says `ok: true` as PROOF a receipt printed. Its
+ * `probeBridge()` calls `/health` with NO Authorization header. `bridge-client.ts` rejects the
+ * bridge unless `service` is exactly 'hankha-print-bridge', and its `compareVersions` returns null
+ * — silently disabling every version gate — for anything that is not three dotted numbers.
+ *
+ * All four of those are load-bearing on a till that will never be updated in step with this
+ * process, so they are tests rather than comments.
+ */
+describe('POS terminal compatibility', () => {
+  it('answers a successful /print with exactly { ok: true }', async (t) => {
+    const lan = localInterfaces()[0];
+    if (!lan) return t.skip('no private LAN interface on this machine');
+
+    const fake = createTcpServer((socket) => socket.resume());
+    const port = await new Promise<number>((resolve) => {
+      fake.listen(0, '0.0.0.0', () => {
+        const address = fake.address();
+        if (typeof address === 'string' || address === null) throw new Error('no port');
+        resolve(address.port);
+      });
+    });
+
+    try {
+      const { status, json } = await post('/print', {
+        ip: lan.address, port, payload_base64: Buffer.from('x').toString('base64'),
+      });
+      assert.equal(status, 200);
+      // Not `assert.equal(json.ok, true)`: an extra key here would be a new field the terminal
+      // does not read, and the point is that the success body has never grown one.
+      assert.deepEqual(json, { ok: true });
+    } finally {
+      fake.close();
+    }
+  });
+
+  it('reports a failed /print with the reason the terminal shows the operator', async () => {
+    const dead = createTcpServer();
+    const port = await new Promise<number>((resolve) => {
+      dead.listen(0, '127.0.0.1', () => {
+        const address = dead.address();
+        if (typeof address === 'string' || address === null) throw new Error('no port');
+        resolve(address.port);
+      });
+    });
+    await new Promise<void>((r) => dead.close(() => r()));
+
+    const { status, json } = await post('/print', {
+      ip: '192.168.255.254', port, payload_base64: Buffer.from('x').toString('base64'),
+    });
+    assert.equal(status, 502);
+    assert.equal(json.ok, false);
+    assert.equal(typeof json.reason, 'string');
+    // Additive fields the terminal ignores today but which the relay and the queue both use.
+    assert.ok(json.printed_certainty === 'none' || json.printed_certainty === 'unknown');
+  });
+
+  it('rejects an empty payload as invalid rather than printing nothing', async () => {
+    const { status, json } = await post('/print', { ip: '192.168.1.2', port: 9100, payload_base64: '' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-payload');
+  });
+
+  it('keeps /health open when a token is set, and guards everything else', async () => {
+    process.env.PRINT_BRIDGE_TOKEN = 'shhh';
+    try {
+      // NetworkTransport.probeBridge() sends no Authorization header. If /health started
+      // returning 401 the terminal would report the bridge as down, not as misconfigured.
+      const health = await fetch(`${baseUrl}/health`);
+      assert.equal(health.status, 200);
+      const body = await health.json();
+      assert.equal(body.ok, true);
+      assert.equal(body.auth_required, true);
+
+      assert.equal((await fetch(`${baseUrl}/printers`)).status, 401);
+      const authorized = await fetch(`${baseUrl}/printers`, { headers: { Authorization: 'Bearer shhh' } });
+      assert.equal(authorized.status, 200);
+      // A near-miss must not pass: the comparison is constant-time over equal lengths.
+      assert.equal((await fetch(`${baseUrl}/printers`, { headers: { Authorization: 'Bearer shhi' } })).status, 401);
+    } finally {
+      delete process.env.PRINT_BRIDGE_TOKEN;
+    }
+  });
+
+  it('reports a version the terminal can actually parse', async () => {
+    const body = await (await fetch(`${baseUrl}/health`)).json();
+    // compareVersions() returns null for anything else, which silently disables every gate that
+    // depends on it rather than failing visibly.
+    assert.match(body.version, /^\d+\.\d+\.\d+$/);
+    assert.equal(body.service, 'hankha-print-bridge');
+  });
+
+  it('ignores a trailing slash, because half the clients build URLs by concatenation', async () => {
+    assert.equal((await fetch(`${baseUrl}/health/`)).status, 200);
+  });
+});
+
+describe('the printer registry over HTTP', () => {
+  it('round-trips a registry and reports every validation error at once', async () => {
+    const bad = await put('/printers', { printers: [{ id: 'x', transport: 'network' }, { id: 'y', transport: 'usb' }] });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json.reason, 'invalid-registry');
+    assert.equal(bad.json.errors.length, 2);
+
+    const good = await put('/printers', {
+      printers: [
+        // Deliberately an address nothing answers on. A test registry pointed at a plausible
+        // venue subnet WILL find a real printer on a developer's LAN and print garbage on it.
+        { id: 'counter', name: 'Counter', transport: 'network', address: '192.168.255.253', port: 9100 },
+        { id: 'labels', name: 'Labels', transport: 'network', address: '192.168.255.252', type: 'label',
+          language: 'tspl', width_mm: 50, height_mm: 30 },
+      ],
+      default_receipt_printer: 'counter',
+    });
+    assert.equal(good.status, 200);
+    assert.equal(good.json.printers.length, 2);
+
+    const read = await (await fetch(`${baseUrl}/printers`)).json();
+    assert.equal(read.default_receipt_printer, 'counter');
+    assert.equal(read.printers[0].dots_per_line, 576, 'defaults are filled in on the way through');
+  });
+});
+
+describe('POST /jobs', () => {
+  it('renders a receipt document and accepts it for printing', async () => {
+    const { status, json } = await post('/jobs', {
+      printer_id: 'counter',
+      receipt: { elements: [{ type: 'text', value: 'HELLO' }, { type: 'columns', left: 'Latte', right: '25,000' }] },
+    });
+    assert.equal(status, 202);
+    assert.equal(json.ok, true);
+    assert.equal(json.job.printer_id, 'counter');
+    assert.ok(json.job.bytes > 0, 'the document was rendered, not stored raw');
+    assert.equal(json.job.payload_base64, undefined, 'a megabyte of base64 has no place in a status body');
+
+    const fetched = await (await fetch(`${baseUrl}/jobs/${json.job.job_id}`)).json();
+    assert.equal(fetched.ok, true);
+    assert.equal(fetched.job.job_id, json.job.job_id);
+  });
+
+  it('refuses a receipt containing text no printer could render, naming the way out', async () => {
+    const { status, json } = await post('/jobs', {
+      printer_id: 'counter',
+      receipt: { elements: [{ type: 'text', value: '2x ເຂົ້າຜັດໄກ່' }] },
+    });
+    // The original bug printed this as a blank line and reported success. A 422 naming the
+    // characters is the whole improvement.
+    assert.equal(status, 422);
+    assert.equal(json.reason, 'render-failed');
+    assert.match(json.errors[0], /'image' element/);
+  });
+
+  it('refuses a receipt document aimed at a label printer', async () => {
+    const { status, json } = await post('/jobs', {
+      printer_id: 'labels',
+      receipt: { elements: [{ type: 'text', value: 'TOTAL' }] },
+    });
+    assert.equal(status, 422);
+    assert.match(json.errors[0], /TSPL/);
+  });
+
+  it('reports document validation errors rather than printing something wrong', async () => {
+    const { status, json } = await post('/jobs', {
+      printer_id: 'labels',
+      label: { elements: [{ type: 'barcode', x: 0, y: 0, symbology: 'NOPE', value: 'x' }] },
+    });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-document');
+    assert.ok(json.errors.length > 0);
+  });
+
+  it('needs exactly one of payload_base64, receipt or label', async () => {
+    assert.equal((await post('/jobs', { printer_id: 'counter' })).status, 400);
+    assert.equal(
+      (await post('/jobs', { printer_id: 'counter', payload_base64: 'AA==', receipt: { elements: [] } })).status,
+      400
+    );
+  });
+
+  it('404s an unknown job id', async () => {
+    assert.equal((await fetch(`${baseUrl}/jobs/nope`)).status, 404);
+  });
+});
+
+describe('GET /status', () => {
+  it('reports transports, printers and queue depth', async () => {
+    const { status, json } = await post('/jobs', { printer_id: 'counter', payload_base64: 'AAAA' });
+    assert.equal(status, 202);
+    assert.ok(json.job);
+
+    const body = await (await fetch(`${baseUrl}/status`)).json();
+    assert.equal(body.ok, true);
+    assert.equal(body.service, BRIDGE_SERVICE);
+    // An empty printer list has two very different meanings; the availability flags are what tell
+    // "no USB printers" apart from "this machine cannot see USB printers at all".
+    assert.deepEqual(body.transports.map((t: { kind: string }) => t.kind), ['network', 'usb', 'serial']);
+    assert.equal(body.printers.length, 2);
+    assert.equal(typeof body.queue.pending, 'number');
+    assert.equal(typeof body.queue.queued, 'number');
+  });
+});
+
+describe('POST /discover', () => {
+  it('answers with every transport, and says which ones this machine cannot use', async () => {
+    // Port 9 so the sweep finds nothing but still exercises the whole path.
+    const { status, json } = await post('/discover', { port: 9 });
+    assert.equal(status, 200);
+    assert.equal(json.ok, true);
+    assert.ok(Array.isArray(json.printers));
+    assert.equal(json.transports.length, 3);
+  });
+});
+
+describe('request limits', () => {
+  it('refuses a body big enough to be a denial of service', async () => {
+    const res = await fetch(`${baseUrl}/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ printer_id: 'counter', payload_base64: 'A'.repeat(9 * 1024 * 1024) }),
+    }).catch(() => null);
+    // The connection is destroyed as soon as the cap is passed, so either a 413 or a dropped
+    // request is a pass — what must not happen is the body being buffered in full.
+    assert.ok(res === null || res.status === 413, `expected 413 or a dropped request, got ${res?.status}`);
   });
 });

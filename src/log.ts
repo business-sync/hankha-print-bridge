@@ -25,7 +25,13 @@ const LEVEL_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, e
 
 function configuredLevel(): LogLevel {
   const raw = process.env.PRINT_BRIDGE_LOG_LEVEL?.trim().toLowerCase();
-  return raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error' ? raw : 'info';
+  if (raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error') return raw;
+  // Quiet under `node --test`, which sets this itself. The queue and the relay narrate every job,
+  // and interleaving that with the test reporter's own output makes a failure hard to find. An
+  // explicit PRINT_BRIDGE_LOG_LEVEL still wins, which is how you get the narration back while
+  // debugging one. Chosen over an env prefix in the npm script because that would not run on
+  // Windows.
+  return process.env.NODE_TEST_CONTEXT ? 'error' : 'info';
 }
 
 function jsonFormat(): boolean {

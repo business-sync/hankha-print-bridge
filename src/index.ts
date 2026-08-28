@@ -242,7 +242,9 @@ function runService(): void {
   });
 
   // Reads the spool back and resumes anything a previous run left behind, before the first request
-  // can add to it.
+  // can add to it. `queue()` loads on creation; this call is what forces that to happen HERE
+  // rather than lazily inside the first request, and `load()` is idempotent so the two cannot
+  // race into a double recovery.
   queue().load();
 
   // The outbound half: dial the cloud API and wait for jobs, so a phone or a till on mobile data

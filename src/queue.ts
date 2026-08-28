@@ -131,6 +131,7 @@ export class PrintQueue {
   private settledLines = 0;
   private readonly history: JobRecord[] = [];
   private draining = false;
+  private loaded = false;
   private readonly sleepers = new Set<() => void>();
 
   constructor(options: QueueOptions = {}) {
@@ -157,6 +158,17 @@ export class PrintQueue {
    * is no way left to ask.
    */
   load(): void {
+    /*
+     * Idempotent, and that is not a nicety.
+     *
+     * A second load re-reads the spool directory while the first one's jobs are already in flight.
+     * Anything it finds in `printing` gets settled as interrupted — reporting a job as failed when
+     * it is at that moment printing successfully — and anything still `queued` is pushed into the
+     * lane a SECOND time, which prints it twice. Both were observed before this guard existed.
+     */
+    if (this.loaded) return;
+    this.loaded = true;
+
     this.loadSettledRing();
 
     let recovered = 0;
@@ -465,9 +477,24 @@ export class PrintQueue {
       duration_ms: outcome.duration_ms,
     };
 
-    const expiresSoon = job.expires_at !== null && Date.now() > Date.parse(job.expires_at);
+    const expired = job.expires_at !== null && Date.now() > Date.parse(job.expires_at);
+    /*
+     * A DEADLINE outranks the attempt count.
+     *
+     * `maxAttempts` alone gives up after about three seconds of backoff, which is shorter than a
+     * printer takes to finish rebooting — so a receipt would be abandoned while the thing it was
+     * meant for was still coming back up. When the caller set a TTL it has already said how long
+     * the job stays worth printing, and the top of this method drops it the moment that passes.
+     * So the count is the safety valve for jobs with NO deadline, and the deadline governs the
+     * rest.
+     */
+    const withinDeadline = job.expires_at !== null && !expired;
     const mayRetry =
-      job.retryable && certainty === 'none' && job.attempts < this.maxAttempts && !expiresSoon && !this.draining;
+      job.retryable &&
+      certainty === 'none' &&
+      !expired &&
+      !this.draining &&
+      (job.attempts < this.maxAttempts || withinDeadline);
 
     if (!mayRetry) {
       job.status = 'failed';
@@ -490,7 +517,7 @@ export class PrintQueue {
     this.persist(job);
     log.warn(
       `queue: job ${job.job_id} failed (${outcome.reason}) but nothing printed — retrying in ${Math.round(wait / 1000)}s ` +
-        `(attempt ${job.attempts} of ${this.maxAttempts})`,
+        (withinDeadline ? `(attempt ${job.attempts}, until ${job.expires_at})` : `(attempt ${job.attempts} of ${this.maxAttempts})`),
       { event: 'queue.retry', job_id: job.job_id, printer_id: job.printer.id, reason: outcome.reason, attempt: job.attempts, wait_ms: wait }
     );
     await this.sleep(wait);
