@@ -516,6 +516,29 @@ Cloud jobs go through the same queue as everything else, and the poll loop no lo
 to print: a printer taking four seconds to answer used to stop the bridge fetching *any* work for
 those four seconds.
 
+### Reaching a USB or Bluetooth printer from a tablet
+
+A cloud job may address a printer two ways, and exactly one of them is set:
+
+- `target_ip` / `target_port` — a socket the bridge dials. The original contract.
+- `printer_id` — an entry in this bridge's own `printers.json`, resolved by `findPrinter`.
+
+The second exists because a USB or serial printer wired to *this* machine has no address at all,
+so a network sweep can never find it and a remote till had nothing to name it by. The workaround
+until now was to invent a private-looking IP, put it in the USB entry's `address`, and type that
+same fake address into the POS; `resolveByAddress` still honours it, so nothing breaks.
+
+To make that choice possible from a device with no LAN access, every heartbeat (and the enrolment
+POST) carries `registry_printers` — a summary of this bridge's configured printers, capped at 64:
+
+```json
+{ "id": "kitchen-usb", "name": "Kitchen", "transport": "usb",
+  "type": "receipt", "enabled": true, "address": null, "port": null }
+```
+
+Additive on both sides. An older API strips the field; a bridge older than 1.5.0 does not send it,
+and the server keeps whatever it last knew rather than treating "absent" as "no printers".
+
 ## Troubleshooting
 
 Start at <http://localhost:9200> on the machine running the bridge. Most of what follows is
