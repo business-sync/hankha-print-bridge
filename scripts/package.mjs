@@ -473,8 +473,12 @@ if (buildWin) {
 
 // Dotfiles are never artifacts, and Finder drops a .DS_Store in here the moment anyone opens
 // the folder or mounts the built .dmg — which then ships as a checksummed "release file".
+// RELEASE_NOTES.md is the same trap from the other direction: `release.mjs` assembles it in here
+// AFTER the verification step, so the run after any previous one sums it, and the strays check
+// then rejects a build that is otherwise perfect. It has bitten every second release.
+const GENERATED = new Set(['SHA256SUMS.txt', 'RELEASE_NOTES.md']);
 const artifacts = readdirSync(OUT_DIR)
-  .filter((f) => f !== 'SHA256SUMS.txt' && !f.startsWith('.'))
+  .filter((f) => !GENERATED.has(f) && !f.startsWith('.'))
   .sort();
 writeFileSync(
   join(OUT_DIR, 'SHA256SUMS.txt'),
