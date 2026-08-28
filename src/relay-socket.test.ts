@@ -30,9 +30,11 @@ after(() => {
 
 function track(server: Server): Server {
   servers.push(server);
-  server.on('upgrade', (_req, socket: Socket) => sockets.push(socket));
+  // Only 'connection' — which also covers sockets that are later upgraded. Registering an
+  // 'upgrade' listener here would change the SERVER's behaviour: node routes a request carrying an
+  // Upgrade header to 'upgrade' instead of 'request' as soon as one exists, so the 404 server
+  // below would stop answering and simply hang.
   server.on('connection', (socket: Socket) => sockets.push(socket));
-  // Never hold the process open on our account.
   server.unref();
   return server;
 }
@@ -156,11 +158,12 @@ describe('a live connection', () => {
 
   it('reassembles a fragmented message', async () => {
     const url = await upgradeServer((socket) => {
-      // FIN=0 text, then FIN=1 continuation. A large job frame arrives this way through some
-      // proxies whether the server intended it or not.
-      socket.write(Buffer.concat([Buffer.from([0x01, 5]), Buffer.from('{"ty')]));
-      socket.write(Buffer.concat([Buffer.from([0x01, 1]), Buffer.from('p')]));
-      socket.write(Buffer.concat([Buffer.from([0x80, 8]), Buffer.from('e":"x"}')]));
+      // Text with FIN=0 (0x01), then continuations (opcode 0x00), the last with FIN set (0x80).
+      // A large job frame arrives this way through some proxies whether the server intended it or
+      // not, so the reassembly has to be real rather than assumed.
+      socket.write(Buffer.concat([Buffer.from([0x01, 4]), Buffer.from('{"ty')]));
+      socket.write(Buffer.concat([Buffer.from([0x00, 1]), Buffer.from('p')]));
+      socket.write(Buffer.concat([Buffer.from([0x80, 7]), Buffer.from('e":"x"}')]));
     });
 
     const received: string[] = [];

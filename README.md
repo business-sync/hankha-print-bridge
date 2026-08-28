@@ -1,12 +1,24 @@
 # hankha-print-bridge
 
-The helper that lets a POS terminal print to a **network** ESC/POS printer. The terminal is a
-browser PWA and cannot open a raw TCP socket; the cloud API cannot reach a venue's private LAN.
-So the terminal POSTs its bytes here over HTTP, and this process dials the printer's `ip:port`.
+The helper that prints POS receipts and labels on a venue's own hardware. A browser PWA cannot
+open a raw TCP socket, a USB print queue or a serial port; the cloud API cannot reach a venue's
+private LAN. So the terminal posts its job here, and this process talks to the printer.
 
 ```
-POS terminal (browser)  --POST /print-->  print bridge  --TCP 9100-->  ESC/POS printer
+POS terminal (browser) ─POST /print─┐
+                                    ├─▶ print bridge ─┬─ TCP 9100 ────▶ network printer
+cloud API ──────────────────────────┘                 ├─ lp -o raw ───▶ USB printer
+        (outbound: no inbound port, works behind NAT) └─ /dev/cu.* ───▶ serial / Bluetooth
 ```
+
+Three things it does that the old forwarder did not:
+
+- **Three transports.** Network (RAW/9100), USB (through the OS print spooler in raw mode), and
+  serial — which is also how a Bluetooth printer appears once the OS has paired it.
+- **Renders.** Send a receipt or a label as JSON and it emits ESC/POS, ZPL, TSPL or EPL2,
+  including barcodes and QR codes. Raw `payload_base64` still works and always will.
+- **Queues.** Jobs are spooled to disk, printed one at a time per printer, retried when — and only
+  when — nothing reached the paper, and dropped rather than printed late once they expire.
 
 It ships as a **self-contained binary** — a till never needs Node installed.
 
@@ -127,9 +139,19 @@ environment variable beats both files, which is how CI overrides one without edi
 
 | Variable | Default | |
 |---|---|---|
-| `APP_VERSION` | `1.2.0` | the release number, and the only place to bump it |
+| `APP_VERSION` | `1.4.0` | the release number, and the only place to bump it |
 | `PRINT_BRIDGE_PORT` | `9200` | the POS terminal defaults to `http://localhost:9200` |
 | `PRINT_BRIDGE_HOST` | `0.0.0.0` | `127.0.0.1` accepts only this machine |
+| `PRINT_BRIDGE_STATE_DIR` | per-OS | holds `printers.json`, the job spool and `relay.json` |
+| `PRINT_BRIDGE_TOKEN` | *(empty)* | require `Authorization: Bearer …` on every route but `/health` |
+| `PRINT_BRIDGE_TLS_CERT` / `_KEY` | *(empty)* | bring your own certificate to serve https |
+| `PRINT_BRIDGE_RELAY_URL` | `https://api.hankha.la` | the cloud API to take jobs from |
+| `PRINT_BRIDGE_RELAY_TRANSPORT` | `auto` | `auto` \| `ws` \| `poll` — see [Cloud jobs](#cloud-jobs) |
+| `PRINT_BRIDGE_MAX_ATTEMPTS` | `3` | retries for a job that provably did not print |
+| `PRINT_BRIDGE_SEND_TIMEOUT_MS` | `15000` | how long one send may take |
+| `PRINT_BRIDGE_SYNC_TIMEOUT_MS` | `8000` | how long `POST /print` blocks — matches the POS's own timeout |
+| `PRINT_BRIDGE_LOG_FORMAT` | `text` | `json` gives one object per line, for a log aggregator |
+| `PRINT_BRIDGE_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 
 An **installed** bridge reads none of this. Its configuration comes from the service definition
 instead: `EnvironmentVariables` in the launchd plist on macOS, and
@@ -242,31 +264,242 @@ npm run typecheck
 `npm run dev` reads `.env` (see [Configuration](#configuration)) and binds `0.0.0.0`, unchanged
 from before packaging existed; the installers set `PRINT_BRIDGE_HOST=127.0.0.1`.
 
+## Printers
+
+Printers live in `printers.json` inside `PRINT_BRIDGE_STATE_DIR` — beside `relay.json`, in a
+directory both installers already create. Read it with `GET /printers`, replace it with
+`PUT /printers`, and see it alongside everything the machine can actually detect with:
+
+```bash
+hankha-print-bridge --list-printers
+hankha-print-bridge --test-print counter
+```
+
+```json
+{
+  "version": 1,
+  "printers": [
+    { "id": "counter", "name": "Counter receipt", "transport": "network",
+      "address": "192.168.18.103", "port": 9100,
+      "type": "receipt", "language": "escpos", "dots_per_line": 576 },
+
+    { "id": "till-usb", "name": "Till (USB)", "transport": "usb",
+      "queue": "SPRT_SP_EP", "type": "receipt", "language": "escpos" },
+
+    { "id": "labels", "name": "Label roll", "transport": "serial",
+      "device": "/dev/cu.RPP02N-SPP", "baud": 9600,
+      "type": "label", "language": "tspl", "width_mm": 50, "height_mm": 30, "dpi": 203 }
+  ],
+  "default_receipt_printer": "counter",
+  "default_label_printer": "labels"
+}
+```
+
+`language` must be one of `escpos`, `zpl`, `tspl`, `epl2` — or `auto`, which means `escpos`.
+Nothing probes the printer to find out: an identification query in the wrong language prints a
+page of garbage, so guessing is opt-in through `POST /printers/:id/identify` and never a side
+effect of loading a config file. A **label** printer has no safe default at all (ZPL sent to a
+TSPL head prints the commands as text, one label per line, until the roll runs out), so its
+`language` is required.
+
+### The three transports
+
+| `transport` | needs | how it works |
+|---|---|---|
+| `network` | `address`, `port` | a raw TCP socket to RAW/JetDirect 9100 |
+| `usb` | `queue` | the OS print spooler in **raw** mode — `lp -o raw` on macOS/Linux, `winspool`'s `WritePrinter` through a PowerShell shim on Windows |
+| `serial` | `device`, `baud` | writes straight to the character device, with `stty` / `mode.com` setting the line |
+
+**USB goes through the spooler rather than libusb** because this app cross-compiles to three
+targets from one machine and also builds as a slim container; a native addon is a per-platform
+artifact and would end both. The trade is real and worth stating: no endpoint-level control and no
+reading status back — but you get the driver the vendor already installed, network queues for
+free, and no elevated USB permissions on either platform.
+
+**Bluetooth is the `serial` transport.** Pair the printer in the operating system's own Bluetooth
+settings — that is where the PIN prompt belongs — and it appears as `/dev/cu.Something-SPP`,
+`/dev/rfcomm0`, or a COM port. There is no BLE path: a GATT-only printer needs a native Bluetooth
+stack, and the OS cannot expose one as a tty.
+
+On macOS, always use the **call-out** device (`/dev/cu.*`), never `/dev/tty.*` — the latter blocks
+until carrier detect, which a printer never asserts, so the open never returns. Paths are
+rewritten automatically, but it is worth knowing which one to type.
+
+**A non-network printer may declare an `address`.** That is what lets a cloud job reach a USB
+printer: a relay job carries only `target_ip`/`target_port`, so giving a USB entry an address makes
+it addressable by every client that already speaks the old contract, with no change on the server
+or in the POS.
+
+## Job documents
+
+A job is one of three things: raw bytes (`payload_base64`), a **receipt**, or a **label**.
+
+A **receipt** is a flow — elements print in order and the paper advances:
+
+```json
+{ "printer_id": "counter", "receipt": { "elements": [
+  { "type": "text", "value": "DOK CHAMPA", "align": "center", "bold": true, "width": 2, "height": 2 },
+  { "type": "rule" },
+  { "type": "columns", "left": "2x Lao coffee", "right": "50,000" },
+  { "type": "columns", "left": "TOTAL", "right": "LAK 75,000", "bold": true },
+  { "type": "barcode", "symbology": "CODE128", "value": "HK-00421", "height": 60, "hri": "below" },
+  { "type": "qr", "value": "https://hankha.la/r/421", "size": 5 },
+  { "type": "drawer" },
+  { "type": "cut" }
+] } }
+```
+
+Elements: `text`, `columns`, `rule`, `feed`, `image`, `barcode`, `qr`, `cut`, `drawer`. A cut is
+appended automatically unless the document ends with one or sets `"cut": false`.
+
+A **label** is a canvas — every element carries `x`/`y` in dots, because ZPL, TSPL and EPL2 are all
+positional:
+
+```json
+{ "printer_id": "labels", "label": { "copies": 2, "elements": [
+  { "type": "box", "x": 4, "y": 4, "width": 392, "height": 232, "thickness": 2 },
+  { "type": "text", "x": 20, "y": 20, "value": "Lao Coffee 250g", "height": 24, "bold": true },
+  { "type": "barcode", "x": 20, "y": 90, "symbology": "EAN13", "value": "885600123456", "height": 60 },
+  { "type": "qr", "x": 290, "y": 90, "value": "https://hankha.la/p/9", "size": 4 }
+] } }
+```
+
+Elements: `text`, `barcode`, `qr`, `image`, `box`, `line`. Media geometry stays in **millimetres**
+(that is how a roll is sold, and what TSPL's `SIZE` wants) while positions are in **dots** (what
+`^FO` and `A` want); `dpi` converts between them.
+
+Symbologies: `CODE128`, `CODE39`, `EAN13`, `EAN8`, `UPCA`, `UPCE`, `ITF`. Nothing is computed here
+— every one of the four languages encodes barcodes and QR in firmware, which is also why the whole
+renderer needs no dependency. Data that a symbology cannot carry is rejected before it is sent,
+because a printer handed impossible data prints nothing and reports nothing.
+
+| document \ printer | `escpos` | `zpl` / `tspl` / `epl2` |
+|---|---|---|
+| `receipt` | native | **refused** — see below |
+| `label` | flattened top-to-bottom, x ignored | native |
+
+A receipt on a label printer is refused rather than approximated: a receipt flows for as long as it
+needs to, a label is a fixed rectangle, and silently clipping a bill at the bottom of a 30 mm label
+produces a slip that looks right until the total is missing from it.
+
+### Non-Latin text
+
+**Lao cannot be printed as text on any of these printers.** It is in no ESC/POS code page (CP874 is
+Thai), and a resident label font has no such glyphs. So the renderer accepts ASCII plus a table of
+punctuation equivalents — including `₭` → `LAK` — and **refuses** anything else with a 422 naming
+the characters.
+
+That refusal is the feature. The predecessor of this code silently dropped what it could not
+encode, so `2x ເຂົ້າຜັດໄກ່` printed as `2x ` — a blank line, no error anywhere. Send Lao as a
+pre-rendered `image` element instead: 1-bit, MSB-first, rows padded to whole bytes, which is
+exactly what the POS terminal's `raster-renderer.ts` already produces.
+
+```json
+{ "type": "image", "image": { "width": 576, "height": 32, "data_base64": "…" } }
+```
+
 ## API
 
-- `GET /health` → `{ ok, service, version, interfaces: [{ address, cidr }], hostname, platform,
-  arch, pid, uptime_s }`. `ok` is first and never changes shape — older terminals read only
-  that. `service` lets the terminal tell a real bridge from some other app on the port;
-  `interfaces` lets it warn when a configured printer sits on a different network; the
-  host/platform block is how an operator sees *which* machine answered, which matters once the
-  bridge is an invisible background service.
-- `POST /probe` — body `{ ip, port? }` (port defaults to 9100) →
-  `{ ok, reachable, latency_ms, reason? }` with `reason: "timeout" | "refused" | "unreachable"`.
-  Opens a TCP connection and drops it **without writing** — a printer that receives stray bytes
-  prints garbage. `refused` means a device is alive there but that port is closed (right host,
-  wrong port); `timeout` means nothing answered at all.
-- `POST /scan` — body `{ port? }` → `{ ok, subnets, duration_ms, printers: [{ ip, port, latency_ms }] }`.
-  Sweeps every address on this machine's own subnets, so an operator can pick a printer from a
-  list instead of typing an IP. Each interface is clamped to the /24 around its own address
-  (a /16 would mean 65k connect attempts), 64 sockets in parallel, 500 ms per host — about
-  2 seconds for a typical venue. Concurrent callers share one run.
-- `POST /print` — body `{ ip, port, payload_base64 }`. Opens a TCP socket to `ip:port`, writes the
-  decoded bytes, closes it. Responds `{ ok: true }` or
-  `{ ok: false, reason: "connect-refused" | "timeout" | "invalid-body" | "invalid-payload" }`.
+Everything below needs `Authorization: Bearer <PRINT_BRIDGE_TOKEN>` when a token is configured.
+`/health` never does.
+
+### Printing
+
+- `POST /print` — body `{ ip, port, payload_base64 }`. **Blocks** until the job settles and answers
+  `{ ok: true }` or `{ ok: false, reason, printed_certainty, detail }` with a 502. This is the
+  original contract and it is frozen: the POS terminal treats a 200 with `ok: true` as proof a
+  receipt printed. It now takes its turn in the printer's queue instead of opening a socket
+  immediately, which serialises two tills printing to one printer.
+- `POST /jobs` — body `{ job_id?, printer_id? | target?, copies?, ttl_s?, payload_base64 | receipt |
+  label }` → `202 { ok, job, deduplicated }`. Returns as soon as the job is queued. `job_id` is an
+  idempotency key: submit the same one twice and the second answers with the first outcome rather
+  than printing again. Omit both `printer_id` and `target` to use the registry's default for the
+  document's kind.
+- `GET /jobs` → recent jobs and the queue depth. `GET /jobs/:id` → one job.
+- `POST /jobs/:id/cancel` → 200 if it had not started, 409 once it is printing.
+
+### Printers
+
+- `GET /printers` / `PUT /printers` — read and replace the registry. A `PUT` that fails validation
+  changes nothing and returns **every** problem at once, not just the first.
+- `POST /printers/:id/test` — print the same test slip `--test-print` prints. Its ruler line shows
+  whether `dots_per_line` matches the paper.
+- `POST /printers/:id/identify` — send a status query and report the reply. Network only: a print
+  spooler is one-way, so there is no channel to read an answer on, and this returns 501 for `usb`
+  rather than pretending. Nothing calls it automatically.
+- `POST /discover` — body `{ port?, network? }` → every printer this machine can see, from all
+  three transports, plus which transports are usable at all. That last part matters: "no USB
+  printers" and "this machine cannot see USB printers" are very different answers.
+
+### Diagnostics
+
+- `GET /health` → `{ ok, service, version, interfaces, hostname, platform, arch, pid, uptime_s,
+  net_warning, auth_required, relay, printers, queue }`. `ok` is first and never changes shape —
+  older terminals read only that. Deliberately does **not** probe printers: this is the endpoint the
+  POS polls, so it stays a memory read.
+- `GET /status` → everything in `/health` plus per-printer online/offline with latency, transport
+  availability, and queue depth by state. Probes are cached for five seconds; `?probe=1` forces a
+  fresh one.
+- `POST /probe` — body `{ ip, port? }` → `{ ok, reachable, latency_ms, reason? }` with
+  `reason: "timeout" | "refused" | "unreachable"`. Opens a TCP connection and drops it **without
+  writing** — a printer that receives stray bytes prints garbage. `refused` means a device is alive
+  there but that port is closed; `timeout` means nothing answered.
+- `POST /scan` — body `{ port? }` → `{ ok, subnets, duration_ms, printers }`. Sweeps this machine's
+  own subnets, clamped to the /24 around each interface (a /16 would mean 65k connect attempts), 64
+  sockets in parallel, 500 ms per host. Concurrent callers share one run.
 
 Every endpoint that dials an address refuses anything outside RFC1918 private space. CORS is `*`
-(the terminal's origin varies too much to pin down), so that restriction is what stops a random
-page from using the bridge to scan the public internet from inside the venue's network.
+(the terminal's origin varies too much to pin down), so that restriction is what stops a random page
+from using the bridge to scan the public internet from inside the venue's network.
+
+## The queue
+
+Jobs are spooled to `PRINT_BRIDGE_STATE_DIR/spool` — one file each, written temp-then-rename, so a
+power cut leaves a whole record or none. Four rules:
+
+1. **Sequential per printer, concurrent across printers.** Not throughput; correctness. Several
+   kitchen stations usually share one physical printer, and two interleaved writes produce one
+   shredded ticket. A dead printer still cannot hold up a working one.
+2. **Only retry what provably did not print.** RAW/9100 has no application acknowledgement, and
+   neither does a spooler, so any failure *after* the channel opened is `printed_certainty:
+   "unknown"` and terminal. Retrying those is how a customer ends up holding two bills.
+3. **A deadline outranks the attempt count.** With `ttl_s` set, the job retries with backoff until
+   that deadline — `PRINT_BRIDGE_MAX_ATTEMPTS` alone gives up in about three seconds, which is
+   shorter than a printer takes to reboot. Once it expires it is **dropped, not printed late**: a
+   receipt printed an hour after the till moved on is worse than no receipt.
+4. **Deduplicated across restarts.** Settled job ids are kept in a bounded on-disk ring, so a
+   redelivered job is *answered*, never reprinted.
+
+A job found in `printing` after a crash is settled as `unknown` rather than retried — the bytes may
+already be on the paper, and there is no way left to ask.
+
+## Cloud jobs
+
+The bridge dials **out** to the cloud API, so a phone or a till on mobile data can print through it
+without reaching the shop LAN. No inbound port, no certificate on the shop PC, nothing to configure
+on the router. Enroll once with a code from **Settings → Printing**:
+
+```bash
+hankha-print-bridge --enroll ABCD-2345
+```
+
+`PRINT_BRIDGE_RELAY_TRANSPORT` picks the channel. `auto` tries a WebSocket at
+`/api/v1/modules/print/bridge/socket` and falls back to the long-poll on
+`/api/v1/modules/print/bridge/work` — which is what the server offers today, so `auto` and `poll`
+behave identically until that endpoint ships. A server that answers the upgrade with an ordinary
+HTTP status is remembered as not supporting it and asked again only twice an hour. `ws` refuses to
+fall back, for testing a server that does have it.
+
+The WebSocket contract, for whoever builds the server half: accept the upgrade with the same bearer
+token the other bridge routes take, then push the same `Work` JSON objects the long-poll returns.
+The bridge sends `{"type":"hello"}` on open and `{"type":"heartbeat"}` every 30 seconds, answers
+pings, and ignores frame types it does not know. **Results keep going back over HTTP** — reusing an
+endpoint that already exists is worth more than the round trip it saves, and it means a half-built
+server side cannot lose a print result.
+
+Cloud jobs go through the same queue as everything else, and the poll loop no longer waits for them
+to print: a printer taking four seconds to answer used to stop the bridge fetching *any* work for
+those four seconds.
 
 ## Troubleshooting
 
@@ -286,7 +519,36 @@ is not `localhost`. Install the bridge on the till itself; see the top of this f
 **Printing works, discovery doesn't** — the bridge is older than v1.1 (no `/scan`). The POS
 shows an "update the Print Bridge" warning below v1.2.
 
+**A job returns 422 `render-failed` mentioning characters** — the text is not ASCII and no printer
+here has those glyphs. Send that line as an `image` element; see
+[Non-Latin text](#non-latin-text). This is deliberate: the alternative is a blank line and a
+success response.
+
+**A USB job says it printed but nothing came out** — the spooler accepted it, which is all a
+spooler can tell you. Check the queue is not paused (`lpstat -p <queue>`, or Printers & Scanners),
+and that it is a **raw**/generic queue rather than one with a vendor driver: a driver turns ESC/POS
+into pages of mojibake. `/status` reports a paused queue explicitly.
+
+**A label comes out solid black with white text** — the printer's language is set wrong in
+`printers.json`. TSPL and EPL2 treat a set bit as *white*; ESC/POS and ZPL treat it as *black*, so
+naming the wrong one inverts every image.
+
+**A label prints the commands as text** — same cause, other direction: ZPL sent to a TSPL head, or
+vice versa. Run `--test-print <id>`; the test slip names the language it was rendered in.
+
+**A Bluetooth printer does not appear in `--list-printers`** — pair it in the operating system's
+Bluetooth settings first. Only then does it get a `/dev/cu.*` or COM port for the `serial`
+transport to open. BLE-only printers are not supported.
+
+**The serial port opens and then hangs** — on macOS that is `/dev/tty.*` waiting for carrier
+detect, which a printer never asserts. Use the `/dev/cu.*` name.
+
 ## Scope
 
-This process only forwards bytes: no printer-specific logic (the ESC/POS payload is built in the
-POS terminal, including the Lao raster path) and no persistence.
+Printer command generation, transport, and queueing — nothing about the business meaning of what is
+printed. There is no order model, no pricing, and no persistence beyond the job spool and the
+printer registry.
+
+The renderer covers ASCII plus a punctuation fallback table. It does **not** rasterise text: there
+is no font engine here, so Lao and every other non-Latin script arrives as a caller-supplied `image`
+element, which is what the POS terminal already produces.

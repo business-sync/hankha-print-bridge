@@ -209,8 +209,16 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
         socket.write(maskedFrame(opcode, payload));
       };
 
-      socket.on('data', (chunk: Buffer) => {
-        buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
+      /*
+       * Drain whatever is buffered.
+       *
+       * Called from the data handler AND once at setup, because the upgrade event hands over a
+       * `head` buffer containing anything the server sent in the same packet as the 101 — and a
+       * server that pushes its first job frame right behind the handshake does exactly that.
+       * Parsing only on 'data' silently swallowed that first message and then waited for a second
+       * one that might never come.
+       */
+      const drain = () => {
         if (buffer.length > MAX_MESSAGE_BYTES) {
           closeCode = 1009;
           closeReason = 'message too large';
@@ -280,6 +288,11 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
               return;
           }
         }
+      };
+
+      socket.on('data', (chunk: Buffer) => {
+        buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
+        drain();
       });
 
       socket.on('error', () => finish());
@@ -301,6 +314,10 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
         },
         closed,
       });
+
+      // Anything that rode in with the handshake. Deferred by one tick so the caller has its
+      // client handle before the first message lands.
+      if (buffer.length > 0) setImmediate(drain);
     });
 
     req.end();

@@ -119,6 +119,20 @@ describe('retry safety', () => {
     assert.equal(calls, 1);
   });
 
+  it('keeps retrying past maxAttempts while the job still has a deadline', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(), maxAttempts: 2,
+      // Fails while the printer is "rebooting", then comes back. maxAttempts alone would have
+      // given up after about three seconds of backoff — shorter than a printer takes to boot.
+      send: async () => (++calls < 4 ? refused() : ok()),
+    });
+
+    const job = await queue.submit({ source: 'relay', printer: printer('counter'), payload, ttl_s: 60 }).settled;
+    assert.equal(job.status, 'done');
+    assert.equal(calls, 4);
+  });
+
   it('gives up after maxAttempts even when every failure was safe', async () => {
     let calls = 0;
     const queue = new PrintQueue({
@@ -268,6 +282,31 @@ describe('idempotency', () => {
 });
 
 describe('durability', () => {
+  it('is safe to load twice', async () => {
+    const dir = scratch();
+    const spool = join(dir, 'spool');
+    mkdirSync(spool, { recursive: true });
+
+    const pending: JobRecord = {
+      job_id: 'once-only', source: 'relay', printer: printer('counter'),
+      payload_base64: payload.toString('base64'), bytes: payload.length, copies: 1, attempts: 0,
+      status: 'queued', created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      expires_at: null, retryable: true, persistent: true,
+    };
+    writeFileSync(join(spool, 'once-only.json'), JSON.stringify(pending));
+
+    let printed = 0;
+    const queue = new PrintQueue({ dir, send: async () => { printed += 1; return ok(); } });
+    // A second load re-reads the spool while the first one's jobs are in flight: it pushes a
+    // queued job into the lane twice (printing it twice) and settles an in-flight one as failed.
+    queue.load();
+    queue.load();
+    await new Promise((r) => setTimeout(r, 60));
+
+    assert.equal(printed, 1);
+    assert.equal(queue.get('once-only')?.status, 'done');
+  });
+
   it('resumes a queued job left on disk by a crash', async () => {
     const dir = scratch();
     const spool = join(dir, 'spool');

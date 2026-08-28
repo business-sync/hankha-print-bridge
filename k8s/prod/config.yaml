@@ -5,7 +5,7 @@ metadata:
   namespace: hankha
 data:
   NODE_ENV: "production"
-  APP_VERSION: 1.3.0
+  APP_VERSION: 1.4.0
   PRINT_BRIDGE_PORT: '9200'
   PRINT_BRIDGE_HOST: "0.0.0.0"
   HANKHA_MACOS_SIGN_IDENTITY: ""
@@ -14,6 +14,11 @@ data:
   HANKHA_WINDOWS_PFX: ""
   HANKHA_WINDOWS_PFX_PASSWORD: ""
   PRINT_BRIDGE_RELAY_URL: "https://api.hankha.la"
+  PRINT_BRIDGE_RELAY_TRANSPORT: "auto"
+  # One JSON object per line: this pod's stdout goes to a log aggregator, where prose is
+  # unqueryable. The desktop installs keep the human-readable default.
+  PRINT_BRIDGE_LOG_FORMAT: "json"
+  PRINT_BRIDGE_LOG_LEVEL: "info"
   PRINT_BRIDGE_STATE_DIR: ""
   PRINT_BRIDGE_TOKEN: ""
   PRINT_BRIDGE_TLS_CERT: ""
