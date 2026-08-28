@@ -375,16 +375,39 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  *
  * One channel carries both jobs and commands, so this is a single loop rather than two — two
  * would double the connection count for no benefit and make ordering ambiguous.
+ *
+ * Callable a second time, which is how `POST /enroll` brings a freshly-paired bridge online
+ * without a service restart. The guard below is what makes that safe: this function starts an
+ * unbounded loop AND a heartbeat interval, so a second concurrent call would put two loops on
+ * `/work` — both claiming jobs, in an order neither controls.
+ *
+ * Note the guard is only armed once the enrolment check has PASSED. A bridge that boots
+ * unenrolled — every bridge, on its first run — must leave the flag clear, or the enrol route
+ * could never start the loop it just made possible.
  */
+let relayRunning = false;
+
+/** Whether a relay loop is live in this process. Read by `POST /enroll` to decide on a restart. */
+export function isRelayRunning(): boolean {
+  return relayRunning;
+}
+
 export function startRelay(): void {
+  if (relayRunning) {
+    log.info('relay: already running, ignoring duplicate start', { event: 'relay.already_running' });
+    return;
+  }
+
   const state = loadState();
   if (!state.token || !state.bridge_id) {
     log.info(
-      'print bridge is not enrolled — run `hankha-print-bridge --enroll <code>` with a code from Settings > Printing',
+      'print bridge is not enrolled — open http://localhost:9200 and paste a pairing code from Settings > Printing',
       { event: 'relay.not_enrolled' }
     );
     return;
   }
+
+  relayRunning = true;
 
   const base = relayUrl(state);
   const token = state.token;
