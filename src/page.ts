@@ -446,6 +446,14 @@ const SCRIPT = `
   /* Re-rendering the table under a running test print would replace the button mid-click. */
   var testsInFlight = 0;
   /*
+   * One refresh at a time. The poll fires on a fixed interval regardless of how long the last
+   * one took, so a bridge answering slowly stacked requests — and whichever finished first
+   * re-enabled the Refresh button while another was still running.
+   */
+  var refreshing = false;
+  /* Where printers.json lives, from /status. Empty until the first authorised poll returns. */
+  var registryPath = '';
+  /*
    * Sticky, because a rejection is otherwise invisible.
    *
    * A 401 clears the stored token, so the very next poll finds no token at all and would put the
@@ -465,6 +473,30 @@ const SCRIPT = `
   }
 
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  /*
+   * Say something out loud.
+   *
+   * Everything this page reports arrives as a silent DOM mutation on a ten-second timer, so
+   * without a live region a screen-reader user is never told a printer stopped answering or a
+   * test slip failed — on a page that exists to report exactly those two things. Kept to state
+   * CHANGES rather than every poll, or it would read the whole table out every ten seconds.
+   */
+  var lastAnnounced = '';
+  function announce(message) {
+    if (!message || message === lastAnnounced) return;
+    lastAnnounced = message;
+    $('live').textContent = message;
+  }
+
+  /* A short, visible aside for something the operator just did. Not an error, not a banner. */
+  var noticeTimer = null;
+  function notice(message) {
+    var node = $('notice');
+    node.textContent = message;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(function () { node.textContent = ''; }, 5000);
+  }
 
   /*
    * Rebuild a section only when something a person can see in it has changed.
