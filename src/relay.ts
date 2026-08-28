@@ -116,6 +116,47 @@ function describeSelf() {
   };
 }
 
+/**
+ * Turn a failed enrolment response into the sentence the operator sees.
+ *
+ * This used to be `Enrollment failed: HTTP ${res.status}` with the body thrown away, and that
+ * cost a day: a 500 caused by one recoverable, named condition — this computer already holds a
+ * bridge row in the venue — was indistinguishable from the API being down, on both the CLI and
+ * the pairing page, because neither ever read what the API said.
+ *
+ * The API hides its own message on 5xx, so the request id is the only thread back to the log
+ * line that has the real cause. Print it whenever there is one.
+ */
+async function enrollFailure(res: Response): Promise<Error> {
+  const body = (await res.json().catch(() => null)) as {
+    detail?: unknown;
+    code?: unknown;
+  } | null;
+  const detail = typeof body?.detail === 'string' ? body.detail : '';
+  const code = typeof body?.code === 'string' ? body.code : '';
+  const requestId = res.headers.get('x-request-id');
+
+  // The API answers every bad, spent or expired code identically so it cannot be used to probe
+  // for live ones. Say the same thing in the three forms an operator can act on.
+  const message =
+    res.status === 404
+      ? 'That enrollment code is not valid, has already been used, or has expired.'
+      : detail ||
+        (res.status >= 500
+          ? `Enrollment failed: the server returned an error (HTTP ${res.status}).`
+          : `Enrollment failed: HTTP ${res.status}`);
+
+  const trailer = [
+    code && code !== 'internal_error' ? code : '',
+    requestId ? `ref ${requestId}` : '',
+  ].filter(Boolean);
+
+  return Object.assign(
+    new Error(trailer.length ? `${message} (${trailer.join(', ')})` : message),
+    { status: res.status, code },
+  );
+}
+
 /** Redeem a one-time enrollment code for a bearer token. Persists on success. */
 export async function enroll(code: string): Promise<{ bridge_id: string }> {
   const state = loadState();
@@ -136,13 +177,7 @@ export async function enroll(code: string): Promise<{ bridge_id: string }> {
     }),
     signal: AbortSignal.timeout(15_000),
   });
-  if (!res.ok) {
-    throw new Error(
-      res.status === 404
-        ? 'That enrollment code is not valid, has already been used, or has expired.'
-        : `Enrollment failed: HTTP ${res.status}`
-    );
-  }
+  if (!res.ok) throw await enrollFailure(res);
   const body = (await res.json()) as { data: { bridge_id: string; token: string } };
   saveState({
     ...state,

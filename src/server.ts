@@ -12,6 +12,7 @@ import {
   tcpPing,
 } from './lan.js';
 import { discoverAll, transportAvailability } from './discovery.js';
+import { isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { prepare, targetFrom, type JobRequest } from './jobs.js';
 import { log } from './log.js';
 import { INDEX_CSP, INDEX_HTML } from './page.js';
@@ -228,16 +229,14 @@ export function isTlsEnabled(): boolean {
  * instead of opening a socket immediately. That serialises two tills printing to one printer,
  * which is a fix, not a regression — concurrent writes to one device shred both tickets.
  */
-/**
- * The shape a pairing code arrives in: `XXXX-XXXX` over the alphabet the API mints them from,
- * which drops O/0/I/1 because the code gets read off a tablet and retyped here.
- *
- * Checked locally so an obvious typo is answered instantly and in the operator's own words,
- * rather than after a round trip that comes back as the API's deliberately vague "not valid,
- * already used, or expired" — wording that exists so the endpoint is not an oracle, and which is
- * unhelpful when the real problem is a transposed character.
+/*
+ * The shape and normalization of a pairing code live in `enroll-code.ts`, shared with
+ * `--enroll`. Checked locally either way, so an obvious typo is answered instantly and in the
+ * operator's own words, rather than after a round trip that comes back as the API's
+ * deliberately vague "not valid, already used, or expired" — wording that exists so the
+ * endpoint is not an oracle, and which is unhelpful when the real problem is a transposed
+ * character. Checking here also keeps the API's per-IP enrolment limiter for real attempts.
  */
-const ENROLL_CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}$/;
 
 /**
  * Pair this bridge with a venue, from the browser on the machine it runs on.
@@ -254,12 +253,9 @@ const ENROLL_CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKLMNPQR
  */
 async function handleEnroll(res: ServerResponse, record: Record<string, unknown>): Promise<void> {
   const raw = typeof record.code === 'string' ? record.code : '';
-  // Operators paste from a tablet: leading spaces, lowercase, and a missing hyphen are all
-  // routine and none of them are the operator being wrong.
-  const code = raw.trim().toUpperCase().replace(/\s+/g, '');
-  const normalized = /^[A-Z0-9]{8}$/.test(code) ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+  const normalized = normalizeEnrollCode(raw);
 
-  if (!ENROLL_CODE_RE.test(normalized)) {
+  if (!isValidEnrollCode(normalized)) {
     sendJson(res, 400, { ok: false, reason: 'invalid-code-format' });
     return;
   }

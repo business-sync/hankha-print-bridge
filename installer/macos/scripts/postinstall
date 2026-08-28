@@ -21,12 +21,30 @@ launchctl enable "system/$LABEL"
 
 # Don't report success until the bridge actually answers. Installing a print helper that
 # silently never started is the exact failure this package exists to eliminate.
+#
+# "Something answered on 9200" is NOT that check, and trusting it is how this failure shipped:
+# a leftover .dmg LaunchAgent answers /health perfectly well, so the package reported success
+# while the daemon it had just installed was crash-looping on a port it could never bind.
+# preinstall now clears that agent; this compares the PID that answered against the one launchd
+# is running for our label, so anything else holding the port is caught rather than believed.
 i=0
 while [ $i -lt 20 ]; do
-  if /usr/bin/curl -fsS -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  answered=$(/usr/bin/curl -fsS -m 2 "http://127.0.0.1:$PORT/health" 2>/dev/null |
+    /usr/bin/sed -n 's/.*"pid":\([0-9]*\).*/\1/p')
+  ours=$(launchctl print "system/$LABEL" 2>/dev/null |
+    /usr/bin/sed -n 's/^[[:space:]]*pid = \([0-9]*\).*/\1/p')
+
+  if [ -n "$answered" ] && [ "$answered" = "$ours" ]; then
     echo "hankha-print-bridge is running on http://127.0.0.1:$PORT"
     exit 0
   fi
+
+  if [ -n "$answered" ] && [ -n "$ours" ] && [ "$answered" != "$ours" ]; then
+    echo "Port $PORT is answered by pid $answered, which is not this package's daemon (pid ${ours:-none})." >&2
+    echo "Stop that process and reinstall — until then the POS is talking to it, not to this bridge." >&2
+    exit 1
+  fi
+
   i=$((i + 1))
   sleep 1
 done

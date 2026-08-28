@@ -3,5 +3,31 @@
 # holding port 9200 while the new binary is on disk — a state whose only symptom is the POS
 # reporting a version that doesn't match what was just installed.
 LABEL=la.hankha.print-bridge
+
 launchctl bootout "system/$LABEL" 2>/dev/null || true
+
+# The .dmg is the other half of this. Opening `Hankha Print Bridge.app` registers a PER-USER
+# LaunchAgent under the SAME label, pointed at the binary inside the bundle, listening on the
+# SAME port — see installer/macos/app/HankhaPrintBridge. Booting out `system/` alone leaves it
+# holding 9200, and the daemon this package installs then fails to bind on every launch,
+# forever: KeepAlive restarts it, ThrottleInterval spaces the attempts, and the only trace is
+# `Port 9200 is already in use` repeating in /var/log/hankha-print-bridge.log. The bridge looks
+# healthy from the POS the whole time, because the .dmg copy is answering for it.
+#
+# The two cannot coexist, and a system daemon is the stronger install — it survives logout and
+# needs no one signed in — so the agent goes. Every user, not just the console one: a till
+# often has a second account, and an agent under any of them takes the port at their next
+# login.
+for home in /Users/*; do
+  plist="$home/Library/LaunchAgents/$LABEL.plist"
+  [ -f "$plist" ] || continue
+
+  uid=$(/usr/bin/stat -f%u "$home" 2>/dev/null)
+  if [ -n "$uid" ]; then
+    launchctl bootout "gui/$uid/$LABEL" 2>/dev/null || true
+  fi
+  rm -f "$plist"
+  echo "Removed the .dmg LaunchAgent at $plist — this package's daemon replaces it." >&2
+done
+
 exit 0
