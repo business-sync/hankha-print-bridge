@@ -1,6 +1,6 @@
 {
   "name": "hankha-print-bridge",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
   "description": "Local helper that prints POS receipts and labels on a venue's own hardware — over the network (ESC/POS-over-TCP), a USB print queue, or a serial/Bluetooth port. Runs on a venue PC, NOT inside the POS terminal's PWA: a browser cannot open any of those. It also dials out to the cloud API, so a phone can print through it without reaching the LAN.",
   "license": "UNLICENSED",

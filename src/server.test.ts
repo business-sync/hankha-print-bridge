@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
-import type { Server } from 'node:http';
+import { createServer as createHttpServer, type Server } from 'node:http';
 import { createServer as createTcpServer, type Server as TcpServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -540,5 +540,101 @@ describe('request limits', () => {
     // The connection is destroyed as soon as the cap is passed, so either a 413 or a dropped
     // request is a pass — what must not happen is the body being buffered in full.
     assert.ok(res === null || res.status === 413, `expected 413 or a dropped request, got ${res?.status}`);
+  });
+});
+
+/*
+ * Pairing from the local page.
+ *
+ * These run against a stub API rather than the real one: `enroll()` posts to
+ * `PRINT_BRIDGE_RELAY_URL`, which defaults to production. A test that reached api.hankha.la
+ * would be both flaky and rude.
+ *
+ * The successful path is deliberately absent. A 200 here calls `startRelay()`, which is an
+ * unbounded loop this suite has no way to stop — every case below stops one step short of that,
+ * at the boundary the handler itself owns.
+ */
+describe('POST /enroll', () => {
+  let api: Server;
+  let apiCalls = 0;
+  let previousRelayUrl: string | undefined;
+
+  before(async () => {
+    previousRelayUrl = process.env.PRINT_BRIDGE_RELAY_URL;
+    api = createHttpServer((_req, res) => {
+      apiCalls += 1;
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'not_found' } }));
+    });
+    process.env.PRINT_BRIDGE_RELAY_URL = `http://127.0.0.1:${await listen(api)}`;
+  });
+
+  after(() => {
+    api.close();
+    if (previousRelayUrl === undefined) delete process.env.PRINT_BRIDGE_RELAY_URL;
+    else process.env.PRINT_BRIDGE_RELAY_URL = previousRelayUrl;
+  });
+
+  it('rejects a code that is not the shape the API mints, without a round trip', async () => {
+    const before = apiCalls;
+    const { status, json } = await post('/enroll', { code: 'NOPE' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-code-format');
+    // The point of validating locally: an obvious typo is answered instantly, and the API's
+    // per-IP enrolment limiter is not spent on it.
+    assert.equal(apiCalls, before, 'a malformed code must not reach the API');
+  });
+
+  it('rejects the letters the alphabet deliberately omits', async () => {
+    // O/0/I/1 are excluded upstream because the code is read aloud and retyped, so a code
+    // containing them is always a misread of something else.
+    const { status, json } = await post('/enroll', { code: 'O0I1-ABCD' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-code-format');
+  });
+
+  it('accepts what an operator actually types — lowercase, spaced, hyphen missing', async () => {
+    const before = apiCalls;
+    const { status } = await post('/enroll', { code: '  6xzr ttwf ' });
+    // Reaching the API at all is the assertion: the code normalised to 6XZR-TTWF and passed
+    // the format gate. The stub answers 404, so the handler reports the failure.
+    assert.equal(apiCalls, before + 1, 'a normalisable code must reach the API');
+    assert.equal(status, 502);
+  });
+
+  it('passes the API’s own wording through instead of inventing a reason', async () => {
+    const { status, json } = await post('/enroll', { code: '6XZR-TTWF' });
+    assert.equal(status, 502);
+    assert.equal(json.reason, 'enroll-failed');
+    assert.match(json.message, /not valid, has already been used, or has expired/);
+  });
+
+  it('refuses a code from anywhere but this machine', async () => {
+    // The gate that matters. The Windows installer binds 0.0.0.0 and the shipped default sets
+    // no token, so without this anyone on the venue wifi could pair the shop's bridge to their
+    // own organisation and collect its bills.
+    const lan = localInterfaces().find((i) => i.address && !i.address.startsWith('127.'));
+    if (!lan) return; // CI containers sometimes have loopback only.
+
+    const open = createHttpServer(bridge.listeners('request')[0] as never);
+    const port = await new Promise<number>((resolve) => {
+      open.listen(0, '0.0.0.0', () => {
+        const address = open.address();
+        if (typeof address === 'string' || address === null) throw new Error('no port');
+        resolve(address.port);
+      });
+    });
+
+    try {
+      const res = await fetch(`http://${lan.address}:${port}/enroll`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: '6XZR-TTWF' }),
+      });
+      assert.equal(res.status, 403);
+      assert.equal((await res.json()).reason, 'not-loopback');
+    } finally {
+      open.close();
+    }
   });
 });
