@@ -24,7 +24,7 @@ spec:
       - name: ghcr-secret
       containers:
       - name: hankha-print-bridge
-        image: ghcr.io/business-sync/hankha-print-bridge:9a80950667e292127cd14d6a64ec93178af65d3d
+        image: ghcr.io/business-sync/hankha-print-bridge:7018198934413de0810a269887b433e2505e1cc7
         imagePullPolicy: Always
         resources:
           requests:
