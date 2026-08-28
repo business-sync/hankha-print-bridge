@@ -225,3 +225,41 @@ describe('command bytes', () => {
     }
   });
 });
+
+/*
+ * The receipt parser's own error path.
+ *
+ * `dots_per_line` and `codepage` are validated INSIDE the returned object literal, so their
+ * errors are pushed after the early `errors.length > 0` guard has already run. Returning a
+ * document alongside them dropped both, because `jobs.ts` only tests `!parsed.document` — an
+ * out-of-range value answered 200 and quietly printed at the fallback width.
+ */
+describe('receipt document validation', () => {
+  it('reports an out-of-range dots_per_line instead of falling back silently', () => {
+    const parsed = parseReceiptDocument({
+      elements: [{ type: 'text', value: 'hi' }],
+      dots_per_line: 1_000_000,
+    });
+    assert.equal(parsed.document, null);
+    assert.match(parsed.errors.join('; '), /dots_per_line/);
+  });
+
+  it('reports an out-of-range codepage', () => {
+    const parsed = parseReceiptDocument({
+      elements: [{ type: 'text', value: 'hi' }],
+      codepage: 999,
+    });
+    assert.equal(parsed.document, null);
+    assert.match(parsed.errors.join('; '), /codepage/);
+  });
+
+  it('still accepts a receipt whose optional numbers are in range', () => {
+    const parsed = parseReceiptDocument({
+      elements: [{ type: 'text', value: 'hi' }],
+      dots_per_line: 384,
+      codepage: 16,
+    });
+    assert.deepEqual(parsed.errors, []);
+    assert.equal(parsed.document?.dots_per_line, 384);
+  });
+});
