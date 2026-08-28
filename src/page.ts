@@ -58,8 +58,15 @@ const FAVICON =
  *
  * Both schemes are defined in full rather than as a dark-mode patch: a till screen is as often a
  * bright counter as a dim kitchen pass, and `prefers-color-scheme` is whatever the OS was set to
- * years ago. "Noto Sans Lao" is in the stack because printer names come from a venue's own
- * registry and this is a Lao product — a station called ຄົວ must not render as boxes.
+ * years ago.
+ *
+ * The Lao faces are in the stack because printer names come from a venue's own registry and this
+ * is a Lao product — a station called ຄົວ must not render as boxes. All three are named on
+ * purpose: the CSP below is `default-src 'none'` with no `font-src`, so NOTHING here can be
+ * fetched and every name has to already be on the machine. "Noto Sans Lao" covers macOS and most
+ * Linux; Windows has neither it nor a Lao-capable `sans-serif`, and ships "Leelawadee UI" (10 and
+ * later) or "Lao UI" (7/8) instead. With only the Noto name a stock Windows till fell through to
+ * a Latin face and printed the boxes this comment claims to prevent.
  */
 const CSS = `
 *, *::before, *::after { box-sizing: border-box; }
@@ -81,7 +88,7 @@ const CSS = `
   --bad: #B32424;     --bad-bg: #FBEBEB;
   --warn: #8A5D04;    --warn-bg: #FBF1DE;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans Lao", sans-serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans Lao", "Leelawadee UI", "Lao UI", sans-serif;
   --radius: 12px;
 }
 
@@ -285,9 +292,32 @@ tr:last-child td { border-bottom: 0; }
 .pill-ok   { background: var(--ok-bg);   color: var(--ok); }
 .pill-bad  { background: var(--bad-bg);  color: var(--bad); }
 .pill-warn { background: var(--warn-bg); color: var(--warn); }
+/* The neutral one, named rather than left as a bare `.pill` built from an empty string. */
+.pill-off  { background: var(--surface-2); color: var(--muted); }
 
 .mono { font: 12.5px/1.5 var(--mono); }
 .empty { color: var(--faint); font-size: 13px; padding: 4px 0; }
+
+/* ------------------------------------------------------------------ a11y */
+
+/*
+ * Announced but not shown. Every fact this page exists to convey arrives as a DOM mutation on a
+ * ten-second timer — a printer going offline, a job failing, a test slip coming back. Without a
+ * live region a screen-reader user is told none of it, and this page is nothing BUT that.
+ */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+.skip {
+  position: absolute; left: -9999px;
+  background: var(--surface); color: var(--text);
+  padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-strong);
+  z-index: 10;
+}
+.skip:focus { left: 12px; top: 12px; }
 
 /* ------------------------------------------------------------------ addresses */
 
@@ -301,6 +331,52 @@ tr:last-child td { border-bottom: 0; }
 .url { font: 13px var(--mono); overflow-wrap: anywhere; }
 .url-why { display: block; color: var(--faint); font-size: 11.5px; font-family: var(--sans); margin-top: 2px; }
 .urls .copy { margin-left: auto; flex: none; }
+
+/* ------------------------------------------------------------------ discovery */
+
+/*
+ * The way out of an empty registry.
+ *
+ * This card is the one concession to the "not a configuration UI" rule at the top of this file,
+ * and it keeps to the letter of it: nothing here writes. It answers "what can this machine see",
+ * which previously could only be asked from a terminal — with a binary that is not on PATH after
+ * the macOS installer, by an operator who runs a café.
+ */
+.find { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.find-note { color: var(--faint); font-size: 12px; }
+
+.found { list-style: none; margin: 0; padding: 0; }
+.found li {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 0; border-bottom: 1px dashed var(--border);
+}
+.found li:last-child { border-bottom: 0; }
+.found li:first-child { padding-top: 0; }
+.found-main { min-width: 0; }
+.found-where { font: 12.5px/1.5 var(--mono); overflow-wrap: anywhere; }
+.found-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: none; }
+
+.where-file {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+}
+.where-file .path { font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; min-width: 0; }
+
+/*
+ * Row feedback that does not move the row.
+ *
+ * A test print used to append its result into the State cell, which grew the row and shunted
+ * every printer below it down the page — at the exact moment the operator is looking between the
+ * screen and the printer to see whether paper came out.
+ */
+.row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.feedback {
+  display: block; margin-top: 4px; font-size: 11.5px; line-height: 1.4;
+  min-height: 1.4em; overflow-wrap: break-word;
+}
+.feedback-ok  { color: var(--ok); }
+.feedback-bad { color: var(--bad); }
+.feedback-busy { color: var(--muted); }
 
 /* ------------------------------------------------------------------ footer */
 
@@ -349,6 +425,16 @@ const SCRIPT = `
    */
   var POLL_MS = 10000;
   var MAX_JOBS = 12;
+  /*
+   * Every fetch is bounded, and the bounds differ because the work does.
+   *
+   * A poll is a memory read on the bridge and should never take seconds. A test print is a real
+   * job with the server's own 12s deadline, so this sits above it — the point is to outlive the
+   * honest answer and still catch a socket that has stopped talking. Discovery sweeps a /24.
+   */
+  var TIMEOUT_MS = 8000;
+  var TEST_TIMEOUT_MS = 20000;
+  var DISCOVER_TIMEOUT_MS = 30000;
   /*
    * sessionStorage, not localStorage: this is the venue's shared printer secret, and a page that
    * remembered it forever would turn any browser profile on the till into a permanent key holder.
@@ -439,7 +525,16 @@ const SCRIPT = `
     } catch (err) { /* ignored on purpose */ }
   }
 
-  function request(method, path, payload) {
+  /*
+   * One transport for the whole page, and the only place a timeout is set.
+   *
+   * `fetch` has no timeout of its own. A printer that accepts a TCP connection and then never
+   * answers used to leave the test-print request pending for the life of the tab — and because a
+   * test in flight suppresses the poll, that single hung request stopped the page updating
+   * entirely, with the button stuck on "Printing" and nothing on screen explaining why. An abort
+   * surfaces as a rejection the callers already handle.
+   */
+  function request(method, path, payload, timeoutMs) {
     var headers = {};
     var tok = readToken();
     if (tok) headers.Authorization = 'Bearer ' + tok;
@@ -448,17 +543,35 @@ const SCRIPT = `
       headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(payload);
     }
+
+    var timer = null;
+    if (typeof AbortController === 'function') {
+      var controller = new AbortController();
+      init.signal = controller.signal;
+      timer = setTimeout(function () { controller.abort(); }, timeoutMs || TIMEOUT_MS);
+    }
+    var done = function () { if (timer) clearTimeout(timer); };
+
     return fetch(path, init).then(function (res) {
       return res.text().then(function (raw) {
         var body = null;
         try { body = JSON.parse(raw); } catch (err) { body = null; }
         return { status: res.status, body: body };
       });
-    });
+    }).then(
+      function (out) { done(); return out; },
+      function (err) {
+        done();
+        /* An abort is a timeout as far as anyone reading this page is concerned. */
+        throw (err && err.name === 'AbortError')
+          ? new Error('The bridge did not answer within ' + Math.round((timeoutMs || TIMEOUT_MS) / 1000) + 's.')
+          : err;
+      }
+    );
   }
 
-  function get(path) { return request('GET', path); }
-  function post(path, payload) { return request('POST', path, payload); }
+  function get(path, timeoutMs) { return request('GET', path, undefined, timeoutMs); }
+  function post(path, payload, timeoutMs) { return request('POST', path, payload, timeoutMs); }
 
   /* ----------------------------------------------------------------- formatting */
 
@@ -529,22 +642,35 @@ const SCRIPT = `
    * The mixed-content note is not padding: a POS served over https may only call http:// on
    * localhost, so every LAN address below is unreachable from that terminal no matter how the
    * network is set up. It is the most common way this install is got wrong.
+   *
+   * But it is CONDITIONAL, and stating it unconditionally was worse than not stating it. Served
+   * over https — which this bridge supports, via PRINT_BRIDGE_TLS_CERT — the page printed
+   * "reachable only by a POS served over plain http" directly beneath an https:// address: both
+   * self-contradictory, and backwards, since a bridge behind TLS is reachable from an https
+   * terminal and being reachable from one is the whole reason to configure it. The rule only
+   * bites when THIS page is served over plain http, so it is only said then.
    */
   function renderReach(health) {
     var list = $('urls');
     clear(list);
     var scheme = location.protocol;
-    var port = location.port || (scheme === 'https:' ? '443' : '80');
+    var secure = scheme === 'https:';
+    /* A default port is noise on the line an operator is about to retype. */
+    var port = location.port && location.port !== (secure ? '443' : '80') ? ':' + location.port : '';
 
     var rows = [{
-      url: scheme + '//localhost:' + port,
-      why: 'What a POS on this machine should use \\u2014 and the only address one served over https can reach.'
+      url: scheme + '//localhost' + port,
+      why: secure
+        ? 'What a POS on this machine should use.'
+        : 'What a POS on this machine should use \\u2014 and the only address one served over https can reach.'
     }];
     var interfaces = health.interfaces || [];
     for (var i = 0; i < interfaces.length; i++) {
       rows.push({
-        url: scheme + '//' + interfaces[i].address + ':' + port,
-        why: 'This LAN (' + interfaces[i].cidr + ') \\u2014 reachable only by a POS served over plain http.'
+        url: scheme + '//' + interfaces[i].address + port,
+        why: secure
+          ? 'This LAN (' + interfaces[i].cidr + ') \\u2014 reachable by any POS that trusts this bridge\\u2019s certificate.'
+          : 'This LAN (' + interfaces[i].cidr + ') \\u2014 reachable only by a POS served over plain http.'
       });
     }
 

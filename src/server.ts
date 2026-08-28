@@ -174,6 +174,29 @@ function isLoopbackRequest(req: IncomingMessage): boolean {
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
 }
 
+/**
+ * Run an async route body so that a throw becomes a 500 rather than a dead socket.
+ *
+ * Both route blocks below were bare `void (async () => …)()` with no catch, which made every
+ * unexpected throw cost twice: the client got no response at all and waited out its own timeout,
+ * AND the rejection was unhandled, which under Node's default ends the process. `prepare()` in
+ * jobs.ts deliberately re-throws anything that is not a RenderError, so a body that reached a
+ * renderer in an unexpected shape took the bridge down with it.
+ *
+ * `headersSent` matters: a throw AFTER a successful `sendJson` must not try to answer twice.
+ */
+function runRoute(res: ServerResponse, body: () => Promise<void>): void {
+  void body().catch((err: unknown) => {
+    const detail = err instanceof Error ? err.message : String(err);
+    log.error(`request failed: ${detail}`, { event: 'request.failed' });
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+    sendJson(res, 500, { ok: false, reason: 'internal-error', detail });
+  });
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const data = JSON.stringify(body);
   res.writeHead(status, {
@@ -677,7 +700,7 @@ export function createBridgeServer(): Server {
     }
 
     if (method === 'GET' && path === '/status') {
-      void (async () => {
+      runRoute(res, async () => {
         const interfaces = localInterfaces();
         sendJson(res, 200, {
           ok: true,
@@ -703,7 +726,7 @@ export function createBridgeServer(): Server {
           printers: await printerStatuses(url.searchParams.get('probe') === '1'),
           queue: { pending: queue().pending(), ...queue().depth() },
         });
-      })();
+      });
       return;
     }
 
@@ -736,7 +759,7 @@ export function createBridgeServer(): Server {
       return;
     }
 
-    void (async () => {
+    runRoute(res, async () => {
       const body = await readJsonBody(req);
       if (!body.ok) {
         sendJson(res, body.reason === 'body-too-large' ? 413 : 400, { ok: false, reason: body.reason });
@@ -829,7 +852,7 @@ export function createBridgeServer(): Server {
       }
 
       sendJson(res, 404, { ok: false, reason: 'not-found' });
-    })();
+    });
   };
 
   const tls = tlsOptions();

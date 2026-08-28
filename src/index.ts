@@ -269,6 +269,25 @@ function runService(): void {
   // until someone runs `--enroll`, so an existing LAN-only install is unaffected.
   startRelay();
 
+  /*
+   * Survive an unexpected throw instead of vanishing.
+   *
+   * Node's default for an unhandled rejection is to end the process, and this one is a printer
+   * daemon with no window: it comes back only when launchd or Task Scheduler notices, and the
+   * operator's evidence is a till that has stopped printing. `runRoute` in server.ts already
+   * answers the request that caused it — these are the backstop for everything off the request
+   * path (a relay dispatch, a queue lane, a transport callback), where the right move is to log
+   * loudly and keep taking print jobs rather than take the venue down over one bad frame.
+   */
+  process.on('unhandledRejection', (reason) => {
+    log.error(`unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`, {
+      event: 'process.unhandled_rejection',
+    });
+  });
+  process.on('uncaughtException', (err) => {
+    log.error(`uncaught exception: ${err.stack ?? err.message}`, { event: 'process.uncaught_exception' });
+  });
+
   // launchd and Task Scheduler both stop the process with a signal; exiting cleanly keeps a
   // restart from being logged as a crash.
   let shuttingDown = false;
