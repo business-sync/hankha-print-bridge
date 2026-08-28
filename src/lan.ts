@@ -112,11 +112,29 @@ export function tcpPing(ip: string, port: number, timeoutMs: number): Promise<Pi
  */
 export type PrintedCertainty = 'none' | 'unknown';
 
+/**
+ * Why a send failed, in enough detail for an operator to act on.
+ *
+ * The first four are the TCP cases and predate every other transport; they stay spelled exactly
+ * as they were because `server.ts` puts this string on the wire and the POS terminal shows it to
+ * the operator verbatim. The rest were added with the USB and serial drivers — additive, so a
+ * terminal that has never seen one simply prints the unfamiliar word.
+ */
 export type PrintFailureReason =
   | 'connect-refused'
   | 'unreachable'
   | 'connect-timeout'
-  | 'write-timeout';
+  | 'write-timeout'
+  /** The queue or character device named in the registry is not on this machine. */
+  | 'device-missing'
+  /** Something else holds the device open. Two processes cannot share a serial port. */
+  | 'device-busy'
+  /** This host has no such transport at all — a container has no printers attached. */
+  | 'not-supported'
+  /** `lp` / `WritePrinter` refused the job. */
+  | 'spooler-error'
+  /** The printer is configured but disabled in the registry, or the job was cancelled. */
+  | 'cancelled';
 
 export type PrintOutcome =
   | { ok: true; duration_ms: number }

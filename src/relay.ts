@@ -1,13 +1,13 @@
 import { loadState, saveState, type RelayState } from './identity.js';
-import {
-  containerSuspect,
-  DEFAULT_PRINTER_PORT,
-  localInterfaces,
-  runScan,
-  sendToPrinter,
-} from './lan.js';
+import { containerSuspect, DEFAULT_PRINTER_PORT, localInterfaces, runScan } from './lan.js';
+import { adHocNetworkPrinter, targetFrom } from './jobs.js';
+import { log } from './log.js';
+import { queue, type JobResult } from './queue.js';
+import { findPrinter, loadRegistry, resolveByAddress } from './registry.js';
+import { connectWebSocket, WebSocketHandshakeError } from './relay-socket.js';
 import { BRIDGE_VERSION } from './version.js';
 import { arch, hostname, platform } from 'node:os';
+import { backoffMs } from './backoff.js';
 
 /**
  * The outbound half of the bridge.
@@ -21,18 +21,15 @@ import { arch, hostname, platform } from 'node:os';
 const DEFAULT_RELAY_URL = 'https://api.hankha.la';
 const POLL_WAIT_S = 25;
 const HEARTBEAT_INTERVAL_MS = 30_000;
-const PRINT_TIMEOUT_MS = 5000;
-/** Remembered results, so a redelivered job is answered rather than reprinted. */
-const RECENT_JOBS_MAX = 200;
-const MAX_BACKOFF_MS = 30_000;
-
-interface JobResult {
-  ok: boolean;
-  reason?: string;
-  printed_certainty?: 'none' | 'unknown';
-  detail?: string;
-  duration_ms?: number;
-}
+/**
+ * How long to leave WebSocket alone after a server says it does not speak it.
+ *
+ * A 404 is a fact about the deployment, not a transient fault: the endpoint either exists or it
+ * does not. Retrying every 30 seconds against a backend that will never answer is pure noise in
+ * both logs, so it is asked again only twice an hour — often enough to pick up a deploy, rare
+ * enough to be invisible.
+ */
+const WS_UNSUPPORTED_RETRY_MS = 30 * 60_000;
 
 type Work =
   | {
@@ -40,6 +37,8 @@ type Work =
       job: {
         job_id: string;
         client_job_id: string;
+        /** Not sent today. Read when present, so the server can address a bridge's own printers. */
+        printer_id?: string;
         kind: string;
         target_ip: string;
         target_port: number;
@@ -109,6 +108,8 @@ export interface RelayStatus {
   enrolled: boolean;
   bridge_id: string | null;
   connected: boolean;
+  /** Which channel is carrying work right now. Null until the first successful exchange. */
+  transport: 'websocket' | 'long-poll' | null;
   last_ok_at: string | null;
   last_error: string | null;
 }
@@ -117,29 +118,13 @@ const status: RelayStatus = {
   enrolled: false,
   bridge_id: null,
   connected: false,
+  transport: null,
   last_ok_at: null,
   last_error: null,
 };
 
 export function relayStatus(): RelayStatus {
   return { ...status };
-}
-
-/**
- * Results of jobs already handled, keyed by job id.
- *
- * The last line of defence against a duplicate print: if the server ever hands out the same
- * job twice — a bug, a replay, a partition — this refuses to print it a second time and simply
- * re-reports what happened the first time. Bounded, because a bridge runs for months.
- */
-const recentJobs = new Map<string, JobResult>();
-
-function remember(jobId: string, result: JobResult): void {
-  recentJobs.set(jobId, result);
-  if (recentJobs.size > RECENT_JOBS_MAX) {
-    const oldest = recentJobs.keys().next().value;
-    if (oldest !== undefined) recentJobs.delete(oldest);
-  }
 }
 
 async function postResult(base: string, token: string, jobId: string, result: JobResult): Promise<void> {
@@ -157,29 +142,57 @@ async function postResult(base: string, token: string, jobId: string, result: Jo
 async function handlePrint(base: string, token: string, work: Extract<Work, { type: 'print' }>) {
   const { job } = work;
 
-  const seen = recentJobs.get(job.job_id);
-  if (seen) {
-    console.warn(`job ${job.job_id} was delivered twice — re-reporting, NOT reprinting`);
-    await postResult(base, token, job.job_id, seen);
+  const target = targetFrom(job.target_ip, job.target_port);
+  const registry = loadRegistry();
+  // `printer_id` is not on the wire today. Preferring it costs nothing and means the server can
+  // start addressing a bridge's own printers — including USB ones, which have no IP at all —
+  // without this file changing.
+  const named = job.printer_id ? findPrinter(registry, job.printer_id) : null;
+  const printer = named ?? (target ? resolveByAddress(registry, target.ip, target.port) ?? adHocNetworkPrinter(target.ip, target.port) : null);
+
+  if (!printer) {
+    await postResult(base, token, job.job_id, {
+      ok: false,
+      reason: 'device-missing',
+      printed_certainty: 'none',
+      detail: `no printer matches ${job.printer_id ?? `${job.target_ip}:${job.target_port}`}`,
+    });
     return;
   }
 
-  const payload = Buffer.from(job.payload_base64, 'base64');
-  const outcome = await sendToPrinter(job.target_ip, job.target_port, payload, PRINT_TIMEOUT_MS);
-  const result: JobResult = outcome.ok
-    ? { ok: true, duration_ms: outcome.duration_ms }
-    : {
-        ok: false,
-        reason: outcome.reason,
-        printed_certainty: outcome.printed_certainty,
-        detail: outcome.detail,
-        duration_ms: outcome.duration_ms,
-      };
+  // The server's claim is the job's real deadline. A bridge that comes back after an outage must
+  // drop the backlog rather than print an hour-old receipt onto a till that has moved on.
+  const claimMs = job.claim_expires_at ? Date.parse(job.claim_expires_at) - Date.now() : Number.NaN;
+  const ttl_s = Number.isFinite(claimMs) && claimMs > 0 ? Math.ceil(claimMs / 1000) : undefined;
 
-  // Remembered BEFORE the report is posted: if the POST fails and the job is redelivered, the
-  // second delivery must find this entry and re-report rather than print again.
-  remember(job.job_id, result);
-  await postResult(base, token, job.job_id, result);
+  const submission = queue().submit({
+    job_id: job.job_id,
+    source: 'relay',
+    printer,
+    payload: Buffer.from(job.payload_base64, 'base64'),
+    ttl_s,
+  });
+
+  // Deliberately NOT awaited. Printing used to happen inline here, which meant a printer taking
+  // four seconds to answer stopped the bridge fetching ANY further work for those four seconds —
+  // on a busy service, that is the whole reason tickets arrived late. The queue owns ordering and
+  // retries now; this loop's only job is to keep the channel moving.
+  //
+  // Redelivery is safe: the queue answers a job id it has already settled from its on-disk ring
+  // instead of printing a second copy, so a duplicate here becomes a duplicate REPORT, never a
+  // duplicate receipt.
+  void submission.settled
+    .then((settled) =>
+      postResult(base, token, job.job_id, settled.result ?? { ok: false, reason: 'unknown', printed_certainty: 'unknown' })
+    )
+    .catch((err: unknown) => {
+      // The print already happened or already failed; only the report was lost. The server's own
+      // sweeper moves an unreported job to UNKNOWN, and it never re-queues one, so nothing prints
+      // twice as a result of this.
+      log.warn(`relay: could not report job ${job.job_id} (${err instanceof Error ? err.message : String(err)})`, {
+        event: 'relay.result.failed', job_id: job.job_id,
+      });
+    });
 }
 
 async function handleScan(base: string, token: string, work: Extract<Work, { type: 'scan' }>) {
@@ -208,20 +221,93 @@ async function heartbeat(base: string, token: string): Promise<void> {
   });
 }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+async function dispatch(base: string, token: string, work: Work): Promise<void> {
+  if (work.type === 'print') await handlePrint(base, token, work);
+  else if (work.type === 'scan') await handleScan(base, token, work);
+}
+
+type RelayMode = 'auto' | 'ws' | 'poll';
+
+function relayMode(): RelayMode {
+  const raw = process.env.PRINT_BRIDGE_RELAY_TRANSPORT?.trim().toLowerCase();
+  return raw === 'ws' || raw === 'poll' ? raw : 'auto';
+}
+
+function socketUrl(base: string): string {
+  return `${base.replace(/^http/, 'ws')}/api/v1/modules/print/bridge/socket`;
+}
+
+type SessionOutcome = 'served' | 'unsupported' | 'revoked' | 'error';
 
 /**
- * Jittered backoff.
+ * One WebSocket session, from handshake to close.
  *
- * The jitter is not cosmetic. Production rolls out with `maxUnavailable: 25%`, which kills
- * every in-flight 25-second long-poll at the same instant; without jitter every bridge in the
- * fleet would reconnect in lock-step and stampede the new pod, and an unjittered exponential
- * backoff would leave every venue dark for the same 30 seconds.
+ * The server does not implement this endpoint yet, and that is the case this is written around:
+ * an ordinary HTTP answer to the upgrade means "not here", which is remembered rather than
+ * retried, and the long-poll below carries the traffic exactly as it does today. The moment the
+ * endpoint appears, every bridge in the fleet picks it up within half an hour with no new release.
+ *
+ * The expected server side is small: accept the upgrade with the same bearer token the other
+ * bridge routes take, then push the SAME `Work` JSON objects the long-poll returns. Results keep
+ * going back over HTTP — reusing an endpoint that already exists is worth more than the round trip
+ * it saves, and it means a half-built server side cannot lose a print result.
  */
-function backoffMs(attempt: number): number {
-  const base = Math.min(2 ** attempt * 1000, MAX_BACKOFF_MS);
-  return Math.round(base * (0.5 + Math.random() * 0.5));
+async function runSocketSession(base: string, token: string): Promise<SessionOutcome> {
+  let client: Awaited<ReturnType<typeof connectWebSocket>>;
+  try {
+    client = await connectWebSocket({
+      url: socketUrl(base),
+      headers: { Authorization: `Bearer ${token}` },
+      onMessage: (text) => {
+        let work: Work;
+        try {
+          work = JSON.parse(text) as Work;
+        } catch {
+          return;
+        }
+        // Unknown types are ignored rather than treated as errors, so the server can add a frame
+        // kind without every deployed bridge dropping its connection over it.
+        if (work.type !== 'print' && work.type !== 'scan') return;
+        void dispatch(base, token, work).catch((err: unknown) => {
+          log.error(`relay: failed to handle ${work.type} (${err instanceof Error ? err.message : String(err)})`, {
+            event: 'relay.dispatch.failed', kind: work.type,
+          });
+        });
+      },
+    });
+  } catch (err) {
+    if (err instanceof WebSocketHandshakeError) {
+      if (err.status === 401 || err.status === 403) return 'revoked';
+      // Any ordinary HTTP answer that is not an auth failure means this path does not speak
+      // WebSocket. A 5xx is the exception: that is a server having a bad minute, not a missing
+      // route, and it should be retried like any other transient fault.
+      if (err.status !== null && err.status < 500) return 'unsupported';
+    }
+    status.last_error = err instanceof Error ? err.message : String(err);
+    return 'error';
+  }
+
+  status.connected = true;
+  status.transport = 'websocket';
+  status.last_ok_at = new Date().toISOString();
+  status.last_error = null;
+  log.info('relay: connected over websocket', { event: 'relay.ws.open' });
+
+  client.send(JSON.stringify({ type: 'hello', ...describeSelf() }));
+  const beat = setInterval(() => client.send(JSON.stringify({ type: 'heartbeat', ...describeSelf() })), HEARTBEAT_INTERVAL_MS);
+  beat.unref();
+
+  const { code, reason } = await client.closed;
+  clearInterval(beat);
+  status.connected = false;
+  status.last_error = code === 1000 ? null : `websocket closed (${code}${reason ? `: ${reason}` : ''})`;
+  log.info(`relay: websocket closed (${code})`, { event: 'relay.ws.close', code, reason });
+  return code === 1008 || code === 4401 ? 'revoked' : 'served';
 }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+
 
 /**
  * The relay loop. Runs forever; never throws.
@@ -232,8 +318,9 @@ function backoffMs(attempt: number): number {
 export function startRelay(): void {
   const state = loadState();
   if (!state.token || !state.bridge_id) {
-    console.log(
-      'print bridge is not enrolled — run `hankha-print-bridge --enroll <code>` with a code from Settings > Printing'
+    log.info(
+      'print bridge is not enrolled — run `hankha-print-bridge --enroll <code>` with a code from Settings > Printing',
+      { event: 'relay.not_enrolled' }
     );
     return;
   }
@@ -242,7 +329,9 @@ export function startRelay(): void {
   const token = state.token;
   status.enrolled = true;
   status.bridge_id = state.bridge_id;
-  console.log(`relay: enrolled as bridge ${state.bridge_id}, polling ${base}`);
+  log.info(`relay: enrolled as bridge ${state.bridge_id}, connecting to ${base}`, {
+    event: 'relay.start', bridge_id: state.bridge_id, relay_url: base,
+  });
 
   const beatOnce = () =>
     heartbeat(base, token).catch(() => {
@@ -257,9 +346,50 @@ export function startRelay(): void {
   const beat = setInterval(beatOnce, HEARTBEAT_INTERVAL_MS);
   beat.unref();
 
+  const mode = relayMode();
+  // `poll` pins the old behaviour; `ws` refuses to fall back, for testing a server that does
+  // implement the socket. `auto` — the default — prefers the socket and quietly degrades.
+  let wsBlockedUntil = mode === 'poll' ? Number.POSITIVE_INFINITY : 0;
+  let wsUnsupportedLogged = false;
+
   void (async () => {
     let failures = 0;
     for (;;) {
+      if (Date.now() >= wsBlockedUntil) {
+        const outcome = await runSocketSession(base, token);
+        if (outcome === 'revoked') {
+          status.connected = false;
+          status.last_error = 'token rejected — re-enrollment required';
+          log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
+            event: 'relay.token_rejected',
+          });
+          clearInterval(beat);
+          return;
+        }
+        if (outcome === 'served') {
+          // A clean session ended: reconnect straight away rather than falling back, because the
+          // endpoint demonstrably exists.
+          failures = 0;
+          continue;
+        }
+        if (outcome === 'unsupported') {
+          wsBlockedUntil = Date.now() + WS_UNSUPPORTED_RETRY_MS;
+          if (!wsUnsupportedLogged) {
+            wsUnsupportedLogged = true;
+            log.info('relay: this server does not offer a websocket endpoint — using long-polling', {
+              event: 'relay.ws.unsupported',
+            });
+          }
+        }
+        if (mode === 'ws') {
+          // Explicitly pinned to websocket: never silently start polling instead.
+          const wait = backoffMs(Math.min(failures, 5));
+          failures += 1;
+          await sleep(wait);
+          continue;
+        }
+      }
+
       try {
         const res = await fetch(
           `${base}/api/v1/modules/print/bridge/work?wait=${POLL_WAIT_S}`,
@@ -276,7 +406,9 @@ export function startRelay(): void {
           // human with a fresh enrollment code can fix this.
           status.connected = false;
           status.last_error = 'token rejected — re-enrollment required';
-          console.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`');
+          log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
+            event: 'relay.token_rejected',
+          });
           clearInterval(beat);
           return;
         }
@@ -284,6 +416,7 @@ export function startRelay(): void {
         if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`);
 
         status.connected = true;
+        status.transport = 'long-poll';
         status.last_ok_at = new Date().toISOString();
         status.last_error = null;
         failures = 0;
@@ -295,9 +428,7 @@ export function startRelay(): void {
           continue;
         }
 
-        const work = (await res.json()) as Work;
-        if (work.type === 'print') await handlePrint(base, token, work);
-        else await handleScan(base, token, work);
+        await dispatch(base, token, (await res.json()) as Work);
       } catch (err) {
         status.connected = false;
         status.last_error = err instanceof Error ? err.message : String(err);
@@ -305,7 +436,9 @@ export function startRelay(): void {
         failures += 1;
         // Logged at most every few seconds by the backoff itself, so a venue that loses its
         // uplink overnight does not fill the log file.
-        console.error(`relay: ${status.last_error} — retrying in ${Math.round(wait / 1000)}s`);
+        log.error(`relay: ${status.last_error} — retrying in ${Math.round(wait / 1000)}s`, {
+          event: 'relay.retry', detail: status.last_error, wait_ms: wait,
+        });
         await sleep(wait);
       }
     }
