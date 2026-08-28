@@ -281,16 +281,21 @@ export function parseReceiptDocument(raw: unknown): DocumentParse<ReceiptDocumen
   }
   if (errors.length > 0) return { document: null, errors };
 
-  return {
-    document: {
-      kind: 'receipt',
-      elements,
-      dots_per_line: record.dots_per_line === undefined ? undefined : int(record.dots_per_line, 'dots_per_line', 'receipt', errors, 8, 4096, 576),
-      codepage: record.codepage === undefined ? undefined : int(record.codepage, 'codepage', 'receipt', errors, 0, 255, 0),
-      cut: record.cut === undefined ? true : record.cut === true,
-    },
-    errors,
+  const document: ReceiptDocument = {
+    kind: 'receipt',
+    elements,
+    dots_per_line: record.dots_per_line === undefined ? undefined : int(record.dots_per_line, 'dots_per_line', 'receipt', errors, 8, 4096, 576),
+    codepage: record.codepage === undefined ? undefined : int(record.codepage, 'codepage', 'receipt', errors, 0, 255, 0),
+    cut: record.cut === undefined ? true : record.cut === true,
   };
+
+  /*
+   * Re-checked, because the two `int()` calls above push into `errors` and the guard further up
+   * has already run by then. Returning a document alongside those errors dropped them entirely —
+   * `jobs.ts` only tests `!parsed.document` — so a `dots_per_line` of 1000000 answered 200 and
+   * quietly printed at the 576 fallback. `parseLabelDocument` has always ended this way.
+   */
+  return errors.length > 0 ? { document: null, errors } : { document, errors };
 }
 
 /* ----------------------------------------------------------------------- label parsing */

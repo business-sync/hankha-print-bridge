@@ -65,7 +65,15 @@ export function renderLabelZpl(document: LabelDocument, printer: PrinterRecord):
         const hri = element.hri === 'none' ? 'N' : 'Y';
         const above = element.hri === 'above' || element.hri === 'both' ? 'Y' : 'N';
         out.push(`^BY${element.module_width ?? 2},,${height}`);
-        out.push(`${at}^${BARCODE_COMMAND[element.symbology]}${rot},${height},${hri},${above},N^FD${element.value}^FS`);
+        /*
+         * `^FH` + `escapeField`, exactly as the text case above does it. Without either, a value
+         * containing `^` or `~` closes the field early and the remainder of the SKU is executed
+         * as ZPL commands — the hazard this file's header describes, fixed for text and missed
+         * here.
+         */
+        out.push(
+          `${at}^${BARCODE_COMMAND[element.symbology]}${rot},${height},${hri},${above},N^FH^FD${escapeField(element.value)}^FS`
+        );
         break;
       }
 
@@ -74,7 +82,14 @@ export function renderLabelZpl(document: LabelDocument, printer: PrinterRecord):
         // `^BQ` magnification tops out at 10. The field data carries the error-correction letter
         // and the input mode (`A` = automatic), which is where ZPL differs from every other
         // language: the EC level is in the DATA, not the command.
-        out.push(`${at}^BQ${rot},2,${Math.min(10, Math.max(1, element.size ?? 5))}^FD${element.ec ?? 'M'}A,${escapeField(element.value)}^FS`);
+        /*
+         * `^FH` is what makes `escapeField` mean anything: the `_XX` hex form is only decoded on
+         * a field that enables it, and it is field-scoped, so the `^FH` on the text case does not
+         * carry here. Escaping without it was the worse half of the bug — every `_` in a payload
+         * (ubiquitous in URLs and ids) was encoded literally as `_5F`, so the label scanned
+         * perfectly and returned the wrong string.
+         */
+        out.push(`${at}^BQ${rot},2,${Math.min(10, Math.max(1, element.size ?? 5))}^FH^FD${element.ec ?? 'M'}A,${escapeField(element.value)}^FS`);
         break;
       }
 

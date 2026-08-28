@@ -30,6 +30,16 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
  * enough to be invisible.
  */
 const WS_UNSUPPORTED_RETRY_MS = 30 * 60_000;
+
+/**
+ * A floor under every websocket reconnect, including the ones we consider clean.
+ *
+ * Cheap insurance rather than a tuning knob: the reconnect path had no delay at all, so any
+ * close that reached it spun the loop as fast as the network would allow — a log line, a
+ * synchronous registry read and a TCP handshake per iteration. Narrowing which close codes get
+ * here is the real fix; this makes the category incapable of spinning again.
+ */
+const RECONNECT_FLOOR_MS = 1_000;
 /**
  * How much of the server's claim window to leave unused, so a terminal result can be reported
  * and accepted before the claim lapses and the sweeper writes UNKNOWN over it.
@@ -398,7 +408,18 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
   status.connected = false;
   status.last_error = code === 1000 ? null : `websocket closed (${code}${reason ? `: ${reason}` : ''})`;
   log.info(`relay: websocket closed (${code})`, { event: 'relay.ws.close', code, reason });
-  return code === 1008 || code === 4401 ? 'revoked' : 'served';
+  if (code === 1008 || code === 4401) return 'revoked';
+  /*
+   * Only a DELIBERATE close counts as served.
+   *
+   * `closeCode` defaults to 1006, the code for an abnormal close — a TCP reset, a load balancer
+   * dropping the connection, the server process dying. Every one of those used to return
+   * 'served', which resets the failure count and reconnects with no delay: a balancer that
+   * accepts the upgrade and immediately drops it produced an unbounded reconnect storm against
+   * the API, with a registry read per turn. Anything unexpected is an error and goes through the
+   * backoff and fallback the loop already has.
+   */
+  return code === 1000 || code === 1001 ? 'served' : 'error';
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -486,9 +507,11 @@ export function startRelay(): void {
           return;
         }
         if (outcome === 'served') {
-          // A clean session ended: reconnect straight away rather than falling back, because the
-          // endpoint demonstrably exists.
+          // A clean session ended: reconnect rather than falling back, because the endpoint
+          // demonstrably exists. Floored all the same — a category that reconnects without
+          // delay is one server-side bug away from being a spin, which is how it got here.
           failures = 0;
+          await sleep(RECONNECT_FLOOR_MS);
           continue;
         }
         if (outcome === 'unsupported') {
