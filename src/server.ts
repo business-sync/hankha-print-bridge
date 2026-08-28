@@ -16,8 +16,8 @@ import { isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { prepare, targetFrom, type JobRequest } from './jobs.js';
 import { log } from './log.js';
 import { INDEX_CSP, INDEX_HTML } from './page.js';
-import { describeJob, queue } from './queue.js';
-import { findPrinter, loadRegistry, parseRegistry, saveRegistry } from './registry.js';
+import { describeJob, isSafeJobId, queue } from './queue.js';
+import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
 import { loadState } from './identity.js';
 import { enroll, isRelayRunning, relayStatus, startRelay } from './relay.js';
 import { sampleLabel, sampleReceipt } from './samples.js';
@@ -391,6 +391,17 @@ async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void
     target = parsed;
   }
 
+  // Checked here so the caller gets a plain 400 naming the field, rather than the queue's throw.
+  // The id ends up as a spool filename, which is why it is constrained at all.
+  if (typeof raw.job_id === 'string' && raw.job_id.trim() && !isSafeJobId(raw.job_id.trim())) {
+    sendJson(res, 400, {
+      ok: false,
+      reason: 'invalid-body',
+      errors: ['job_id may contain only letters, digits, dot, dash and underscore, and cannot start with a dot'],
+    });
+    return;
+  }
+
   const request: JobRequest = {
     job_id: typeof raw.job_id === 'string' ? raw.job_id : undefined,
     printer_id: typeof raw.printer_id === 'string' ? raw.printer_id : undefined,
@@ -586,7 +597,10 @@ export function createBridgeServer(): Server {
       return;
     }
 
-    if (method === 'GET' && path === '/health') {
+    // HEAD as well as GET, for the same reason the root page accepts it: `curl -I` and every
+    // uptime monitor aim at a URL with HEAD, and this — not `/` — is the endpoint they are told
+    // to watch. Node suppresses the body on a HEAD itself, so the headers stay honest.
+    if ((method === 'GET' || method === 'HEAD') && path === '/health') {
       // `ok` stays first and unchanged: older terminals only look at that. Everything after
       // it is additive — a terminal predating any of these fields simply ignores them.
       //
@@ -641,6 +655,13 @@ export function createBridgeServer(): Server {
           auth_required: bridgeToken().length > 0,
           relay: relayStatus(),
           transports: transportAvailability(),
+          // Where printers.json actually lives. The status page used to tell an operator to run
+          // `--list-printers` to find this out — a CLI round trip for a string this process has
+          // in hand, on a machine where the binary is not on PATH after the macOS installer.
+          //
+          // On /status rather than /health deliberately: /health is unauthenticated and reachable
+          // from the whole venue LAN, and on macOS this path contains the account name.
+          registry_path: registryPath(),
           printers: await printerStatuses(url.searchParams.get('probe') === '1'),
           queue: { pending: queue().pending(), ...queue().depth() },
         });
@@ -722,7 +743,19 @@ export function createBridgeServer(): Server {
       }
 
       if (method === 'POST' && segments[0] === 'jobs' && segments[2] === 'cancel' && segments.length === 3) {
-        const cancelled = queue().cancel(segments[1] ?? '');
+        const jobId = segments[1] ?? '';
+        /*
+         * `cancel()` answers false for "unknown id", "already settled" and "currently printing"
+         * alike, and its return value is load-bearing for `/print`'s printed_certainty — so the
+         * distinction is drawn HERE rather than by changing it. Without this a typo'd id came
+         * back as `already-printing-or-finished`, which tells a caller that a job it never
+         * created is on the paper: the one answer that suppresses a retry.
+         */
+        if (!queue().get(jobId)) {
+          sendJson(res, 404, { ok: false, reason: 'not-found' });
+          return;
+        }
+        const cancelled = queue().cancel(jobId);
         sendJson(res, cancelled ? 200 : 409, {
           ok: cancelled,
           reason: cancelled ? undefined : 'already-printing-or-finished',
