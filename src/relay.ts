@@ -37,10 +37,15 @@ type Work =
       job: {
         job_id: string;
         client_job_id: string;
-        /** Not sent today. Read when present, so the server can address a bridge's own printers. */
+        /**
+         * An entry in this bridge's own registry. Set when the server is addressing a printer
+         * this machine owns — the only way to reach a USB or serial one, which has no address
+         * for a remote till to send. Preferred over `target_ip` when both somehow arrive.
+         */
         printer_id?: string;
         kind: string;
-        target_ip: string;
+        /** Null when `printer_id` addresses the job instead. */
+        target_ip: string | null;
         target_port: number;
         payload_base64: string;
         payload_sha256: string;
@@ -74,7 +79,7 @@ const MAX_REPORTED_PRINTERS = 64;
  * Deliberately a summary, not the whole record: baud rates, codepages and label dimensions are
  * this machine's business and change nothing about which printer a remote operator wants.
  */
-function describeRegistry() {
+export function describeRegistry() {
   // `loadRegistry` is documented never to throw — a broken file yields an empty registry — so a
   // heartbeat is never lost to a malformed `printers.json`.
   return loadRegistry()
@@ -122,6 +127,7 @@ export async function enroll(code: string): Promise<{ bridge_id: string }> {
       platform: self.platform,
       arch: self.arch,
       interfaces: self.interfaces,
+      registry_printers: self.registry_printers,
     }),
     signal: AbortSignal.timeout(15_000),
   });
@@ -183,9 +189,9 @@ async function handlePrint(base: string, token: string, work: Extract<Work, { ty
 
   const target = targetFrom(job.target_ip, job.target_port);
   const registry = loadRegistry();
-  // `printer_id` is not on the wire today. Preferring it costs nothing and means the server can
-  // start addressing a bridge's own printers — including USB ones, which have no IP at all —
-  // without this file changing.
+  // `printer_id` wins over the address. It is how the server names a printer this machine owns
+  // — including USB and serial ones, which have no IP at all and therefore cannot be addressed
+  // any other way.
   const named = job.printer_id ? findPrinter(registry, job.printer_id) : null;
   const printer = named ?? (target ? resolveByAddress(registry, target.ip, target.port) ?? adHocNetworkPrinter(target.ip, target.port) : null);
 

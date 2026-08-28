@@ -7,6 +7,7 @@ import {
   defaultPrinter, findPrinter, loadRegistry, parseRegistry, registryPath,
   resetRegistryCache, resolveByAddress, saveRegistry,
 } from './registry.js';
+import { describeRegistry } from './relay.js';
 
 let dir = '';
 let originalStateDir: string | undefined;
@@ -161,3 +162,40 @@ describe('resolution', () => {
     assert.equal(defaultPrinter(two, 'receipt'), null);
   });
 });
+
+describe('what the bridge reports upstream', () => {
+  // The cloud can only offer a printer a remote till can pick if the bridge has told it the
+  // printer exists. A network sweep finds sockets; only this list can contain a USB or serial
+  // printer, and that is the whole reason a tablet could not print to one.
+  it('reports every configured printer, including the ones with no address', () => {
+    saveRegistry({
+      version: 1,
+      printers: [
+        { id: 'counter', name: 'Counter', transport: 'network', address: '192.168.18.103', port: 9100 },
+        { id: 'kitchen-usb', name: 'Kitchen', transport: 'usb', queue: 'EPSON_TM_T20' },
+      ],
+    });
+    const reported = describeRegistry();
+
+    assert.equal(reported.length, 2);
+    const usb = reported.find((p) => p.id === 'kitchen-usb');
+    assert.equal(usb?.transport, 'usb');
+    // Null rather than absent: the server column is NOT NULL-defaulted and the POS branches on
+    // it to decide whether a printer can be addressed by socket at all.
+    assert.equal(usb?.address, null);
+    assert.equal(reported.find((p) => p.id === 'counter')?.address, '192.168.18.103');
+  });
+
+  // The heartbeat runs every 30 seconds forever; a serial port name is this machine's business
+  // and nothing remote can act on it.
+  it('sends a summary, not the whole record', () => {
+    saveRegistry({
+      version: 1,
+      printers: [{ id: 'labels', name: 'Labels', transport: 'serial', device: '/dev/cu.RPP02N', baud: 19200, type: 'label', language: 'tspl', width_mm: 40, height_mm: 30 }],
+    });
+    const [reported] = describeRegistry();
+    assert.deepEqual(Object.keys(reported ?? {}).sort(), [
+      'address', 'enabled', 'id', 'name', 'port', 'transport', 'type',
+    ]);
+  });
+})
