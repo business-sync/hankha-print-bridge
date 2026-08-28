@@ -787,3 +787,73 @@ describe('POST /print by printer id', () => {
     assert.equal(status, 400);
   });
 })
+
+
+describe('job ids are filesystem-safe', () => {
+  /*
+   * `job_id` becomes a spool filename, and `join()` resolves `..` — so an id like this used to
+   * write a caller-influenced JSON file outside the state directory and delete that path when
+   * the job settled. Printer ids have been validated from the start; job ids were not, and the
+   * prod deployment answers with no token at all.
+   */
+  it('refuses a job id that would escape the spool directory', async () => {
+    const { status, json } = await post('/jobs', {
+      job_id: '../../../../tmp/hankha-pwn',
+      target: { ip: '192.168.1.50', port: 9100 },
+      payload_base64: 'QQ==',
+    });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-body');
+    assert.match(json.errors.join('; '), /job_id/);
+  });
+
+  it('refuses an id with a path separator, which merely breaks spooling', async () => {
+    const { status } = await post('/jobs', {
+      job_id: 'a/b',
+      target: { ip: '192.168.1.50', port: 9100 },
+      payload_base64: 'QQ==',
+    });
+    assert.equal(status, 400);
+  });
+
+  it('still accepts an ordinary server-side id', async () => {
+    const { status } = await post('/jobs', {
+      job_id: 'job_01HZX.4-abc',
+      target: { ip: '192.168.1.50', port: 9100 },
+      payload_base64: 'QQ==',
+    });
+    assert.equal(status, 202);
+  });
+});
+
+describe('monitoring surface', () => {
+  // `curl -I` and every uptime monitor use HEAD, and /health — not / — is the URL they are
+  // pointed at. It answered 404, having fallen through to the catch-all.
+  it('answers HEAD /health', async () => {
+    const res = await fetch(`${baseUrl}/health`, { method: 'HEAD' });
+    assert.equal(res.status, 200);
+  });
+
+  it('tells /status where printers.json is, and does not tell /health', async () => {
+    const status = await (await fetch(`${baseUrl}/status`)).json();
+    assert.equal(typeof status.registry_path, 'string');
+    assert.ok(status.registry_path.endsWith('printers.json'));
+
+    // /health is unauthenticated and LAN-reachable, and this path carries an account name.
+    const health = await (await fetch(`${baseUrl}/health`)).json();
+    assert.equal(health.registry_path, undefined);
+  });
+});
+
+describe('cancelling a job', () => {
+  /*
+   * `cancel()` returns false for "unknown", "settled" and "printing" alike, so an id that never
+   * existed came back as `already-printing-or-finished` — an answer that tells a caller a job it
+   * never created is on the paper, which is exactly the answer that suppresses a retry.
+   */
+  it('answers 404 for a job id that never existed', async () => {
+    const { status, json } = await post('/jobs/no-such-job/cancel', {});
+    assert.equal(status, 404);
+    assert.equal(json.reason, 'not-found');
+  });
+})
