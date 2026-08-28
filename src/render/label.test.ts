@@ -43,11 +43,39 @@ describe('ZPL', () => {
 
   it('positions every element with ^FO', () => {
     assert.ok(out.includes('^FO16,16^A0N,24,0^FH^FDDok Champa^FS'));
-    assert.ok(out.includes('^FO16,60^BCN,50,Y,N,N^FDHK-00421^FS'));
+    assert.ok(out.includes('^FO16,60^BCN,50,Y,N,N^FH^FDHK-00421^FS'));
     // The error-correction letter lives in the FIELD DATA for ^BQ, not in the command — the one
     // place ZPL differs from every other language here.
-    assert.ok(out.includes('^FO260,60^BQN,2,4^FDMA,https://hankha.la/p/421^FS'));
+    assert.ok(out.includes('^FO260,60^BQN,2,4^FH^FDMA,https://hankha.la/p/421^FS'));
     assert.ok(out.includes('^FO4,4^GB392,232,2^FS'));
+  });
+
+  /*
+   * Every field that carries caller data must both escape AND enable `^FH`, because the two are
+   * only meaningful together. These three cases used to disagree: text did both, the barcode did
+   * neither, and the QR escaped without enabling — which is the worst of the three, since it
+   * corrupts silently instead of failing.
+   */
+  it('escapes a caret in a barcode, so a SKU cannot run on as ZPL commands', () => {
+    const parsed = parseLabelDocument({
+      elements: [{ type: 'barcode', x: 0, y: 0, symbology: 'CODE128', value: 'A^B' }],
+    });
+    assert.ok(parsed.document);
+    const escaped = render(parsed.document, labelPrinter('zpl')).toString('latin1');
+    assert.ok(escaped.includes('^FH^FDA_5EB^FS'), escaped);
+    assert.ok(!escaped.includes('^FDA^B'), 'the raw caret must not reach the printer');
+  });
+
+  it('enables ^FH on a QR, so an underscore is not encoded as the literal _5F', () => {
+    const parsed = parseLabelDocument({
+      elements: [{ type: 'qr', x: 0, y: 0, value: 'https://hankha.la/p/a_b' }],
+    });
+    assert.ok(parsed.document);
+    const escaped = render(parsed.document, labelPrinter('zpl')).toString('latin1');
+    // Escaped in the stream...
+    assert.ok(escaped.includes('_5F'), escaped);
+    // ...and preceded by the ^FH that makes the printer decode it back to an underscore.
+    assert.ok(/\^BQ[^^]*\^FH\^FD/.test(escaped), 'the QR field must enable hex escapes');
   });
 
   it('repeats natively rather than by resending the label', () => {

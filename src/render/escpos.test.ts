@@ -78,6 +78,30 @@ describe('layout', () => {
     assert.equal(line.length, 20);
     assert.ok(line.includes(' 25,000'));
   });
+
+  /*
+   * The line is measured in what the ENCODER emits, not in code units. `₭` is one character and
+   * three printed columns, so padding by `.length` made every kip total two columns too long and
+   * wrapped the price onto its own row — on the totals line of essentially every receipt in this
+   * fleet.
+   */
+  it('pads a kip price by its printed width, not its character count', () => {
+    const line = twoColumns('Beer Lao', '₭25,000', 32);
+    assert.equal(encodeText(line).bytes.length, 32);
+    assert.ok(encodeText(line).unprintable.length === 0);
+  });
+
+  it('measures an expanding character on the left side too', () => {
+    // `…` encodes to three dots, so a name padded by code units overruns by two.
+    const line = twoColumns('Long name…', '5,000', 24);
+    assert.equal(encodeText(line).bytes.length, 24);
+  });
+
+  it('still fills the line exactly when the name has to be cut', () => {
+    const line = twoColumns('₭'.repeat(30), '25,000', 20);
+    assert.equal(encodeText(line).bytes.length, 20);
+    assert.ok(line.endsWith(' 25,000'));
+  });
 });
 
 describe('command bytes', () => {
@@ -127,6 +151,26 @@ describe('command bytes', () => {
     // selector each vendor guesses differently.
     const payload = Buffer.from('{BHK-421', 'ascii');
     assert.ok(contains(bytes, [0x1d, 0x6b, 73, payload.length, ...payload]));
+  });
+
+  /*
+   * `GS k` announces its payload in a single byte. `Buffer.from(number[])` masks anything over
+   * 255 instead of complaining, so an over-long value used to print a truncated barcode and then
+   * hand the rest of the payload to the printer as commands. 254 characters plus the `{B`
+   * selector is 256, which masks to zero — the worst case, and the one pinned here.
+   */
+  it('refuses a barcode longer than the one-byte length can describe', () => {
+    const parsed = parseReceiptDocument({
+      elements: [{ type: 'barcode', symbology: 'CODE128', value: 'A'.repeat(254) }],
+    });
+    assert.deepEqual(parsed.errors, []);
+    assert.throws(() => renderReceiptEscPos(parsed.document!, printer), RenderError);
+  });
+
+  it('still emits a barcode that fits the length byte', () => {
+    // 253 + the two-byte `{B` selector is exactly 255.
+    const bytes = build([{ type: 'barcode', symbology: 'CODE128', value: 'A'.repeat(253) }]);
+    assert.ok(contains(bytes, [0x1d, 0x6b, 73, 255]));
   });
 
   it('refuses barcode data the symbology cannot carry', () => {
