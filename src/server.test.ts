@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { localInterfaces } from './lan.js';
 import { resetRegistryCache } from './registry.js';
+import { INDEX_HTML } from './page.js';
 import { BRIDGE_SERVICE, createBridgeServer } from './server.js';
 
 let stateDir = '';
@@ -100,6 +101,80 @@ describe('GET /health diagnostics', () => {
   it('keeps ok first so a terminal that only reads that keeps working', async () => {
     const raw = await (await fetch(`${baseUrl}/health`)).text();
     assert.ok(raw.startsWith('{"ok":true'));
+  });
+});
+
+describe('GET /', () => {
+  it('answers a browser with a page instead of a JSON 404', async () => {
+    // Typing the address the installer printed is the likeliest thing anyone ever does with this
+    // process, and `{"ok":false,"reason":"not-found"}` reads as "the thing I just installed is
+    // broken".
+    const res = await fetch(`${baseUrl}/`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /^text\/html/);
+    const html = await res.text();
+    assert.match(html, /^<!doctype html>/i);
+    assert.ok(html.includes('Hankha Print Bridge'));
+  });
+
+  it('serves the same page for /index.html', async () => {
+    const res = await fetch(`${baseUrl}/index.html`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /^text\/html/);
+  });
+
+  it('stays open when a token is set, so the page can explain that one is needed', async () => {
+    process.env.PRINT_BRIDGE_TOKEN = 'shhh';
+    try {
+      // A 401 here would show an operator raw JSON in a browser. The page carries no venue data
+      // of its own; every value on it comes from /status, which stays guarded.
+      assert.equal((await fetch(`${baseUrl}/`)).status, 200);
+      assert.equal((await fetch(`${baseUrl}/status`)).status, 401);
+    } finally {
+      delete process.env.PRINT_BRIDGE_TOKEN;
+    }
+  });
+
+  it('is self-contained, because the bridge is the only host it can reach', async () => {
+    // A till with no internet must render this page identically. Nothing may be fetched from a
+    // CDN, and the CSP says so as well as the markup.
+    const res = await fetch(`${baseUrl}/`);
+    const html = await res.text();
+    assert.equal(html.includes('//fonts.'), false);
+    assert.equal(/(src|href)="https?:/.test(html), false);
+    const csp = res.headers.get('content-security-policy') ?? '';
+    assert.ok(csp.includes("default-src 'none'"));
+    assert.ok(csp.includes("connect-src 'self'"));
+    // Without this the browser's default form submission would put the venue's printer token in
+    // a URL query string if the token box's handler ever failed to run.
+    assert.ok(csp.includes("form-action 'none'"));
+  });
+
+  it('survives a doubled slash rather than dying on it', async () => {
+    // `new URL('//', base)` throws, and a throw inside a request listener is an
+    // uncaughtException: before this was pinned to the path, one unauthenticated `GET //` from
+    // anywhere on the venue LAN stopped the bridge. `//health` is the milder half of the same
+    // bug — it parsed as the HOST `health` with the path `/`, so every doubled slash silently
+    // routed somewhere else. The POS terminal really does produce these: its `normalizeBase`
+    // exists because a stored `http://host:9200/` was building `…9200//print`.
+    const doubled = await fetch(`${baseUrl}//`);
+    assert.equal(doubled.status, 200);
+    assert.match(doubled.headers.get('content-type') ?? '', /^text\/html/);
+
+    const health = await fetch(`${baseUrl}//health`);
+    assert.equal(health.status, 200);
+    assert.equal((await health.json()).service, BRIDGE_SERVICE);
+
+    // Still answering, which is the part that was not true before.
+    assert.equal((await fetch(`${baseUrl}/health`)).status, 200);
+  });
+
+  it('never spells the version expression that --define rewrites', () => {
+    // `scripts/package.mjs` compiles with `--define process.env.APP_VERSION=...`, a source
+    // rewrite that does not care whether the expression sits inside a string. Written here it
+    // would be substituted into the served HTML, freezing the page at the build's version while
+    // /health went on reporting the truth.
+    assert.equal(INDEX_HTML.includes('process.env.APP_VERSION'), false);
   });
 });
 
