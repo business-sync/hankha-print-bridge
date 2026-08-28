@@ -40,6 +40,13 @@ const IDENTIFY_TIMEOUT_MS = 1500;
  * only produces a job nobody is listening for any more.
  */
 const SYNC_PRINT_TIMEOUT_MS = Number(process.env.PRINT_BRIDGE_SYNC_TIMEOUT_MS) || 8000;
+/**
+ * How long `POST /printers/:id/test` waits.
+ *
+ * Longer than the synchronous print above, because a test slip is worth a little more patience
+ * than a customer's receipt — but bounded, because a person is watching a button.
+ */
+const TEST_PRINT_TIMEOUT_MS = 12_000;
 /** Ample for a full-width raster receipt; small enough that a bad client cannot exhaust memory. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -457,9 +464,40 @@ async function handleTestPrint(res: ServerResponse, printerId: string): Promise<
     return;
   }
 
-  const submission = queue().submit({ source: 'local', printer, payload, ttl_s: 60 });
-  const settled = await submission.settled;
-  sendJson(res, settled.result?.ok ? 200 : 502, { ok: settled.result?.ok === true, job: describeJob(settled) });
+  /*
+   * A test print is something a person is standing in front of, waiting for.
+   *
+   * `ttl_s: 60` plus a retryable job means `withinDeadline` keeps trying for the whole minute, and
+   * this used to `await submission.settled` with no deadline of its own — so pressing "Test print"
+   * on a printer that was switched off held the HTTP request open for sixty seconds. The status
+   * page has no fetch timeout either, which turned that into a page that stopped updating until
+   * it was reloaded. `handleLegacyPrint` has always raced a deadline; this does the same, and
+   * cancels afterwards so the answer about whether anything printed is an honest one.
+   */
+  const submission = queue().submit({ source: 'local', printer, payload, ttl_s: TEST_PRINT_TIMEOUT_MS / 1000 });
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), TEST_PRINT_TIMEOUT_MS);
+    timer.unref();
+  });
+  const outcome = await Promise.race([submission.settled, deadline]);
+  clearTimeout(timer);
+
+  if (outcome === 'timeout') {
+    const neverStarted = queue().cancel(submission.job.job_id);
+    sendJson(res, 502, {
+      ok: false,
+      reason: 'timeout',
+      job: describeJob(queue().get(submission.job.job_id) ?? submission.job),
+      printed_certainty: neverStarted ? 'none' : 'unknown',
+      detail: neverStarted
+        ? `the printer did not accept the test slip within ${TEST_PRINT_TIMEOUT_MS}ms`
+        : `the test slip was still printing after ${TEST_PRINT_TIMEOUT_MS}ms`,
+    });
+    return;
+  }
+
+  sendJson(res, outcome.result?.ok ? 200 : 502, { ok: outcome.result?.ok === true, job: describeJob(outcome) });
 }
 
 /**
