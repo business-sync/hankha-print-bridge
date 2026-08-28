@@ -187,6 +187,27 @@ input[type=password], input[type=text] {
 .gate form { display: flex; gap: 8px; flex-wrap: wrap; }
 .gate input { flex: 1 1 260px; }
 
+/* ------------------------------------------------------------------ pairing */
+
+/*
+ * The code is read off a tablet held in the other hand and retyped here, so it is set large,
+ * monospaced and letter-spaced: at 13px in the body face, B/8 and S/5 are a coin toss, and a
+ * mistyped character costs a whole 15-minute code.
+ */
+.pair-lead { margin: 0 0 8px; color: var(--muted); font-size: 13px; max-width: 62ch; }
+.pair-steps { margin: 0 0 12px; padding-left: 20px; color: var(--muted); font-size: 13px; }
+.pair-steps li { margin-bottom: 3px; }
+.pair-steps strong { color: var(--text); font-weight: 600; }
+#pair-form { display: flex; gap: 8px; flex-wrap: wrap; }
+#pair-code {
+  flex: 1 1 190px; font-family: var(--mono); font-size: 18px; font-weight: 650;
+  letter-spacing: .16em; text-transform: uppercase; text-align: center;
+}
+.pair-result { margin: 10px 0 0; font-size: 13px; line-height: 1.45; }
+.pair-result.is-ok { color: var(--ok); }
+.pair-result.is-err { color: var(--bad); }
+.pair-result.is-busy { color: var(--muted); }
+
 /* ------------------------------------------------------------------ cards */
 
 /*
@@ -418,11 +439,16 @@ const SCRIPT = `
     } catch (err) { /* ignored on purpose */ }
   }
 
-  function request(method, path) {
+  function request(method, path, payload) {
     var headers = {};
     var tok = readToken();
     if (tok) headers.Authorization = 'Bearer ' + tok;
-    return fetch(path, { method: method, headers: headers, cache: 'no-store' }).then(function (res) {
+    var init = { method: method, headers: headers, cache: 'no-store' };
+    if (payload !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(payload);
+    }
+    return fetch(path, init).then(function (res) {
       return res.text().then(function (raw) {
         var body = null;
         try { body = JSON.parse(raw); } catch (err) { body = null; }
@@ -432,7 +458,7 @@ const SCRIPT = `
   }
 
   function get(path) { return request('GET', path); }
-  function post(path) { return request('POST', path); }
+  function post(path, payload) { return request('POST', path, payload); }
 
   /* ----------------------------------------------------------------- formatting */
 
@@ -766,7 +792,35 @@ const SCRIPT = `
     }
 
     $('relay-note').textContent = !relay.enrolled ? 'not enrolled' : relay.connected ? 'connected' : 'offline';
-    $('relay-hint').hidden = Boolean(relay.enrolled);
+    /*
+     * Hidden the moment the bridge is enrolled, including when the enrolment came from another
+     * tab or the CLI — the poll is what notices, so nothing here needs to know who paired it.
+     * The success message is left standing rather than cleared: it names the bridge, and the
+     * operator has usually looked away at the POS by the time this redraws.
+     */
+    $('pair').hidden = Boolean(relay.enrolled);
+  }
+
+  /* ----------------------------------------------------------------- pairing */
+
+  function pairResult(kind, message) {
+    var node = $('pair-result');
+    node.hidden = false;
+    node.className = 'pair-result is-' + kind;
+    node.textContent = message;
+  }
+
+  /*
+   * Formats as the operator types: uppercase, and a hyphen after the fourth character.
+   *
+   * The code is displayed as XXXX-XXXX on the POS but people type the hyphen inconsistently,
+   * and on a tablet keyboard it is two taps away. Inserting it here means the box always looks
+   * like the thing being copied from, which is how a transposition gets noticed before Connect
+   * is pressed rather than after the API has refused it.
+   */
+  function formatPairCode(raw) {
+    var clean = raw.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+    return clean.length > 4 ? clean.slice(0, 4) + '-' + clean.slice(4) : clean;
   }
 
   /* ----------------------------------------------------------------- token gate */
@@ -886,6 +940,58 @@ const SCRIPT = `
     writeToken('');
     refresh(false);
   });
+
+  $('pair-code').addEventListener('input', function () {
+    this.value = formatPairCode(this.value);
+  });
+
+  $('pair-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var code = formatPairCode($('pair-code').value);
+    if (code.length < 9) {
+      pairResult('err', 'A pairing code is eight characters, like XXXX-XXXX.');
+      return;
+    }
+
+    var button = $('pair-submit');
+    button.disabled = true;
+    pairResult('busy', 'Connecting\\u2026');
+
+    post('/enroll', { code: code }).then(function (res) {
+      var body = res.body || {};
+      if (res.status === 200 && body.ok) {
+        $('pair-code').value = '';
+        /*
+         * restart_required comes back only when a relay loop was ALREADY running — a re-pair
+         * onto a different venue. That loop holds the previous token in its closure, so the new
+         * credential does not take effect until the service restarts. Saying "connected" there
+         * would be a lie the operator only discovers when nothing prints.
+         */
+        pairResult(
+          'ok',
+          body.restart_required
+            ? 'Paired as bridge ' + body.bridge_id + '. Restart the Print Bridge service to finish.'
+            : 'Connected. This bridge is now paired \\u2014 the POS should show it within a few seconds.'
+        );
+        refresh(false);
+        return;
+      }
+      pairResult('err', pairError(res.status, body));
+    }).catch(function () {
+      pairResult('err', 'Could not reach the Print Bridge on this computer.');
+    }).then(function () {
+      button.disabled = false;
+    });
+  });
+
+  /* The reasons are the bridge's own; each one has a different thing for the operator to do. */
+  function pairError(status, body) {
+    if (body.reason === 'invalid-code-format') return 'That does not look like a pairing code. Check it against the POS.';
+    if (body.reason === 'already-enrolled') return 'This bridge is already paired with a venue. Remove it in Settings > Printing first.';
+    if (body.reason === 'not-loopback') return 'Pairing has to be done in a browser on this computer, not from another device.';
+    if (body.message) return body.message;
+    return 'Pairing failed (HTTP ' + status + '). Check this computer is online, then try again.';
+  }
 
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) {
@@ -1040,9 +1146,21 @@ export const INDEX_HTML = `<!doctype html>
       </div>
       <div class="card-body">
         <dl class="kv" id="relay-kv"></dl>
-        <p id="relay-hint" hidden>Jobs only arrive over the LAN. To let a phone print through this
-        bridge, run <code>hankha-print-bridge --enroll &lt;code&gt;</code> with a code from
-        Settings &rsaquo; Printing.</p>
+        <div id="pair" hidden>
+          <p class="pair-lead">Jobs only arrive over the LAN. To let a phone or tablet print
+          through this bridge, pair it with your venue.</p>
+          <ol class="pair-steps">
+            <li>In the POS, open <strong>Settings &rsaquo; Printing</strong> and tap
+            <strong>Add bridge</strong>.</li>
+            <li>Type the pairing code it shows into the box below.</li>
+          </ol>
+          <form id="pair-form" autocomplete="off">
+            <input type="text" id="pair-code" placeholder="XXXX-XXXX" maxlength="9" spellcheck="false"
+              autocapitalize="characters" autocorrect="off" aria-label="Pairing code">
+            <button type="submit" class="btn" id="pair-submit">Connect</button>
+          </form>
+          <p class="pair-result" id="pair-result" hidden></p>
+        </div>
       </div>
     </section>
 

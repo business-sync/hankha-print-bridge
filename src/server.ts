@@ -17,7 +17,8 @@ import { log } from './log.js';
 import { INDEX_CSP, INDEX_HTML } from './page.js';
 import { describeJob, queue } from './queue.js';
 import { findPrinter, loadRegistry, parseRegistry, saveRegistry } from './registry.js';
-import { relayStatus } from './relay.js';
+import { loadState } from './identity.js';
+import { enroll, isRelayRunning, relayStatus, startRelay } from './relay.js';
 import { sampleLabel, sampleReceipt } from './samples.js';
 import { printerStatuses } from './status.js';
 import { render } from './render/index.js';
@@ -138,6 +139,33 @@ function isAuthorized(req: IncomingMessage): boolean {
   return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
+/**
+ * Is this request coming from the machine the bridge runs on?
+ *
+ * The gate on `POST /enroll`, and the only thing standing between a venue's printers and anyone
+ * else on its wifi. Two facts make it load-bearing rather than defensive: `isAuthorized()` above
+ * returns TRUE when no token is configured — the default, and what both installers ship — and the
+ * Windows installer binds `0.0.0.0` so other tills can reach the bridge. Without this check, a
+ * guest on the café wifi could POST a pairing code from their own Hankha organisation and
+ * silently take ownership of the shop's bridge, receiving every subsequent bill and kitchen
+ * ticket.
+ *
+ * Physical access to the till is the trust boundary here, exactly as it is for the `--enroll`
+ * CLI, which asks for no credential either.
+ *
+ * The whole 127/8 block counts, not just 127.0.0.1: macOS and Linux both route it entirely to
+ * the loopback interface, and a request that arrives on lo cannot have crossed the network.
+ * IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is how a dual-stack listener reports an IPv4 client, so
+ * it is the form this actually sees on a default Windows install.
+ */
+function isLoopbackRequest(req: IncomingMessage): boolean {
+  const remote = req.socket.remoteAddress?.trim().toLowerCase();
+  if (!remote) return false;
+  if (remote === '::1') return true;
+  const v4 = remote.startsWith('::ffff:') ? remote.slice('::ffff:'.length) : remote;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const data = JSON.stringify(body);
   res.writeHead(status, {
@@ -200,6 +228,80 @@ export function isTlsEnabled(): boolean {
  * instead of opening a socket immediately. That serialises two tills printing to one printer,
  * which is a fix, not a regression — concurrent writes to one device shred both tickets.
  */
+/**
+ * The shape a pairing code arrives in: `XXXX-XXXX` over the alphabet the API mints them from,
+ * which drops O/0/I/1 because the code gets read off a tablet and retyped here.
+ *
+ * Checked locally so an obvious typo is answered instantly and in the operator's own words,
+ * rather than after a round trip that comes back as the API's deliberately vague "not valid,
+ * already used, or expired" — wording that exists so the endpoint is not an oracle, and which is
+ * unhelpful when the real problem is a transposed character.
+ */
+const ENROLL_CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}$/;
+
+/**
+ * Pair this bridge with a venue, from the browser on the machine it runs on.
+ *
+ * The reason this exists rather than leaving it to `--enroll`: the command the POS used to print
+ * cannot be run as shown. Neither installer puts `hankha-print-bridge` on PATH — on Windows it
+ * lives under `%ProgramFiles%\Hankha\Print Bridge\`, and the macOS .dmg keeps it inside the app
+ * bundle — so an operator following the instructions to the letter got `command not found`.
+ * Worse on the .pkg, where the daemon runs as root: a bare `--enroll` writes the token into the
+ * user's own Application Support directory (`identity.ts`), reports success, and never connects.
+ *
+ * Opening the address the installer already printed and pasting the code has none of those
+ * failure modes, and needs no terminal at all.
+ */
+async function handleEnroll(res: ServerResponse, record: Record<string, unknown>): Promise<void> {
+  const raw = typeof record.code === 'string' ? record.code : '';
+  // Operators paste from a tablet: leading spaces, lowercase, and a missing hyphen are all
+  // routine and none of them are the operator being wrong.
+  const code = raw.trim().toUpperCase().replace(/\s+/g, '');
+  const normalized = /^[A-Z0-9]{8}$/.test(code) ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+
+  if (!ENROLL_CODE_RE.test(normalized)) {
+    sendJson(res, 400, { ok: false, reason: 'invalid-code-format' });
+    return;
+  }
+
+  // A second enrolment moves this machine's printers to whichever organisation supplied the
+  // code, so it is never the incidental outcome of a pasted string. `force` makes re-pairing
+  // possible without making it accidental.
+  //
+  // Read from disk rather than from `relayStatus()`: that reports on the LOOP, which is false
+  // whenever the relay has not started — including on a bridge that is paired but whose relay
+  // never came up. Treating that as unpaired would let a stray code quietly move a venue's
+  // bridge in precisely the situation where nobody is watching it work.
+  if (loadState().token && record.force !== true) {
+    sendJson(res, 409, { ok: false, reason: 'already-enrolled' });
+    return;
+  }
+
+  try {
+    const { bridge_id } = await enroll(normalized);
+
+    // Connect NOW. `--enroll` tells the operator to restart the service, which is fine for a
+    // command line and useless here: the POS is sitting on "Waiting for the bridge to connect…"
+    // and would wait forever. `startRelay` is guarded against a double start, so the only case
+    // it declines is a forced re-pair over a live loop — which keeps the OLD token in its
+    // closure, and is the one time a restart genuinely is required. Say so instead of implying
+    // success.
+    const wasRunning = isRelayRunning();
+    if (!wasRunning) startRelay();
+
+    log.info(`enrolled as bridge ${bridge_id} from the local page`, {
+      event: 'relay.enrolled', bridge_id, source: 'page',
+    });
+    sendJson(res, 200, { ok: true, bridge_id, restart_required: wasRunning });
+  } catch (err) {
+    // The API answers every enrolment failure identically on purpose. Pass its sentence straight
+    // through rather than inventing a more specific one this side cannot actually justify.
+    const message = err instanceof Error ? err.message : 'Enrollment failed.';
+    log.warn(`enrolment from the local page failed: ${message}`, { event: 'relay.enroll_failed' });
+    sendJson(res, 502, { ok: false, reason: 'enroll-failed', message });
+  }
+}
+
 async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<void> {
   const raw = (body ?? {}) as Record<string, unknown>;
   if (!isDialableTarget(raw.ip) || !isValidPort(raw.port) || typeof raw.payload_base64 !== 'string') {
@@ -438,7 +540,15 @@ export function createBridgeServer(): Server {
     // browser saw a bare JSON 401 instead of the sentence telling them it wants a token.
     const isPageRequest =
       (method === 'GET' || method === 'HEAD') && (path === '/' || path === '/index.html');
-    const openToAnyone = path === '/health' || isPageRequest;
+    // `/enroll` skips the token gate because it is the route that EXISTS to obtain a credential:
+    // a bridge being paired for the first time has none, and the person pasting the code is
+    // standing at the machine. Loopback is its gate instead, checked first and unconditionally
+    // so no later edit to the POST block below can widen it by accident.
+    const openToAnyone = path === '/health' || path === '/enroll' || isPageRequest;
+    if (path === '/enroll' && method !== 'OPTIONS' && !isLoopbackRequest(req)) {
+      sendJson(res, 403, { ok: false, reason: 'not-loopback' });
+      return;
+    }
     if (!openToAnyone && method !== 'OPTIONS' && !isAuthorized(req)) {
       sendJson(res, 401, { ok: false, reason: 'unauthorized' });
       return;
@@ -559,6 +669,11 @@ export function createBridgeServer(): Server {
       }
       const value = body.value;
       const record = (value ?? {}) as Record<string, unknown>;
+
+      if (method === 'POST' && path === '/enroll') {
+        await handleEnroll(res, record);
+        return;
+      }
 
       if (method === 'POST' && path === '/probe') {
         const port = record.port ?? DEFAULT_PRINTER_PORT;
