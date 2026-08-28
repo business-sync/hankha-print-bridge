@@ -492,11 +492,27 @@ already be on the paper, and there is no way left to ask.
 
 The bridge dials **out** to the cloud API, so a phone or a till on mobile data can print through it
 without reaching the shop LAN. No inbound port, no certificate on the shop PC, nothing to configure
-on the router. Enroll once with a code from **Settings → Printing**:
+on the router. Pair once with a code from **Settings → Printing**.
+
+**On the machine itself, open <http://localhost:9200> and paste the code into the Cloud relay
+card.** That is the path to hand an operator: it needs no terminal, and it cannot hit the two
+failure modes the command line has. Neither installer puts `hankha-print-bridge` on PATH — on
+Windows it lives under `%ProgramFiles%\Hankha\Print Bridge\` and the macOS .dmg keeps it inside
+the app bundle — and on the macOS .pkg, where the daemon runs as root, a bare `--enroll` writes
+the token into the operator's own `~/Library/Application Support/…`, reports success, and never
+connects.
+
+For scripted rollouts the command still works, with the full path and, on the .pkg, `sudo`:
 
 ```bash
-hankha-print-bridge --enroll ABCD-2345
+sudo /usr/local/hankha/print-bridge/hankha-print-bridge --enroll ABCD-2345
 ```
+
+`POST /enroll` answers **only on loopback** (`403 not-loopback` otherwise). The Windows installer
+binds `0.0.0.0` and `PRINT_BRIDGE_TOKEN` is empty by default, so that gate is what stops anyone on
+the venue wifi pairing the shop's bridge to their own organisation. A bridge that is already paired
+answers `409 already-enrolled`; `{"code":…,"force":true}` re-pairs and reports `restart_required`,
+because a running relay loop holds the previous token.
 
 `PRINT_BRIDGE_RELAY_TRANSPORT` picks the channel. `auto` tries a WebSocket at
 `/api/v1/modules/print/bridge/socket` and falls back to the long-poll on
