@@ -55,6 +55,42 @@ function relayUrl(state: RelayState): string {
   return (configured || DEFAULT_RELAY_URL).replace(/\/+$/, '');
 }
 
+/**
+ * How many registry entries are reported upstream.
+ *
+ * A venue has a handful of printers; the cap exists so a corrupted `printers.json` cannot turn
+ * every 30-second heartbeat into a large POST.
+ */
+const MAX_REPORTED_PRINTERS = 64;
+
+/**
+ * This bridge's own configured printers, for the cloud to offer as print targets.
+ *
+ * Without this a remote till can only choose from `/scan` hits, which are by definition network
+ * printers — so a USB or Bluetooth printer attached to THIS machine was unreachable from a
+ * tablet unless an operator invented a fake private IP for it and typed the same fake address
+ * into the POS. Reporting the registry is what lets the server address a printer by its id.
+ *
+ * Deliberately a summary, not the whole record: baud rates, codepages and label dimensions are
+ * this machine's business and change nothing about which printer a remote operator wants.
+ */
+function describeRegistry() {
+  // `loadRegistry` is documented never to throw — a broken file yields an empty registry — so a
+  // heartbeat is never lost to a malformed `printers.json`.
+  return loadRegistry()
+    .printers.slice(0, MAX_REPORTED_PRINTERS)
+    .map((p) => ({
+      id: p.id,
+      name: p.name,
+      transport: p.transport,
+      type: p.type,
+      enabled: p.enabled,
+      // Present for network printers, and for the address-alias workaround this replaces.
+      address: p.address ?? null,
+      port: p.port ?? null,
+    }));
+}
+
 function describeSelf() {
   const interfaces = localInterfaces();
   return {
@@ -64,6 +100,9 @@ function describeSelf() {
     arch: arch(),
     interfaces,
     net_warning: containerSuspect(interfaces) ? ('container-suspect' as const) : null,
+    // Additive: a server that does not know this field strips it, so an older API keeps
+    // working unchanged against a newer bridge.
+    registry_printers: describeRegistry(),
   };
 }
 
