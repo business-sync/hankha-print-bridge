@@ -706,3 +706,84 @@ describe('POST /enroll', () => {
     assert.match(json.message, /HTTP 502/);
   });
 });
+
+/*
+ * Reaching a USB or serial printer from the synchronous route.
+ *
+ * `/print` used to require `ip` + `port`, which a printer wired to this machine simply does not
+ * have — so the POS could list such a printer from the registry and had no way to send it a
+ * bill. `prepare()` has resolved `printer_id` since the queue landed; these cover the route
+ * finally offering the field, and the address form staying exactly as every deployed terminal
+ * speaks it.
+ *
+ * Last in the file on purpose: it rewrites the registry, and `GET /status` above counts it.
+ */
+describe('POST /print by printer id', () => {
+  it('resolves the id and forwards the bytes, with no address on the wire', async (t) => {
+    const lan = localInterfaces()[0];
+    if (!lan) return t.skip('no private LAN interface on this machine');
+
+    const received: Buffer[] = [];
+    const fake = createTcpServer((socket) => {
+      socket.on('data', (chunk) => received.push(chunk));
+    });
+    const port = await new Promise<number>((resolve) => {
+      fake.listen(0, '0.0.0.0', () => {
+        const address = fake.address();
+        if (typeof address === 'string' || address === null) throw new Error('no port');
+        resolve(address.port);
+      });
+    });
+
+    try {
+      const registered = await put('/printers', {
+        printers: [
+          { id: 'till', name: 'Till', transport: 'network', address: lan.address, port },
+          { id: 'retired', name: 'Retired', transport: 'network', address: '192.168.255.251', enabled: false },
+        ],
+      });
+      assert.equal(registered.status, 200);
+
+      const { status, json } = await post('/print', {
+        printer_id: 'till',
+        payload_base64: Buffer.from('\x1b@BILL\n').toString('base64'),
+      });
+      assert.equal(status, 200);
+      assert.equal(json.ok, true);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(Buffer.concat(received).toString(), '\x1b@BILL\n');
+    } finally {
+      fake.close();
+    }
+  });
+
+  it('names the printer it could not find', async () => {
+    const { status, json } = await post('/print', { printer_id: 'ghost', payload_base64: 'AA==' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'unknown-printer');
+    // `unknown-printer` alone cannot be acted on; which id failed is the whole message.
+    assert.match(json.errors[0], /ghost/);
+  });
+
+  /* Disabled means deliberately out of service, not missing. Printing to it anyway would make
+     the toggle in the console a lie. */
+  it('refuses a printer the operator has turned off', async () => {
+    const { status, json } = await post('/print', { printer_id: 'retired', payload_base64: 'AA==' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'unknown-printer');
+    assert.match(json.errors[0], /disabled/);
+  });
+
+  it('still refuses a request that names neither a printer nor an address', async () => {
+    const { status, json } = await post('/print', { payload_base64: 'AA==' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-body');
+  });
+
+  /* The contract every deployed terminal speaks. An id must not have become mandatory. */
+  it('leaves the address form exactly as it was', async () => {
+    const { status } = await post('/print', { ip: '8.8.8.8', port: 9100, payload_base64: 'AA==' });
+    assert.equal(status, 400);
+  });
+})

@@ -356,9 +356,26 @@ export function runScan(port: number): Promise<ScanResult> {
  * "on a different network" when it is sitting right there. A UI that lies is worse than one
  * that admits it cannot see.
  */
+const DOCKER_BRIDGE_PREFIXES = ['172.17.', '172.18.', '172.19.', '172.20.'];
+
+/*
+ * The structural half of the test, and the one that generalises.
+ *
+ * A real LAN interface carries a subnet — /24 in a shop, /16 at the widest. A /32 says "this
+ * address routes nowhere but itself", which is what a container veth and a Kubernetes pod IP
+ * both look like. Matching on the shape rather than on another list of prefixes is what makes
+ * this cover K3s (10.42/16 pods), a non-default Docker network, and whatever CNI comes next —
+ * the prefix allowlist below missed all three, and the pod the status page was screenshotted
+ * from sat on 10.42.4.121/32 reporting itself as a perfectly ordinary LAN host.
+ */
+function isPointToPoint(cidr: string): boolean {
+  const prefix = Number(cidr.split('/')[1]);
+  return prefix === 32 || prefix === 31;
+}
+
 export function containerSuspect(interfaces: LocalInterface[]): boolean {
   if (interfaces.length === 0) return true;
-  return interfaces.every((i) =>
-    ['172.17.', '172.18.', '172.19.', '172.20.'].some((p) => i.address.startsWith(p))
+  return interfaces.every(
+    (i) => isPointToPoint(i.cidr) || DOCKER_BRIDGE_PREFIXES.some((p) => i.address.startsWith(p))
   );
 }

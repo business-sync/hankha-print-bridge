@@ -129,4 +129,23 @@ describe('containerSuspect', () => {
       false
     );
   });
+
+  /*
+   * The prefix list alone answered `false` here, which is how a production pod spent its life
+   * offering its own cluster-internal address as somewhere to point a till. A /32 is the
+   * giveaway: it is an address that routes to nothing but itself.
+   */
+  it('flags a Kubernetes pod, whose address is outside every Docker bridge range', () => {
+    assert.equal(containerSuspect([{ address: '10.42.4.121', cidr: '10.42.4.121/32' }]), true);
+  });
+
+  it('flags a /31 point-to-point interface', () => {
+    assert.equal(containerSuspect([{ address: '10.88.0.7', cidr: '10.88.0.7/31' }]), true);
+  });
+
+  // The shape test must not swallow the real case it sits next to: a shop LAN in the same
+  // 10/8 space is an ordinary network, and only the mask tells the two apart.
+  it('does not flag a shop LAN that happens to use 10.x', () => {
+    assert.equal(containerSuspect([{ address: '10.0.1.24', cidr: '10.0.1.24/24' }]), false);
+  });
 });
