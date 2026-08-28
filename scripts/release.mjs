@@ -295,7 +295,12 @@ if (opts.dryRun) {
   step('Dry run — nothing was pushed');
   console.log(`   would tag  ${TAG} at ${commit}${tagLocal ? ' (exists)' : ''}`);
   console.log(`   would push ${opts.remote} ${TAG}`);
-  console.log(`   would run  gh ${ghArgs.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join(' ')}`);
+  // Printed relative: the five absolute asset paths make this line unreadable, and the only
+  // question a reader has of it is which flags and which files.
+  const shown = ghArgs
+    .map((a) => a.replace(`${OUT_DIR}/`, 'dist-installers/'))
+    .map((a) => (a.includes(' ') ? JSON.stringify(a) : a));
+  console.log(`   would run  gh ${shown.join(' ')}`);
   if (notesBody) console.log(`   notes assembled at dist-installers/RELEASE_NOTES.md`);
   process.exit(0);
 }

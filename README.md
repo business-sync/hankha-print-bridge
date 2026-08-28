@@ -188,6 +188,48 @@ in `.env`, which is gitignored, and never in `.env.example`:
 The macOS binary is always **ad-hoc** signed regardless: Apple silicon refuses to launch an
 unsigned binary at all, and the failure — `Killed: 9` at exec — never reaches the installer log.
 
+## Cutting a release
+
+```bash
+bun run release              # preflight, test, build, tag, publish
+bun run release --dry-run    # every check and the full build, but pushes nothing
+```
+
+Installers are distributed as **GitHub Releases** — no CI job builds them, so this runs from a
+Mac with Docker running (see above for why `setup.exe` needs it).
+
+1. Bump `APP_VERSION` in **both** `.env` and `.env.example`.
+2. Write `release-notes/v<version>.md` — prose only. The script appends the "Verify your
+   download" section from the checksums of the artifacts it just built, so the hashes in the
+   notes can never describe the build before last.
+3. Commit both, push, then `bun run release`.
+
+The version is never passed as an argument; it comes from `APP_VERSION`, so the tag, the
+filenames and the number the binary reports to the POS cannot disagree.
+
+Before anything is pushed it refuses to continue if: `gh` is not authenticated, `package.json`
+has drifted from `APP_VERSION`, the tree is dirty, HEAD is not `main` in step with `origin`, a
+release already exists for the tag, the notes file is missing, or the typecheck or tests fail.
+After building it verifies **all four** artifacts are present and that `SHA256SUMS.txt` matches
+their actual bytes and lists nothing else — `package.mjs` exits 0 having shipped only the `.zip`
+when NSIS is unusable, and that is exactly the kind of half-release nobody notices.
+
+| Flag | |
+|---|---|
+| `--dry-run` | build and assemble, stop before `git push` / `gh release create` |
+| `--draft` | publish as a draft |
+| `--skip-tests` | skip typecheck + tests |
+| `--skip-build` | reuse `dist-installers/` as-is — still fully verified, so a stale build is caught |
+| `--generate-notes` | let GitHub list the commits instead of requiring a notes file |
+| `--notes <path>` | use a specific notes file |
+
+If publishing fails after the tag is pushed, fix the cause and re-run — it reuses the tag rather
+than demanding a version bump.
+
+Do **not** run `bun install` here. `bun.lock` is lockfileVersion 2; an older bun cannot parse it,
+warns, ignores it, and regenerates a downgraded lockfile that then breaks the Docker build's
+`--frozen-lockfile`.
+
 ## Development
 
 ```bash
