@@ -129,6 +129,17 @@ function parsePrinter(value: unknown, index: number, errors: string[]): PrinterR
     errors.push(`${where}: type must be 'receipt' or 'label'`);
   }
 
+  /*
+   * A boolean that is not a boolean is nearly always a stringified one, from a shell script or
+   * a management UI that serialised its form. Reading it as `raw.enabled === true` turns the
+   * string "true" into `false` — so the PUT answers 200, the printer is silently disabled, and
+   * every job afterwards fails with "printer is disabled" while the config on screen says the
+   * opposite. `type` above already refuses a value it does not recognise; this does the same.
+   */
+  if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') {
+    errors.push(`${where}: enabled must be true or false`);
+  }
+
   // `auto` is accepted and means escpos. Nothing probes the printer to find out: an
   // identification query sent to the wrong language prints a page of garbage, so guessing is
   // opt-in through /printers/:id/identify and never a side effect of loading a config file.

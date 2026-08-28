@@ -300,14 +300,34 @@ async function handleEnroll(res: ServerResponse, record: Record<string, unknown>
 
 async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<void> {
   const raw = (body ?? {}) as Record<string, unknown>;
-  if (!isDialableTarget(raw.ip) || !isValidPort(raw.port) || typeof raw.payload_base64 !== 'string') {
+  if (typeof raw.payload_base64 !== 'string') {
     sendJson(res, 400, { ok: false, reason: 'invalid-body' });
     return;
   }
 
-  const prepared = prepare({ target: { ip: raw.ip, port: raw.port }, payload_base64: raw.payload_base64 });
+  /*
+   * `printer_id` names a printer in the registry instead of a socket, and is the ONLY way this
+   * synchronous route can reach a USB or serial printer — one wired to this machine has no
+   * address to dial, so the `ip`/`port` form cannot express it at all. `prepare()` has resolved
+   * ids since the queue landed; the route simply never offered the field, which left the POS
+   * able to SEE such a printer in the registry and unable to print to it.
+   *
+   * The address form below is untouched: it is what every terminal in the field speaks, and a
+   * client that sends both gets the id, matching `prepare()`'s own resolution order.
+   */
+  const printerId = typeof raw.printer_id === 'string' ? raw.printer_id.trim() : '';
+  if (!printerId && (!isDialableTarget(raw.ip) || !isValidPort(raw.port))) {
+    sendJson(res, 400, { ok: false, reason: 'invalid-body' });
+    return;
+  }
+
+  const prepared = prepare(
+    printerId
+      ? { printer_id: printerId, payload_base64: raw.payload_base64 }
+      : { target: { ip: raw.ip as string, port: raw.port as number }, payload_base64: raw.payload_base64 }
+  );
   if (!prepared.ok) {
-    sendJson(res, prepared.status === 413 ? 413 : 400, { ok: false, reason: prepared.reason });
+    sendJson(res, prepared.status === 413 ? 413 : 400, { ok: false, reason: prepared.reason, errors: prepared.errors });
     return;
   }
 
