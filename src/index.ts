@@ -1,5 +1,6 @@
 import { localInterfaces } from './lan.js';
 import { discoverAll } from './discovery.js';
+import { ENROLL_CODE_HINT, isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { log } from './log.js';
 import { enroll, startRelay } from './relay.js';
 import { queue } from './queue.js';
@@ -88,9 +89,18 @@ const enrollAt = args.indexOf('--enroll');
 const testPrintAt = args.indexOf('--test-print');
 
 if (enrollAt !== -1) {
-  const code = args[enrollAt + 1];
-  if (!code || code.startsWith('-')) {
+  const given = args[enrollAt + 1];
+  if (!given || given.startsWith('-')) {
     console.error('--enroll needs a code, e.g. `hankha-print-bridge --enroll ABCD-2345`');
+    process.exit(2);
+  }
+  // Folded and checked before it is sent, exactly as the pairing page does. Argv used to go
+  // upstream verbatim, so a pasted lowercase code was hashed to something the API had never
+  // minted and came back as "not valid" — the same sentence a genuinely wrong code gets, and
+  // the reason a correct code could look like the wrong one.
+  const code = normalizeEnrollCode(given);
+  if (!isValidEnrollCode(code)) {
+    console.error(ENROLL_CODE_HINT);
     process.exit(2);
   }
   enroll(code)

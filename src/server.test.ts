@@ -4,7 +4,7 @@ import { createServer as createHttpServer, type Server } from 'node:http';
 import { createServer as createTcpServer, type Server as TcpServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, describe, it } from 'node:test';
+import { after, before, beforeEach, describe, it } from 'node:test';
 import { localInterfaces } from './lan.js';
 import { resetRegistryCache } from './registry.js';
 import { INDEX_HTML } from './page.js';
@@ -559,14 +559,33 @@ describe('POST /enroll', () => {
   let apiCalls = 0;
   let previousRelayUrl: string | undefined;
 
+  /**
+   * What the fake API answers next. Mutable because the interesting cases are the ones the
+   * bridge used to throw away: a 500 and a named 409 are the same `HTTP <status>` sentence
+   * until something reads the body.
+   */
+  let apiReply = {
+    status: 404,
+    body: { detail: 'That enrollment code is not valid', code: 'not_found' } as unknown,
+    headers: {} as Record<string, string>,
+  };
+
   before(async () => {
     previousRelayUrl = process.env.PRINT_BRIDGE_RELAY_URL;
     api = createHttpServer((_req, res) => {
       apiCalls += 1;
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { code: 'not_found' } }));
+      res.writeHead(apiReply.status, { 'Content-Type': 'application/json', ...apiReply.headers });
+      res.end(JSON.stringify(apiReply.body));
     });
     process.env.PRINT_BRIDGE_RELAY_URL = `http://127.0.0.1:${await listen(api)}`;
+  });
+
+  beforeEach(() => {
+    apiReply = {
+      status: 404,
+      body: { detail: 'That enrollment code is not valid', code: 'not_found' },
+      headers: {},
+    };
   });
 
   after(() => {
@@ -636,5 +655,54 @@ describe('POST /enroll', () => {
     } finally {
       open.close();
     }
+  });
+
+  /*
+   * What the API said, not just that it said no.
+   *
+   * `Enrollment failed: HTTP 500` with the body dropped is what shipped, and it cost a day of
+   * debugging: the 500 had ONE recoverable cause — this computer already holds a bridge row in
+   * the venue — and neither the CLI nor this page ever read the sentence that said so.
+   */
+  it('surfaces a named conflict instead of a bare status', async () => {
+    apiReply = {
+      status: 409,
+      body: {
+        detail: 'This computer is already paired with this venue as “Counter”.',
+        code: 'print_bridge_already_paired',
+      },
+      headers: {},
+    };
+
+    const { status, json } = await post('/enroll', { code: '6XZR-TTWF' });
+    assert.equal(status, 502);
+    assert.match(json.message, /already paired/);
+    assert.match(json.message, /Counter/);
+    assert.match(json.message, /print_bridge_already_paired/);
+  });
+
+  it('prints the request id, the only thread back to the cause of a 5xx', async () => {
+    // The API hides its own message on 5xx on purpose, so `detail` is the generic string and
+    // the id is the only way to find the log line that has the real error.
+    apiReply = {
+      status: 500,
+      body: { detail: 'Internal server error', code: 'internal_error' },
+      headers: { 'X-Request-Id': 'req-abc123' },
+    };
+
+    const { json } = await post('/enroll', { code: '6XZR-TTWF' });
+    assert.match(json.message, /ref req-abc123/);
+    // 'internal_error' adds nothing an operator can act on — the id does.
+    assert.doesNotMatch(json.message, /internal_error/);
+  });
+
+  it('still says something useful when the body is not JSON at all', async () => {
+    // A gateway or CDN answering instead of the API sends HTML. Reading the body must not turn
+    // a failed enrolment into a crash.
+    apiReply = { status: 502, body: '<html>gateway</html>', headers: {} };
+
+    const { status, json } = await post('/enroll', { code: '6XZR-TTWF' });
+    assert.equal(status, 502);
+    assert.match(json.message, /HTTP 502/);
   });
 });
