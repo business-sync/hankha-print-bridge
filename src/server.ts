@@ -14,6 +14,7 @@ import {
 import { discoverAll, transportAvailability } from './discovery.js';
 import { prepare, targetFrom, type JobRequest } from './jobs.js';
 import { log } from './log.js';
+import { INDEX_CSP, INDEX_HTML } from './page.js';
 import { describeJob, queue } from './queue.js';
 import { findPrinter, loadRegistry, parseRegistry, saveRegistry } from './registry.js';
 import { relayStatus } from './relay.js';
@@ -142,6 +143,25 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(data),
+  });
+  res.end(data);
+}
+
+/**
+ * The only route that answers with anything but JSON.
+ *
+ * `no-store` rather than an ETag: the page is a few tens of kilobytes over loopback, and the one
+ * situation where caching would bite is the one that matters — an operator reloading after an
+ * upgrade and being shown the previous build's page while support asks them what it says.
+ */
+function sendHtml(res: ServerResponse, html: string): void {
+  const data = Buffer.from(html, 'utf8');
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': data.length,
+    'Content-Security-Policy': INDEX_CSP,
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'no-store',
   });
   res.end(data);
 }
@@ -379,17 +399,47 @@ export function createBridgeServer(): Server {
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     withCors(res);
 
-    const url = new URL(req.url ?? '/', 'http://bridge.local');
-    // A trailing slash must not change the route: half the clients in this fleet build URLs by
-    // concatenation and the other half do not.
-    const path = url.pathname.replace(/\/+$/, '') || '/';
+    /*
+     * `req.url` is a request target — always a path — but `new URL(target, base)` does not know
+     * that and resolves it as a reference against the base. So `//print` parses as the HOST
+     * `print` with the path `/`, and a bare `//` is not a valid URL at all and THROWS. Thrown
+     * synchronously from a request listener that is an uncaughtException, which stops the
+     * process: one unauthenticated `GET //` from anywhere on the venue LAN took the bridge down,
+     * because this runs before the token check.
+     *
+     * Not hypothetical either. The POS terminal builds bridge URLs by concatenation, and its own
+     * `normalizeBase` exists because a stored `http://host:9200/` was producing `…9200//print`.
+     *
+     * Interpolating the target after the authority is what pins it to the path: `new URL` has
+     * already consumed the host by the time it reads a slash. The try/catch still stands, because
+     * a proxy may send an absolute-form target and nothing here should die on a malformed one.
+     */
+    const target = req.url ?? '/';
+    let url: URL;
+    try {
+      url = new URL(`http://bridge.local${target.startsWith('/') ? '' : '/'}${target}`);
+    } catch {
+      sendJson(res, 400, { ok: false, reason: 'invalid-request-target' });
+      return;
+    }
+    // Neither a repeated slash nor a trailing one may change the route: half the clients in this
+    // fleet build URLs by concatenation and the other half do not.
+    const path = url.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/';
     const segments = path.split('/').filter(Boolean);
     const method = req.method ?? 'GET';
 
     // `/health` stays open even when a token is set: the POS uses it to tell "the bridge is
     // down" from "the bridge is up but this terminal has the wrong token", and it discloses
     // nothing an attacker on the same LAN could not learn by scanning.
-    if (path !== '/health' && method !== 'OPTIONS' && !isAuthorized(req)) {
+    //
+    // The root page is open for the same reason, one step further along: it is static markup with
+    // no venue data in it, and every value it displays comes from the routes below that ARE
+    // guarded. Guarding the page itself would only mean an operator who opened the bridge in a
+    // browser saw a bare JSON 401 instead of the sentence telling them it wants a token.
+    const isPageRequest =
+      (method === 'GET' || method === 'HEAD') && (path === '/' || path === '/index.html');
+    const openToAnyone = path === '/health' || isPageRequest;
+    if (!openToAnyone && method !== 'OPTIONS' && !isAuthorized(req)) {
       sendJson(res, 401, { ok: false, reason: 'unauthorized' });
       return;
     }
@@ -397,6 +447,16 @@ export function createBridgeServer(): Server {
     if (method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // Typing the address the installer printed is the most likely thing anyone ever does with
+    // this process. Answering that with `{"ok":false,"reason":"not-found"}` reads as "the thing I
+    // just installed is broken".
+    // HEAD as well as GET: `curl -I` and every uptime monitor ever pointed at a service aim at
+    // its root. Node suppresses the body on a HEAD itself, so the headers stay honest.
+    if (isPageRequest) {
+      sendHtml(res, INDEX_HTML);
       return;
     }
 

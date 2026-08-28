@@ -125,6 +125,19 @@ Log: `C:\ProgramData\Hankha\PrintBridge\logs\bridge.log`
 Open the POS on the same computer → **Settings → Printing**. The Print Bridge card should read
 *"Print Bridge is running"* and name this machine. Then press **Search** to find printers.
 
+### The status page
+
+Open <http://localhost:9200> in a browser. Once installed the bridge is a launchd daemon or a
+scheduled task with no window, and this is the only place to see it without the POS: which machine
+is answering, which printers are online and how far away, the queue, the recent jobs with the
+reason each one failed, and the addresses another terminal could be pointed at. It is served
+without a token even when one is configured — it is static markup, and every value on it is
+fetched afterwards from the routes that are guarded, so a bridge that wants a token says so in a
+sentence instead of a bare `401`.
+
+It is not a configuration screen. `printers.json` stays the source of truth; the one thing the
+page can do to a printer is send it the same test slip `--test-print` sends.
+
 ## Configuration
 
 Everything is read from the environment. `.env` supplies it during development and packaging:
@@ -433,6 +446,8 @@ Everything below needs `Authorization: Bearer <PRINT_BRIDGE_TOKEN>` when a token
 
 ### Diagnostics
 
+- `GET /` → the status page above, as HTML. `/index.html` and `HEAD` answer the same. The only
+  route that is not JSON, and — with `/health` — the only one served without a token.
 - `GET /health` → `{ ok, service, version, interfaces, hostname, platform, arch, pid, uptime_s,
   net_warning, auth_required, relay, printers, queue }`. `ok` is first and never changes shape —
   older terminals read only that. Deliberately does **not** probe printers: this is the endpoint the
@@ -502,6 +517,9 @@ to print: a printer taking four seconds to answer used to stop the bridge fetchi
 those four seconds.
 
 ## Troubleshooting
+
+Start at <http://localhost:9200> on the machine running the bridge. Most of what follows is
+visible there, including which printers are refusing connections and why the last job failed.
 
 **"Print Bridge is not answering"** — almost always another program on port 9200. The log says
 so explicitly. Change it with `PRINT_BRIDGE_PORT` and set the matching address in the POS.

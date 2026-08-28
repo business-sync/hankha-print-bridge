@@ -64,6 +64,7 @@ Environment:
   PRINT_BRIDGE_MAX_ATTEMPTS     Retries per job, when nothing printed   (default 3)
 
 Endpoints:
+  GET  /         a status page for a browser: printers, queue, addresses, recent jobs
   GET  /health   liveness, identity, version and this machine's networks
   GET  /status   printers online/offline, queue depth, transports, relay
   POST /probe    { ip, port? }                  can the bridge reach this printer?
@@ -220,6 +221,12 @@ function runService(): void {
       // venue Wi-Fi, guest phones included, can drive the printers.
       log.warn('  WARNING: bound beyond loopback with no PRINT_BRIDGE_TOKEN set', { event: 'server.open_lan' });
     }
+    // The one line in this banner an operator can act on: everything else here is for whoever
+    // reads the log file afterwards, and this is where they find out there is a page at all.
+    log.info(`  open ${scheme}://localhost:${PORT} in a browser to see printers, queue and jobs`, {
+      event: 'server.page', url: `${scheme}://localhost:${PORT}`,
+    });
+
     if (HOST === '127.0.0.1' || HOST === 'localhost') {
       // Not a warning — this is the intended setup on a till, and saying so out loud stops
       // someone "fixing" it when another terminal can't connect.
