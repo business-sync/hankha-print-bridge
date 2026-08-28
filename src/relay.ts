@@ -30,6 +30,11 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
  * enough to be invisible.
  */
 const WS_UNSUPPORTED_RETRY_MS = 30 * 60_000;
+/**
+ * How much of the server's claim window to leave unused, so a terminal result can be reported
+ * and accepted before the claim lapses and the sweeper writes UNKNOWN over it.
+ */
+const RESULT_RESERVE_MS = 10_000;
 
 type Work =
   | {
@@ -207,8 +212,19 @@ async function handlePrint(base: string, token: string, work: Extract<Work, { ty
 
   // The server's claim is the job's real deadline. A bridge that comes back after an outage must
   // drop the backlog rather than print an hour-old receipt onto a till that has moved on.
+  //
+  // Stop RESERVE_MS short of it, though. Retrying right up to the claim meant the bridge gave up
+  // at the exact moment the server's sweeper did, so the sweeper always won and every job the
+  // bridge could not print was recorded as UNKNOWN — "paper may already have come out". For the
+  // commonest failure of all, a printer that is switched off, that is simply untrue: the bridge
+  // knows within milliseconds that nothing printed, and UNKNOWN is precisely the state that
+  // withholds the retry button. Giving up early leaves room for the truthful result to land
+  // first, and costs one retry of a printer that was not answering anyway.
   const claimMs = job.claim_expires_at ? Date.parse(job.claim_expires_at) - Date.now() : Number.NaN;
-  const ttl_s = Number.isFinite(claimMs) && claimMs > 0 ? Math.ceil(claimMs / 1000) : undefined;
+  const ttl_s =
+    Number.isFinite(claimMs) && claimMs > RESULT_RESERVE_MS
+      ? Math.max(1, Math.floor((claimMs - RESULT_RESERVE_MS) / 1000))
+      : undefined;
 
   const submission = queue().submit({
     job_id: job.job_id,
