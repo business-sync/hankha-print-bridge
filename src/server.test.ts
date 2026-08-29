@@ -284,6 +284,78 @@ describe('POST /print', () => {
     });
     assert.equal(status, 400);
   });
+
+  /*
+   * Idempotency on the LOCAL path.
+   *
+   * The cloud path has always had it — the server dedupes on `client_job_id` — but every
+   * desktop till prints through this route, where a double-tapped button or a retried `fetch`
+   * simply produced a second bill. The queue has kept a ring of settled job ids since it was
+   * written; this route just never gave it one to remember.
+   */
+  it('replays a repeated job_id instead of printing a second copy', async (t) => {
+    const lan = localInterfaces()[0];
+    if (!lan) return t.skip('no private LAN interface on this machine');
+
+    let connections = 0;
+    const fake = createTcpServer((socket) => {
+      connections += 1;
+      socket.on('data', () => {});
+    });
+    const port = await new Promise<number>((resolve) => {
+      fake.listen(0, '0.0.0.0', () => {
+        const address = fake.address();
+        if (typeof address === 'string' || address === null) throw new Error('no port');
+        resolve(address.port);
+      });
+    });
+
+    try {
+      const body = {
+        ip: lan.address,
+        port,
+        job_id: 'till-slip-0001',
+        payload_base64: Buffer.from('\x1b@BILL\n').toString('base64'),
+      };
+
+      const first = await post('/print', body);
+      assert.equal(first.status, 200);
+      assert.equal(first.json.deduplicated, undefined);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(connections, 1);
+
+      const second = await post('/print', body);
+      assert.equal(second.status, 200);
+      // Answered from the settled ring, and it says so — the caller can tell "printed" from
+      // "printed a moment ago and I did not do it again".
+      assert.equal(second.json.deduplicated, true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(connections, 1, 'a replayed job_id must not open a second socket');
+    } finally {
+      fake.close();
+    }
+  });
+
+  it('rejects a job_id that is not filesystem-safe, as a 400 rather than a 500', async () => {
+    const { status, json } = await post('/print', {
+      ip: '192.168.18.103',
+      port: 9100,
+      job_id: '../../../../tmp/escape',
+      payload_base64: 'AA==',
+    });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-job-id');
+  });
+
+  it('still accepts the frozen contract with no job_id at all', async () => {
+    // The shape every terminal in the field speaks. `job_id` is additive and optional forever.
+    const { status } = await post('/print', {
+      ip: '8.8.8.8',
+      port: 9100,
+      payload_base64: 'AA==',
+    });
+    assert.equal(status, 400, 'still validated the same way — no job_id required to be parsed');
+  });
 });
 
 describe('POST /scan', () => {

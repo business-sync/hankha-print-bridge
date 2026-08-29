@@ -1,6 +1,6 @@
 import { loadState, saveState, type RelayState } from './identity.js';
 import { containerSuspect, DEFAULT_PRINTER_PORT, localInterfaces, runScan } from './lan.js';
-import { adHocNetworkPrinter, targetFrom } from './jobs.js';
+import { adHocNetworkPrinter, renderJobDocument, targetFrom } from './jobs.js';
 import { log } from './log.js';
 import { queue, type JobResult } from './queue.js';
 import { findPrinter, loadRegistry, resolveByAddress } from './registry.js';
@@ -62,7 +62,17 @@ type Work =
         /** Null when `printer_id` addresses the job instead. */
         target_ip: string | null;
         target_port: number;
-        payload_base64: string;
+        /** Pre-rendered bytes. Absent when `document` carries the slip instead. */
+        payload_base64?: string;
+        /**
+         * A structured slip for THIS bridge to render, at the real paper width of the printer
+         * that will print it.
+         *
+         * The reason it exists: a tablet is paired to a station it cannot see and has no idea
+         * whether the roll is 58 mm or 80 mm, so rendering on the POS means guessing. The
+         * server only ever sends this to a bridge whose reported version can handle it.
+         */
+        document?: unknown;
         payload_sha256: string;
         attempt: number;
         claim_expires_at: string;
@@ -275,11 +285,41 @@ async function handlePrint(base: string, token: string, work: Extract<Work, { ty
       ? Math.max(1, Math.floor((claimMs - RESULT_RESERVE_MS) / 1000))
       : undefined;
 
+  // Bytes or a document — one of the two, resolved against the printer we just picked so a
+  // document is rendered for the head that will actually print it.
+  let payload: Buffer;
+  if (job.document !== undefined && job.document !== null) {
+    const rendered = renderJobDocument(job.document, printer);
+    if (!rendered.ok) {
+      // `printed_certainty: 'none'` is the whole point of reporting this properly: nothing was
+      // ever sent to the printer, so the POS may safely offer to print again once the document
+      // is fixed. Reporting it as a device fault would send someone to check a cable.
+      await postResult(base, token, job.job_id, {
+        ok: false,
+        reason: 'payload-rejected',
+        printed_certainty: 'none',
+        detail: rendered.errors.slice(0, 3).join('; '),
+      });
+      return;
+    }
+    payload = rendered.payload;
+  } else if (typeof job.payload_base64 === 'string') {
+    payload = Buffer.from(job.payload_base64, 'base64');
+  } else {
+    await postResult(base, token, job.job_id, {
+      ok: false,
+      reason: 'payload-rejected',
+      printed_certainty: 'none',
+      detail: 'the job carried neither payload_base64 nor document',
+    });
+    return;
+  }
+
   const submission = queue().submit({
     job_id: job.job_id,
     source: 'relay',
     printer,
-    payload: Buffer.from(job.payload_base64, 'base64'),
+    payload,
     ttl_s,
   });
 

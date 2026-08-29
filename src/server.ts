@@ -351,6 +351,26 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
     return;
   }
 
+  /*
+   * An optional idempotency handle, and the one thing this route was missing.
+   *
+   * The CLOUD path has been idempotent since it existed — the server dedupes on
+   * `client_job_id`, so a retried POST resolves to the same job. The local path, which is what
+   * every desktop till actually uses, had nothing: a double-tapped button or a `fetch` the
+   * browser retried was simply a second bill in the customer's hand.
+   *
+   * Almost none of the machinery is new. `queue().submit()` has kept a 500-entry ring of
+   * settled job ids since the queue landed, and answers a repeat from that ring by replaying
+   * the first outcome instead of printing — this route just never passed an id for it to
+   * remember. The id is validated here rather than at `submit()`, which throws on a bad one, so
+   * a client typo is a plain 400 instead of a 500.
+   */
+  const jobId = typeof raw.job_id === 'string' ? raw.job_id.trim() : '';
+  if (jobId && !isSafeJobId(jobId)) {
+    sendJson(res, 400, { ok: false, reason: 'invalid-job-id' });
+    return;
+  }
+
   const prepared = prepare(
     printerId
       ? { printer_id: printerId, payload_base64: raw.payload_base64 }
@@ -364,9 +384,29 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
   // Not persisted and never retried: this caller is holding a socket open and owns its own retry
   // policy. Spooling it would mean a job the client already gave up on printing later anyway.
   const submission = queue().submit({
+    ...(jobId ? { job_id: jobId } : {}),
     source: 'local', printer: prepared.printer, payload: prepared.payload,
     persistent: false, retryable: false,
   });
+
+  // A replay: this id has printed (or provably failed) before. Answer with the FIRST outcome and
+  // print nothing. Returning the recorded result rather than a fresh `{ok:true}` matters — a
+  // retry of a job that failed must still read as a failure.
+  if (submission.deduplicated && submission.job.result) {
+    const prior = submission.job.result;
+    if (prior.ok) {
+      sendJson(res, 200, { ok: true, deduplicated: true });
+    } else {
+      sendJson(res, 502, {
+        ok: false,
+        reason: prior.reason === 'connect-timeout' ? 'timeout' : prior.reason,
+        printed_certainty: prior.printed_certainty,
+        detail: prior.detail,
+        deduplicated: true,
+      });
+    }
+    return;
+  }
 
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<'timeout'>((resolve) => {
