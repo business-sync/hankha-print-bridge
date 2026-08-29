@@ -280,7 +280,23 @@ export class PrintQueue {
 
   private rememberSettled(job: JobRecord): void {
     if (!job.result) return;
+    // A job nobody named cannot be resubmitted under its id, so recording it would fill the
+    // ring with entries that can never match and evict the ones that can.
     if (!job.persistent && !job.keyed) return;
+    /*
+     * A synchronous job that PROVABLY did not print stays retryable.
+     *
+     * The ring exists to stop a resubmit becoming a second slip, and that reasoning only holds
+     * when paper might have come out. For `printed_certainty: 'none'` it provably did not —
+     * the socket never opened, or the spooler refused it outright. Remembering such an outcome
+     * would make the operator's Retry replay the old failure forever, so a printer switched
+     * back on ten seconds later could never be reached again under the same id. That is both a
+     * worse failure than the one the ring prevents and a far more common one.
+     *
+     * Persistent jobs keep the old blanket rule. The relay's own state machine owns their
+     * retries, and a redelivery must never reprint one behind its back.
+     */
+    if (!job.persistent && !job.result.ok && job.result.printed_certainty === 'none') return;
     this.settledResults.set(job.job_id, job.result);
     while (this.settledResults.size > SETTLED_RING) {
       const oldest = this.settledResults.keys().next().value;
