@@ -10,11 +10,13 @@ spec:
     matchLabels:
       app: hankha-print-bridge
   replicas: 1
+  # Recreate, not RollingUpdate. Two things forbid an overlap: the relay identity in `relay.json`
+  # is single-holder by construction (two pods sharing one `bridge_id` would race each other for
+  # the same claimed jobs), and the PVC below is ReadWriteOnce. `maxSurge: 25%` rounds UP to 1
+  # on a single replica, so the old strategy started the replacement BEFORE the old pod exited —
+  # which on a multi-node cluster deadlocks on the volume.
   strategy:
-    rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
-    type: RollingUpdate
+    type: Recreate
   template:
     metadata:
       labels:
@@ -33,8 +35,13 @@ spec:
           limits:
             cpu: 2000m
             memory: 2048Mi
+        # httpGet, not tcpSocket: the kernel completes a TCP handshake from the accept backlog
+        # even when the event loop is wedged, so the old probe could never detect the one failure
+        # a restart would fix. `/health` is deliberately unauthenticated, so this keeps working
+        # once PRINT_BRIDGE_TOKEN is set.
         livenessProbe:
-          tcpSocket:
+          httpGet:
+            path: /health
             port: 9200
           initialDelaySeconds: 5
           timeoutSeconds: 5
@@ -42,7 +49,8 @@ spec:
           failureThreshold: 3
           periodSeconds: 10
         readinessProbe:
-          tcpSocket:
+          httpGet:
+            path: /health
             port: 9200
           initialDelaySeconds: 5
           timeoutSeconds: 2
@@ -52,23 +60,28 @@ spec:
         envFrom:
         - configMapRef:
             name: hankha-print-bridge-config
-        # - secretRef:
-        #     name: sync-db-prod
-        # - secretRef:
-        #     name: s3-storage
+        # Carries PRINT_BRIDGE_TOKEN. Required, not optional: an empty token makes
+        # `isAuthorized()` true for everyone, and this pod is on NodePort 30021. A missing
+        # Secret holds the pod in CreateContainerConfigError, which is the correct failure —
+        # far better than a bridge that starts and accepts print jobs from anyone.
+        # See the comment in config.yaml for the command that creates it.
+        - secretRef:
+            name: hankha-print-bridge-secret
         ports:
         - containerPort: 9200
           name: http
         volumeMounts:
         - name: localtime
           mountPath: /etc/localtime
+        # Must match PRINT_BRIDGE_STATE_DIR in config.yaml.
+        - name: state
+          mountPath: /var/lib/hankha-print-bridge
 
       volumes:
       - name: localtime
         hostPath:
           path: /usr/share/zoneinfo/Asia/Bangkok
-      - name: vol-hankha-print-bridge
-        # nfs:
-        #   path: /mnt/gfs
-        #   server: gfs-01
+      - name: state
+        persistentVolumeClaim:
+          claimName: hankha-print-bridge-state
       restartPolicy: Always

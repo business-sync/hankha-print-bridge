@@ -5,6 +5,9 @@ metadata:
   namespace: hankha
 data:
   NODE_ENV: "production"
+  # ⚠ Nothing updates this automatically. CI rewrites the image tag in `deployment.yaml` and
+  # never touches this file, so a release that forgets it leaves the pod truthfully reporting a
+  # version it is not running — and the POS gates document rendering on exactly that string.
   APP_VERSION: 1.8.0
   PRINT_BRIDGE_PORT: '9200'
   PRINT_BRIDGE_HOST: "0.0.0.0"
@@ -19,7 +22,26 @@ data:
   # unqueryable. The desktop installs keep the human-readable default.
   PRINT_BRIDGE_LOG_FORMAT: "json"
   PRINT_BRIDGE_LOG_LEVEL: "info"
-  PRINT_BRIDGE_STATE_DIR: ""
-  PRINT_BRIDGE_TOKEN: ""
+  # An explicit path onto the PVC mounted at the same place in `deployment.yaml`.
+  #
+  # Empty here used to fall through to the container-local default, which is the same path with
+  # no volume behind it — so `relay.json` died with the pod. That file IS the bridge's identity
+  # (`install_id`, `bridge_id`, `token`), so every restart came back UNENROLLED and never
+  # reconnected until a human re-paired it; and because `install_id` was re-minted, re-enrolling
+  # created a SECOND bridge row rather than reusing the original.
+  PRINT_BRIDGE_STATE_DIR: "/var/lib/hankha-print-bridge"
   PRINT_BRIDGE_TLS_CERT: ""
   PRINT_BRIDGE_TLS_KEY: ""
+  # PRINT_BRIDGE_TOKEN is deliberately NOT here — it is a credential, and a ConfigMap is world
+  # readable to anything with namespace get. It comes from the `hankha-print-bridge-secret`
+  # Secret via `envFrom` in `deployment.yaml`.
+  #
+  # It is also not optional. `isAuthorized()` returns true unconditionally when the token is
+  # empty, and this pod binds 0.0.0.0 behind NodePort 30021 — so an empty value publishes
+  # `POST /print`, `POST /jobs`, `PUT /printers`, `/scan` and `/probe` to anything that can
+  # reach a node. Create it with:
+  #
+  #   kubectl -n hankha create secret generic hankha-print-bridge-secret \
+  #     --from-literal=PRINT_BRIDGE_TOKEN="$(openssl rand -base64 32)"
+  #
+  # Then enter the same value in the POS at Settings → Printing → Connection.
