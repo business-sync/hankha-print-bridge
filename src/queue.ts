@@ -62,6 +62,18 @@ export interface JobRecord {
   retryable: boolean;
   /** False keeps the job out of the spool directory entirely. */
   persistent: boolean;
+  /**
+   * The caller chose this job's id, so it is an idempotency key and its outcome is worth
+   * remembering.
+   *
+   * Distinct from `persistent`, which asks whether the PAYLOAD is spooled for retry after a
+   * crash. A synchronous `/print` is deliberately not spooled — the client holds a socket and
+   * owns its own retry policy — but if that client NAMED the job, a repeat of it must still
+   * replay rather than print a second bill. Conversely a job whose id we minted ourselves can
+   * never be resubmitted under it, so remembering one would fill the ring with entries that can
+   * never match and evict the ones that can.
+   */
+  keyed: boolean;
   result?: JobResult;
 }
 
@@ -267,7 +279,8 @@ export class PrintQueue {
   }
 
   private rememberSettled(job: JobRecord): void {
-    if (!job.persistent || !job.result) return;
+    if (!job.result) return;
+    if (!job.persistent && !job.keyed) return;
     this.settledResults.set(job.job_id, job.result);
     while (this.settledResults.size > SETTLED_RING) {
       const oldest = this.settledResults.keys().next().value;
@@ -358,6 +371,7 @@ export class PrintQueue {
         expires_at: null,
         retryable: false,
         persistent: false,
+        keyed: true,
         result: remembered,
       };
       return { job: replay, settled: Promise.resolve(replay), deduplicated: true };
@@ -379,6 +393,7 @@ export class PrintQueue {
       expires_at: input.ttl_s && input.ttl_s > 0 ? new Date(now + input.ttl_s * 1000).toISOString() : null,
       retryable: input.retryable ?? persistent,
       persistent,
+      keyed: Boolean(supplied),
     };
 
     this.active.set(jobId, job);
