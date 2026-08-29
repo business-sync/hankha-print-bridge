@@ -420,3 +420,123 @@ describe('cancellation', () => {
     await first.settled;
   });
 });
+
+
+describe('idempotency for the synchronous /print path', () => {
+  /*
+   * A synchronous job is not spooled — the client holds a socket open and owns its own retry
+   * policy — but if that client NAMED the job, a repeat of it must still replay rather than
+   * print a second bill. Before `keyed`, the settled ring skipped every non-persistent job, so
+   * `/print` could not dedupe at all no matter what id it was given.
+   */
+  const sync = (job_id?: string) => ({
+    source: 'local' as const,
+    printer: printer('counter'),
+    payload,
+    persistent: false,
+    retryable: false,
+    ...(job_id ? { job_id } : {}),
+  });
+
+  it('replays a keyed job that succeeded, without printing it again', async () => {
+    let sends = 0;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async () => {
+        sends += 1;
+        return ok();
+      },
+    });
+
+    await queue.submit(sync('slip-1')).settled;
+    assert.equal(sends, 1);
+
+    const again = queue.submit(sync('slip-1'));
+    assert.equal(again.deduplicated, true);
+    await again.settled;
+    assert.equal(sends, 1, 'a replayed keyed job must not reach the printer twice');
+  });
+
+  /*
+   * The counterpart, and the more consequential of the two. `printed_certainty: 'none'` means
+   * the socket never opened, so nothing printed and the operator's Retry has to be able to
+   * actually try. Remembering this outcome would replay the failure forever — a printer
+   * switched back on ten seconds later could never be reached again under that id.
+   */
+  it('lets a keyed job that provably did not print be retried for real', async () => {
+    let sends = 0;
+    let failing = true;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async () => {
+        sends += 1;
+        return failing ? refused() : ok();
+      },
+    });
+
+    await queue.submit(sync('slip-2')).settled;
+    const afterFailure = sends;
+
+    failing = false;
+    const retry = queue.submit(sync('slip-2'));
+    assert.equal(retry.deduplicated, false, 'a provably-failed sync job must stay retryable');
+    await retry.settled;
+    assert.ok(sends > afterFailure, 'the retry must actually reach the printer');
+  });
+
+  /*
+   * `unknown` is the case that costs money: we were connected when it went wrong, so paper may
+   * already have come out. This one must never be silently tried again.
+   */
+  it('remembers a keyed job whose outcome was ambiguous', async () => {
+    let sends = 0;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async () => {
+        sends += 1;
+        return stalled();
+      },
+    });
+
+    await queue.submit(sync('slip-3')).settled;
+    const after = sends;
+
+    const retry = queue.submit(sync('slip-3'));
+    assert.equal(retry.deduplicated, true, 'paper may have come out — replay, never reprint');
+    await retry.settled;
+    assert.equal(sends, after);
+  });
+
+  it('does not fill the ring with ids it minted itself', async () => {
+    const queue = new PrintQueue({ dir: scratch(), send: async () => ok() });
+    const first = queue.submit(sync());
+    await first.settled;
+    const second = queue.submit(sync());
+    assert.equal(second.deduplicated, false);
+    assert.notEqual(first.job.job_id, second.job.job_id);
+  });
+
+  /*
+   * The relay's jobs are persistent, and their retries belong to the server's state machine.
+   * A redelivery must never reprint one behind its back, so the blanket rule still applies
+   * there even for a provably-failed job.
+   */
+  it('still remembers every settled PERSISTENT job, failures included', async () => {
+    let sends = 0;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async () => {
+        sends += 1;
+        return refused();
+      },
+    });
+
+    await queue.submit({ source: 'relay', printer: printer('counter'), payload, job_id: 'relay-1' }).settled;
+    const after = sends;
+
+    const again = queue.submit({ source: 'relay', printer: printer('counter'), payload, job_id: 'relay-1' });
+    assert.equal(again.deduplicated, true);
+    await again.settled;
+    assert.equal(sends, after);
+  });
+});
