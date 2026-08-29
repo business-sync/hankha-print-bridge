@@ -195,7 +195,46 @@ describe('what the bridge reports upstream', () => {
     });
     const [reported] = describeRegistry();
     assert.deepEqual(Object.keys(reported ?? {}).sort(), [
-      'address', 'enabled', 'id', 'name', 'port', 'transport', 'type',
+      'address', 'enabled', 'id', 'name', 'port', 'role', 'transport', 'type',
     ]);
+    // Not `device`, not `baud`, not `language`: the summary carries only what the server can
+    // act on. `role` earns its place because role-addressed jobs are resolved server-side.
+    assert.equal('device' in (reported ?? {}), false);
+  });
+
+  it('accepts a role, folds its case, and refuses one that is not a role', () => {
+    // Unset is normal and silent. A VALUE that is not a role is a typo in a hand-edited config,
+    // and swallowing it would leave the printer permanently unreachable by role with nothing on
+    // screen to say why.
+    const ok = parseRegistry({
+      version: 1,
+      printers: [
+        { id: 'pass', name: 'Pass', transport: 'network', address: '192.168.18.104', role: 'KITCHEN' },
+        { id: 'till', name: 'Till', transport: 'network', address: '192.168.18.103' },
+      ],
+    });
+    assert.deepEqual(ok.errors, []);
+    assert.equal(ok.registry?.printers.find((p) => p.id === 'pass')?.role, 'kitchen');
+    assert.equal(ok.registry?.printers.find((p) => p.id === 'till')?.role, undefined);
+
+    const bad = parseRegistry({
+      version: 1,
+      printers: [{ id: 'x', name: 'X', transport: 'network', address: '192.168.18.103', role: 'dessert' }],
+    });
+    assert.equal(bad.errors.length, 1);
+    assert.match(bad.errors[0] ?? '', /role must be one of/);
+  });
+
+  it('reports an untagged printer as role null, so the server can tell it apart from a tag', () => {
+    saveRegistry({
+      version: 1,
+      printers: [
+        { id: 'till', name: 'Till', transport: 'network', address: '192.168.18.103' },
+        { id: 'pass', name: 'Pass', transport: 'network', address: '192.168.18.104', role: 'kitchen' },
+      ],
+    });
+    const reported = describeRegistry();
+    assert.equal(reported.find((p) => p.id === 'till')?.role, null);
+    assert.equal(reported.find((p) => p.id === 'pass')?.role, 'kitchen');
   });
 })

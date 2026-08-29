@@ -143,6 +143,37 @@ export function prepare(request: JobRequest): Prepared {
   }
 }
 
+/**
+ * Render a document that arrived over the RELAY, for an already-resolved printer.
+ *
+ * Split out of `prepare()` because the relay resolves its own printer — it has to, in order to
+ * report `device-missing` with the id or address the server actually sent — but must not then
+ * re-implement parsing, the size cap, or the `RenderError` handling. Everything here is the
+ * same code path `POST /jobs` takes; only the resolution step differs.
+ *
+ * The kind is taken from the document itself rather than from a separate field: the server
+ * carries one opaque `document` and the two shapes are already tagged, so a second field could
+ * only ever disagree with it.
+ */
+export function renderJobDocument(
+  document: unknown,
+  printer: PrinterRecord,
+): { ok: true; payload: Buffer } | { ok: false; errors: string[] } {
+  const kind = (document as { kind?: unknown } | null | undefined)?.kind;
+  const parsed = kind === 'label' ? parseLabelDocument(document) : parseReceiptDocument(document);
+  if (!parsed.document) return { ok: false, errors: parsed.errors };
+  try {
+    const payload = render(parsed.document, printer);
+    if (payload.length > MAX_PAYLOAD_BYTES) {
+      return { ok: false, errors: [`the rendered document is ${payload.length} bytes`] };
+    }
+    return { ok: true, payload };
+  } catch (err) {
+    if (err instanceof RenderError) return { ok: false, errors: err.errors };
+    throw err;
+  }
+}
+
 /** The `ip`/`port` shape the legacy `/print` route and every relay job still use. */
 export function targetFrom(ip: unknown, port: unknown): { ip: string; port: number } | null {
   if (typeof ip !== 'string' || !isPrivateIpv4(ip)) return null;
