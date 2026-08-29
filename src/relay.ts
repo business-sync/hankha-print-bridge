@@ -108,6 +108,10 @@ export function describeRegistry() {
       // Present for network printers, and for the address-alias workaround this replaces.
       address: p.address ?? null,
       port: p.port ?? null,
+      // What the server resolves a role-addressed job against. Null when nobody has tagged the
+      // printer — the server has its own fallback for that and must be able to tell the two
+      // apart, so this is reported explicitly rather than omitted.
+      role: p.role ?? null,
     }));
 }
 

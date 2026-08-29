@@ -17,8 +17,23 @@ export type TransportKind = 'network' | 'usb' | 'serial';
 export type PrinterType = 'receipt' | 'label';
 export type PrinterLanguage = 'escpos' | 'zpl' | 'tspl' | 'epl2';
 
+/**
+ * What this printer is FOR, as opposed to what it is.
+ *
+ * Distinct from `type`, which says what the hardware can do (a receipt roll or a label head).
+ * Two printers can both be `receipt` and still be the bill printer and the kitchen pass — only
+ * the operator knows which, so this is a tag they apply, never something probed or inferred.
+ *
+ * It exists for the cloud path. A tablet cannot see the shop network and does not know one
+ * printer id from another; it addresses a slip by role, and the server resolves that against
+ * whatever the stations in that branch reported here. Without it a phone can only ever print to
+ * a printer someone typed an id for, and a station going offline means the slip is simply lost.
+ */
+export type PrinterRole = 'receipt' | 'kitchen' | 'bar';
+
 export const TRANSPORT_KINDS: TransportKind[] = ['network', 'usb', 'serial'];
 export const PRINTER_LANGUAGES: PrinterLanguage[] = ['escpos', 'zpl', 'tspl', 'epl2'];
+export const PRINTER_ROLES: PrinterRole[] = ['receipt', 'kitchen', 'bar'];
 
 export interface PrinterRecord {
   /** URL-safe, because it appears in `/printers/:id/test`. */
@@ -28,6 +43,16 @@ export interface PrinterRecord {
   type: PrinterType;
   language: PrinterLanguage;
   enabled: boolean;
+
+  /**
+   * Which kind of slip this printer handles — see `PrinterRole`.
+   *
+   * Optional, and absent is meaningful: it means nobody has tagged this printer, not that it
+   * serves nothing. The server treats an untagged receipt-type printer as the venue's bill
+   * printer so that role addressing works before anyone has configured anything, and refuses
+   * to guess for `kitchen`/`bar`, where guessing wrong prints a bar ticket on a customer's bill.
+   */
+  role?: PrinterRole;
 
   /** network: the printer's own IP. Also usable on other transports — see `resolveByAddress`. */
   address?: string;
@@ -156,6 +181,18 @@ function parsePrinter(value: unknown, index: number, errors: string[]): PrinterR
     errors.push(`${where}: language must be one of ${PRINTER_LANGUAGES.join(', ')} or 'auto'`);
   }
 
+  // Unset is a normal, common state, so `undefined` passes silently — but a value that is not
+  // a role is a typo in a config file someone hand-edited, and swallowing it would leave the
+  // printer permanently unreachable by role with nothing on screen to explain why.
+  let role: PrinterRole | undefined;
+  if (raw.role !== undefined && raw.role !== null && raw.role !== '') {
+    if (typeof raw.role === 'string' && PRINTER_ROLES.includes(raw.role.trim().toLowerCase() as PrinterRole)) {
+      role = raw.role.trim().toLowerCase() as PrinterRole;
+    } else {
+      errors.push(`${where}: role must be one of ${PRINTER_ROLES.join(', ')}`);
+    }
+  }
+
   const address = typeof raw.address === 'string' && raw.address.trim() ? raw.address.trim() : undefined;
   if (address !== undefined && !isPrivateIpv4(address)) {
     // Same rule the HTTP routes enforce: this process only ever dials RFC1918 space, so an
@@ -191,6 +228,7 @@ function parsePrinter(value: unknown, index: number, errors: string[]): PrinterR
     type,
     language,
     enabled: raw.enabled === undefined ? true : raw.enabled === true,
+    role,
     address,
     port: port ?? (transport === 'network' ? DEFAULT_PRINTER_PORT_FALLBACK : undefined),
     queue,
