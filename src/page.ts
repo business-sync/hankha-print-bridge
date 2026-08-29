@@ -1107,6 +1107,14 @@ const SCRIPT = `
    * The outbound half. Worth its own card because "printing works from the till but not from a
    * phone" is exactly the difference between the LAN surface and this one.
    */
+  /*
+   * Whether the next Connect is a RE-pair. Enrolling twice moves this machine's printers to
+   * whichever venue supplied the code, so the bridge refuses a second enrolment unless the
+   * caller says so; this flag is that say-so, and it is only ever true while the box is being
+   * shown for a pairing the server has stopped accepting.
+   */
+  var pairForce = false;
+
   function renderRelay(relay) {
     /* last_ok_at renders as "12s ago", so this one has to redraw as the clock moves. */
     if (!changed('relay', [relay, ago(relay && relay.last_ok_at)])) return;
@@ -1129,13 +1137,56 @@ const SCRIPT = `
     }
 
     $('relay-note').textContent = !relay.enrolled ? 'not enrolled' : relay.connected ? 'connected' : 'offline';
+
     /*
-     * Hidden the moment the bridge is enrolled, including when the enrolment came from another
-     * tab or the CLI — the poll is what notices, so nothing here needs to know who paired it.
-     * The success message is left standing rather than cleared: it names the bridge, and the
-     * operator has usually looked away at the POS by the time this redraws.
+     * Hidden once the bridge is paired AND connected, including when the pairing came from
+     * another tab or the CLI — the poll is what notices, so nothing here needs to know who
+     * paired it. The success message is left standing rather than cleared: it names the bridge,
+     * and the operator has usually looked away at the POS by the time this redraws.
+     *
+     * Enrolled-but-not-connected keeps the box, because it is the one state with no other way
+     * out. Hiding it whenever a token merely existed on disk meant a bridge whose credential the
+     * server had rejected offered no code field at all, and the only route back was a terminal.
      */
-    $('pair').hidden = Boolean(relay.enrolled);
+    pairForce = Boolean(relay.enrolled) && !relay.connected;
+    $('pair').hidden = Boolean(relay.enrolled) && Boolean(relay.connected);
+
+    /*
+     * Disconnected has two causes and they need opposite advice. A REJECTED credential never
+     * recovers by waiting — the bridge stops its heartbeat and leaves its poll loop — while an
+     * uplink that dropped comes back on its own, and re-pairing it would mean deleting a
+     * working bridge row for nothing. The box is offered either way, because being wrong about
+     * which one this is must never leave the operator with no way out; only the wording moves.
+     */
+    var rejected = pairForce && /token rejected|revoked|re-?enroll/i.test(relay.last_error || '');
+    var why = relay.last_error ? ' (' + relay.last_error + ')' : '';
+
+    $('pair-submit').textContent = pairForce ? 'Re-pair' : 'Connect';
+    $('pair-lead').textContent = !pairForce
+      ? 'Jobs only arrive over the LAN. To let a phone or tablet print through this bridge, ' +
+        'pair it with your venue.'
+      : rejected
+        ? 'This bridge is paired, but the server is not accepting its credential' + why +
+          '. Pair it again with a fresh code.'
+        : 'This bridge is paired, but it is not reaching the server right now' + why +
+          '. It usually reconnects on its own — pair it again only if this does not clear.';
+
+    /*
+     * The removal step is not tidiness. One computer holds one bridge row per organisation, so
+     * enrolling into a freshly added row while the old one is still live is refused upstream as
+     * "this computer is already paired" — the operator has to retire the dead row first. Shown
+     * only for a rejection: telling someone to delete their bridge row during a thirty-second
+     * network blip is how a working station gets thrown away.
+     */
+    var steps = $('pair-steps');
+    clear(steps);
+    if (rejected) {
+      steps.appendChild(h('li', null, 'In the POS, open Settings > Printing, remove this print bridge, then tap Add bridge.'));
+      steps.appendChild(h('li', null, 'Type the new pairing code into the box below.'));
+    } else {
+      steps.appendChild(h('li', null, 'In the POS, open Settings > Printing and tap Add bridge.'));
+      steps.appendChild(h('li', null, 'Type the pairing code it shows into the box below.'));
+    }
   }
 
   /* ----------------------------------------------------------------- discovery */
@@ -1542,7 +1593,7 @@ const SCRIPT = `
     button.disabled = true;
     pairResult('busy', 'Connecting\\u2026');
 
-    post('/enroll', { code: code }).then(function (res) {
+    post('/enroll', { code: code, force: pairForce }).then(function (res) {
       var body = res.body || {};
       if (res.status === 200 && body.ok) {
         $('pair-code').value = '';
@@ -1765,13 +1816,8 @@ export const INDEX_HTML = `<!doctype html>
       <div class="card-body">
         <dl class="kv" id="relay-kv"></dl>
         <div id="pair" hidden>
-          <p class="pair-lead">Jobs only arrive over the LAN. To let a phone or tablet print
-          through this bridge, pair it with your venue.</p>
-          <ol class="pair-steps">
-            <li>In the POS, open <strong>Settings &rsaquo; Printing</strong> and tap
-            <strong>Add bridge</strong>.</li>
-            <li>Type the pairing code it shows into the box below.</li>
-          </ol>
+          <p class="pair-lead" id="pair-lead"></p>
+          <ol class="pair-steps" id="pair-steps"></ol>
           <form id="pair-form" autocomplete="off">
             <input type="text" id="pair-code" placeholder="XXXX-XXXX" maxlength="9" spellcheck="false"
               autocapitalize="characters" autocorrect="off" aria-label="Pairing code">
