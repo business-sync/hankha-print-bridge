@@ -29,6 +29,11 @@
  * `--define process.env.APP_VERSION=...`, a plain source rewrite that does not care whether the
  * expression is inside a string. Do not write that expression here. The page asks `/health` for
  * the version at runtime instead, which is also how it stays honest after an upgrade.
+ *
+ * The other trap: CSS and SCRIPT below are template literals, so a backtick ANYWHERE inside them
+ * ends the string — including one used to quote an identifier in a comment, which is how this
+ * file has twice been left unparseable and the whole bridge unable to start. Write `fetch()`
+ * without the backticks in there, or escape them.
  */
 
 /*
@@ -292,7 +297,7 @@ tr:last-child td { border-bottom: 0; }
 .pill-ok   { background: var(--ok-bg);   color: var(--ok); }
 .pill-bad  { background: var(--bad-bg);  color: var(--bad); }
 .pill-warn { background: var(--warn-bg); color: var(--warn); }
-/* The neutral one, named rather than left as a bare `.pill` built from an empty string. */
+/* The neutral one, named rather than left as a bare .pill built from an empty string. */
 .pill-off  { background: var(--surface-2); color: var(--muted); }
 
 .mono { font: 12.5px/1.5 var(--mono); }
@@ -353,7 +358,7 @@ tr:last-child td { border-bottom: 0; }
 .found li:last-child { border-bottom: 0; }
 .found li:first-child { padding-top: 0; }
 .found-main { min-width: 0; }
-.found-where { font: 12.5px/1.5 var(--mono); overflow-wrap: anywhere; }
+.found-where { display: block; margin-top: 2px; font: 12.5px/1.5 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
 .found-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: none; }
 
 .where-file {
@@ -361,6 +366,14 @@ tr:last-child td { border-bottom: 0; }
   margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
 }
 .where-file .path { font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; min-width: 0; }
+
+/* Shown only when the clipboard is unavailable, which is every plain-http LAN origin. */
+.found li { flex-wrap: wrap; }
+.entry {
+  flex-basis: 100%; margin: 10px 0 0; padding: 10px 12px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+  font: 12px/1.5 var(--mono); white-space: pre; overflow-x: auto;
+}
 
 /*
  * Row feedback that does not move the row.
@@ -453,6 +466,8 @@ const SCRIPT = `
   var refreshing = false;
   /* Where printers.json lives, from /status. Empty until the first authorised poll returns. */
   var registryPath = '';
+  /* The registry as last loaded, so a discovered device can be marked already-configured. */
+  var configured = [];
   /*
    * Sticky, because a rejection is otherwise invisible.
    *
@@ -533,11 +548,15 @@ const SCRIPT = `
    */
   function awaitingToken() {
     placeholder($('printers-body'), 5, 'Waiting for the token above.');
-    placeholder($('jobs-body'), 4, 'Waiting for the token above.');
+    placeholder($('jobs-body'), 5, 'Waiting for the token above.');
     clear($('transports-body'));
     clear($('queue-counts'));
+    clear($('where-file'));
+    clear($('found'));
     $('printers-note').textContent = '';
     $('queue-note').textContent = '';
+    $('jobs-note').textContent = '';
+    $('find-note').textContent = '';
     $('checked').textContent = '';
     /* The DOM no longer matches any signature cached against it. */
     lastRendered = {};
@@ -560,7 +579,7 @@ const SCRIPT = `
   /*
    * One transport for the whole page, and the only place a timeout is set.
    *
-   * `fetch` has no timeout of its own. A printer that accepts a TCP connection and then never
+   * fetch() has no timeout of its own. A printer that accepts a TCP connection and then never
    * answers used to leave the test-print request pending for the life of the tab — and because a
    * test in flight suppresses the poll, that single hung request stopped the page updating
    * entirely, with the button stuck on "Printing" and nothing on screen explaining why. An abort
@@ -752,13 +771,13 @@ const SCRIPT = `
     done('Selected');
   }
 
-  function renderPrinters(statuses, registry) {
+  function renderPrinters(statuses, registry, registryOk) {
     var body = $('printers-body');
     var configured = (registry && registry.printers) || [];
     /* checked_at moves on every probe and is not on the page; comparing it would defeat this. */
     if (!changed('printers', [statuses.map(function (p) {
       return [p.id, p.name, p.transport, p.type, p.language, p.enabled, p.online, p.latency_ms, p.detail];
-    }), configured])) return;
+    }), configured, registryOk])) return;
 
     var byId = {};
     for (var i = 0; i < configured.length; i++) byId[configured[i].id] = configured[i];
@@ -767,25 +786,34 @@ const SCRIPT = `
     $('printers-note').textContent = statuses.length === 1 ? '1 configured' : statuses.length + ' configured';
 
     if (statuses.length === 0) {
-      placeholder(body, 5, 'No printers configured. Add them with PUT /printers, or run hankha-print-bridge --list-printers to see what this machine can see.');
+      /*
+       * The dead end this page used to be. It said "add them with PUT /printers, or run
+       * hankha-print-bridge --list-printers" — one instruction naming an HTTP verb, the other a
+       * binary that is not on PATH after the macOS installer, to a person who runs a cafe. The
+       * card below answers the same question without either.
+       */
+      placeholder(body, 5, 'No printers configured yet. Use Find printers below to see what this machine can see.');
       return;
     }
 
-    for (var j = 0; j < statuses.length; j++) body.appendChild(printerRow(statuses[j], byId[statuses[j].id]));
+    for (var j = 0; j < statuses.length; j++) {
+      body.appendChild(printerRow(statuses[j], byId[statuses[j].id], registryOk));
+    }
   }
 
-  function printerRow(status, record) {
+  function printerRow(status, record, registryOk) {
     var tr = h('tr');
+    var label = status.name || status.id;
 
     var first = h('td');
     first.appendChild(dot(!status.enabled ? 'off' : status.online ? 'ok' : 'bad'));
-    first.appendChild(h('span', 'name', status.name || status.id));
+    first.appendChild(h('span', 'name', label));
     first.appendChild(h('span', 'detail mono', status.id));
     tr.appendChild(first);
 
     var where = h('td', 'mono');
-    where.textContent = locate(status, record);
-    where.appendChild(h('span', 'detail', status.transport + ' \\u00b7 ' + status.type + ' \\u00b7 ' + status.language));
+    where.textContent = locate(status, record, registryOk);
+    where.appendChild(h('span', 'detail', status.transport + ' · ' + status.type + ' · ' + status.language));
     tr.appendChild(where);
 
     var state = h('td');
@@ -796,15 +824,45 @@ const SCRIPT = `
     tr.appendChild(state);
 
     tr.appendChild(h('td', 'num', status.latency_ms === null || status.latency_ms === undefined
-      ? '\\u2014'
+      ? '—'
       : status.latency_ms + ' ms'));
 
-    var action = h('td', 'num');
-    var button = h('button', 'btn btn-ghost btn-sm', 'Test print');
-    button.type = 'button';
-    button.disabled = !status.enabled;
-    button.addEventListener('click', function () { testPrint(status.id, button, state); });
-    action.appendChild(button);
+    /*
+     * Both actions share ONE feedback line, which is always in the DOM at a fixed minimum height.
+     * The old code appended its result into the State cell, which grew the row and shunted every
+     * printer below it down the page — at exactly the moment the operator is looking between the
+     * screen and the printer to see whether paper came out.
+     */
+    var action = h('td');
+    var actions = h('div', 'row-actions');
+    var feedback = h('span', 'feedback');
+
+    var test = h('button', 'btn btn-ghost btn-sm', 'Test print');
+    test.type = 'button';
+    test.disabled = !status.enabled;
+    test.addEventListener('click', function () { testPrint(status, test, feedback); });
+    actions.appendChild(test);
+
+    /*
+     * Identify is offered only where it can work, and only on demand.
+     *
+     * A print spooler is one-way by construction, so usb and serial have no channel to read a
+     * reply on and the bridge answers 501 for them. And the probe is sent in BOTH languages, one
+     * of which is wrong for any given printer and prints three or four stray characters when it
+     * lands — which is why nothing calls this automatically, and why the button says so before
+     * it is pressed rather than after.
+     */
+    if (status.transport === 'network') {
+      var ident = h('button', 'btn btn-ghost btn-sm', 'Identify');
+      ident.type = 'button';
+      ident.title = 'Asks the printer which language it speaks. Harmless, but it may print a few stray characters.';
+      ident.disabled = !status.enabled;
+      ident.addEventListener('click', function () { identify(status, ident, feedback); });
+      actions.appendChild(ident);
+    }
+
+    action.appendChild(actions);
+    action.appendChild(feedback);
     tr.appendChild(action);
 
     return tr;
@@ -812,44 +870,104 @@ const SCRIPT = `
 
   /* /status answers with what a printer IS; the registry knows WHERE it is. Only together do they
      answer "is that the one by the till". */
-  function locate(status, record) {
-    if (!record) return '\\u2014';
+  function locate(status, record, registryOk) {
+    /* Distinct from an em dash: "we asked and it has no address" is not "we could not ask". */
+    if (!registryOk) return 'not loaded';
+    if (!record) return '—';
     if (record.queue) return record.queue;
     if (record.device) return record.device;
     if (record.address) return record.address + ':' + (record.port || 9100);
-    return '\\u2014';
+    return '—';
   }
 
-  function testPrint(printerId, button, cell) {
-    testsInFlight++;
-    button.disabled = true;
-    button.textContent = 'Printing\\u2026';
+  function setFeedback(node, kind, message) {
+    node.className = 'feedback feedback-' + kind;
+    node.textContent = message;
+  }
 
-    post('/printers/' + encodeURIComponent(printerId) + '/test').then(function (res) {
-      var ok = res.status === 200 && res.body && res.body.ok === true;
-      var result = res.body && res.body.job && res.body.job.result;
-      button.textContent = ok ? 'Sent' : 'Failed';
-      var note = h('span', 'detail', ok
-        ? 'Test slip sent \\u2014 check the paper.'
-        : (result && (result.detail || result.reason)) || 'The bridge answered ' + res.status + '.');
-      cell.appendChild(note);
-      setTimeout(function () {
-        button.textContent = 'Test print';
-        button.disabled = false;
-        if (note.parentNode) note.parentNode.removeChild(note);
-      }, 6000);
-    }, function () {
-      button.textContent = 'Failed';
-      button.disabled = false;
+  /*
+   * Runs a per-row action and puts its answer on the row.
+   *
+   * testsInFlight is what stops the poll redrawing the table under a button that is mid-click,
+   * and it MUST come back to zero on every path — including a rejection. When it did not, the
+   * page stopped refreshing for the rest of the session.
+   */
+  function rowAction(status, button, feedback, busyLabel, busyText, run, describe) {
+    testsInFlight++;
+    var label = button.textContent;
+    button.disabled = true;
+    button.textContent = busyLabel;
+    button.setAttribute('aria-busy', 'true');
+    setFeedback(feedback, 'busy', busyText);
+
+    return run().then(function (res) {
+      var told = describe(res);
+      setFeedback(feedback, told.kind, told.text);
+      announce(label + ' — ' + status.name + ': ' + told.text);
+    }, function (err) {
+      var why = (err && err.message) || 'The bridge did not answer.';
+      setFeedback(feedback, 'bad', why);
+      announce(label + ' — ' + status.name + ': ' + why);
     }).then(function () {
+      button.textContent = label;
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
       testsInFlight--;
-      /* The row was drawn before this ran, so the cached signature no longer matches the DOM. */
-      delete lastRendered.printers;
     });
   }
 
-  function renderQueue(queue, jobs) {
-    if (!changed('queue', [queue, jobs])) return;
+  function testPrint(status, button, feedback) {
+    rowAction(
+      status, button, feedback, 'Printing…', 'Sending a test slip…',
+      function () { return post('/printers/' + encodeURIComponent(status.id) + '/test', undefined, TEST_TIMEOUT_MS); },
+      function (res) {
+        var body = res.body || {};
+        if (res.status === 200 && body.ok === true) {
+          return { kind: 'ok', text: 'Test slip sent — check the paper.' };
+        }
+        var result = body.job && body.job.result;
+        return {
+          kind: 'bad',
+          text: body.detail || (result && (result.detail || result.reason)) || 'The bridge answered ' + res.status + '.'
+        };
+      }
+    );
+  }
+
+  /*
+   * A language mismatch is the root cause of the whole "it prints garbage" class of fault, and it
+   * is invisible: the printer is online, the job succeeds, and the paper is nonsense. This is the
+   * only way to see it without walking to the printer.
+   */
+  function identify(status, button, feedback) {
+    rowAction(
+      status, button, feedback, 'Asking…', 'Asking the printer what it is…',
+      function () { return post('/printers/' + encodeURIComponent(status.id) + '/identify', undefined, TEST_TIMEOUT_MS); },
+      function (res) {
+        var body = res.body || {};
+        /* Not a fault: a spooler simply has nothing to answer on. */
+        if (res.status === 501) {
+          return { kind: 'busy', text: 'Only network printers can answer — ' + status.transport + ' is one-way.' };
+        }
+        if (res.status !== 200 || body.ok !== true) {
+          return { kind: 'bad', text: body.detail || 'The bridge answered ' + res.status + '.' };
+        }
+        if (!body.detected_language) {
+          return { kind: 'busy', text: body.detail || 'The printer did not answer — many models never do.' };
+        }
+        if (body.detected_language === body.configured_language) {
+          return { kind: 'ok', text: 'Answered as ' + body.detected_language + ', which matches printers.json.' };
+        }
+        return {
+          kind: 'bad',
+          text: 'Answered as ' + body.detected_language + ', but printers.json says '
+            + body.configured_language + '. Set language to ' + body.detected_language + '.'
+        };
+      }
+    );
+  }
+  function renderQueue(queue, jobs, jobsOk) {
+    if (!changed('queue', [queue, jobs, jobsOk])) return;
     var counts = $('queue-counts');
     clear(counts);
     var order = ['queued', 'printing', 'done', 'failed', 'expired'];
@@ -861,8 +979,17 @@ const SCRIPT = `
 
     var body = $('jobs-body');
     clear(body);
+    /*
+     * "Could not load" and "nothing has printed" are opposite facts, and this used to show the
+     * second for both: /jobs failing left the list undefined, and the page then stated as fact that
+     * nothing had printed since the bridge started. Only /status's status code was ever checked.
+     */
+    if (!jobsOk) {
+      placeholder(body, 5, 'Could not load recent jobs.');
+      return;
+    }
     if (!jobs || jobs.length === 0) {
-      placeholder(body, 4, 'Nothing printed since this bridge started.');
+      placeholder(body, 5, 'Nothing printed since this bridge started.');
       return;
     }
 
@@ -872,11 +999,27 @@ const SCRIPT = `
     }).slice(0, MAX_JOBS);
 
     for (var j = 0; j < recent.length; j++) body.appendChild(jobRow(recent[j]));
+    if (jobs.length > recent.length) {
+      /* Say what was left out. A list silently capped reads as a complete one. */
+      $('jobs-note').textContent = 'newest ' + recent.length + ' of ' + jobs.length;
+    } else {
+      $('jobs-note').textContent = '';
+    }
   }
 
   function jobRow(job) {
     var tr = h('tr');
-    tr.appendChild(h('td', 'mono', clockOf(job.updated_at || job.created_at)));
+
+    var when = h('td', 'mono');
+    when.textContent = clockOf(job.updated_at || job.created_at);
+    /*
+     * Where the job came from. This is THE question the Cloud relay card exists to answer —
+     * "printing works from the till but not from the phone" is entirely a question of whether
+     * relay jobs are arriving at all — and the bridge has always reported it and the page has
+     * always thrown it away.
+     */
+    if (job.source) when.appendChild(h('span', 'detail', job.source === 'relay' ? 'via relay' : 'over LAN'));
+    tr.appendChild(when);
 
     var who = h('td');
     who.appendChild(h('span', 'name', job.printer_name || job.printer_id));
@@ -892,17 +1035,53 @@ const SCRIPT = `
       var why = job.result.reason || 'failed';
       /* printed_certainty is the field that decides whether a retry is safe. It is the whole
          reason a failure here is not simply "try again". */
-      if (job.result.printed_certainty) why += ' \\u00b7 printed: ' + job.result.printed_certainty;
+      if (job.result.printed_certainty) why += ' · printed: ' + job.result.printed_certainty;
       state.appendChild(h('span', 'detail', why));
+    } else if (job.status === 'queued' && job.expires_at) {
+      /* The offline banner promises jobs queue "until they expire". This is that deadline. */
+      state.appendChild(h('span', 'detail', 'expires ' + clockOf(job.expires_at)));
     }
     tr.appendChild(state);
 
     var meta = h('td', 'num');
     meta.textContent = sizeOf(job.bytes);
-    meta.appendChild(h('span', 'detail', 'attempt ' + job.attempts + (job.copies > 1 ? ' \\u00b7 ' + job.copies + ' copies' : '')));
+    meta.appendChild(h('span', 'detail', 'attempt ' + job.attempts + (job.copies > 1 ? ' · ' + job.copies + ' copies' : '')));
     tr.appendChild(meta);
 
+    /*
+     * Cancel is offered only while a job is still queued, which is the only state the bridge can
+     * honestly withdraw it from — once it is printing, paper may already be moving. The route has
+     * existed since the queue landed with nothing able to call it.
+     */
+    var act = h('td');
+    if (job.status === 'queued') {
+      var actions = h('div', 'row-actions');
+      var feedback = h('span', 'feedback');
+      var cancel = h('button', 'btn btn-ghost btn-sm', 'Cancel');
+      cancel.type = 'button';
+      cancel.addEventListener('click', function () { cancelJob(job, cancel, feedback); });
+      actions.appendChild(cancel);
+      act.appendChild(actions);
+      act.appendChild(feedback);
+    }
+    tr.appendChild(act);
+
     return tr;
+  }
+
+  function cancelJob(job, button, feedback) {
+    var name = job.printer_name || job.printer_id;
+    rowAction(
+      { id: job.job_id, name: name }, button, feedback, 'Cancelling…', 'Withdrawing this job…',
+      function () { return post('/jobs/' + encodeURIComponent(job.job_id) + '/cancel', {}); },
+      function (res) {
+        if (res.status === 200) return { kind: 'ok', text: 'Cancelled before it reached the printer.' };
+        /* 409 is not a failure to report as one: it means the paper is already moving. */
+        if (res.status === 409) return { kind: 'busy', text: 'Too late — it had already started printing.' };
+        if (res.status === 404) return { kind: 'bad', text: 'That job is no longer in the queue.' };
+        return { kind: 'bad', text: 'The bridge answered ' + res.status + '.' };
+      }
+    ).then(function () { delete lastRendered.queue; });
   }
 
   function renderTransports(transports) {
@@ -959,6 +1138,211 @@ const SCRIPT = `
     $('pair').hidden = Boolean(relay.enrolled);
   }
 
+  /* ----------------------------------------------------------------- discovery */
+
+  /*
+   * "What can this machine see?"
+   *
+   * The question the empty state used to answer with a terminal command. POST /discover has
+   * existed since the transports landed and nothing in a browser has ever called it.
+   *
+   * Never on load, always on a press: discoverAll sweeps a /24, which is a couple of seconds of
+   * SYN traffic across the venue's network. A page left open on a till would turn that into a
+   * background hum for nobody's benefit — the same reasoning that put a cache in front of the
+   * printer probes. The button is the consent.
+   *
+   * And nothing here writes. printers.json stays the only way the registry changes; this card
+   * only shortens the distance between "I plugged in a printer" and knowing what to put in it.
+   */
+  function findPrinters() {
+    var button = $('find');
+    var note = $('find-note');
+    var label = button.textContent;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Looking…';
+    note.textContent = 'Checking USB, serial and this machine’s own subnets…';
+    clear($('found'));
+
+    post('/discover', {}, DISCOVER_TIMEOUT_MS).then(function (res) {
+      var body = res.body || {};
+      if (res.status !== 200 || body.ok !== true) {
+        note.textContent = 'Could not look: the bridge answered ' + res.status + '.';
+        return;
+      }
+      renderFound(body);
+    }, function (err) {
+      note.textContent = (err && err.message) || 'Could not look.';
+    }).then(function () {
+      button.textContent = label;
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    });
+  }
+
+  function renderFound(result) {
+    var out = $('found');
+    clear(out);
+
+    var found = result.printers || [];
+    var subnets = result.subnets || [];
+    /*
+     * Saying WHERE it looked is the difference between "you have no printers" and "this machine
+     * cannot see the network your printers are on" — and the second is exactly what a
+     * containerised bridge reports, confidently and wrongly.
+     */
+    var where = subnets.length
+      ? 'Swept ' + subnets.join(', ') + '.'
+      : 'No subnets to sweep — this bridge can only see its own machine.';
+    var summary = found.length
+      ? found.length + (found.length === 1 ? ' device found. ' : ' devices found. ') + where
+      : 'Nothing found. ' + where;
+    $('find-note').textContent = summary;
+    announce(summary);
+
+    for (var i = 0; i < found.length; i++) out.appendChild(foundRow(found[i], i));
+  }
+
+  function locationOf(item) {
+    if (item.queue) return item.queue;
+    if (item.device) return item.device;
+    if (item.address) return item.address + ':' + (item.port || 9100);
+    return item.transport;
+  }
+
+  /* Matched on where a device IS, not on its name: the label a spooler reports and the name a
+     venue gave the same printer in printers.json are rarely the same string. */
+  function isConfigured(item) {
+    for (var i = 0; i < configured.length; i++) {
+      var p = configured[i];
+      if (p.transport !== item.transport) continue;
+      if (item.queue && p.queue === item.queue) return true;
+      if (item.device && p.device === item.device) return true;
+      if (item.address && p.address === item.address && (p.port || 9100) === (item.port || 9100)) return true;
+    }
+    return false;
+  }
+
+  function foundRow(item, index) {
+    var li = h('li');
+
+    var main = h('div', 'found-main');
+    var where = locationOf(item);
+    var label = item.label || where;
+    main.appendChild(h('span', 'name', label));
+    /* A spooler reports its queue name as its label, so printing both is the same string twice. */
+    if (where !== label) main.appendChild(h('span', 'found-where', where));
+    if (item.detail) main.appendChild(h('span', 'detail', item.detail));
+    li.appendChild(main);
+
+    var actions = h('div', 'found-actions');
+    if (isConfigured(item)) {
+      actions.appendChild(h('span', 'pill pill-ok', 'In printers.json'));
+    } else {
+      actions.appendChild(h('span', 'pill pill-off', 'Not configured'));
+      var copy = h('button', 'btn btn-ghost btn-sm', 'Copy entry');
+      copy.type = 'button';
+      copy.title = 'Copies a printers.json entry for this device, ready to paste.';
+      copy.addEventListener('click', function () { copyEntry(item, index, copy); });
+      actions.appendChild(copy);
+    }
+    li.appendChild(actions);
+
+    return li;
+  }
+
+  /*
+   * Hands over the exact object to paste, rather than a shape to reconstruct from a README.
+   *
+   * The id is positional, not derived from the label. The registry requires
+   * ^[a-z0-9][a-z0-9_-]{0,63}$ and there is no slug helper anywhere in this app — a Lao station
+   * name reduces to the empty string and an address to a run of digits and dots, so deriving one
+   * produces an entry that fails validation on paste.
+   *
+   * type and language are guesses, and deliberately the safe ones: receipt/escpos is what a
+   * thermal printer at a till almost always is, and a label printer has no safe default at all —
+   * the registry refuses one without an explicit language for exactly that reason.
+   */
+  function copyEntry(item, index, button) {
+    var entry = {
+      id: item.transport + '-' + (index + 1),
+      name: item.label || locationOf(item),
+      transport: item.transport,
+      type: 'receipt',
+      language: 'escpos',
+      enabled: true
+    };
+    if (item.address) { entry.address = item.address; entry.port = item.port || 9100; }
+    if (item.queue) entry.queue = item.queue;
+    if (item.device) entry.device = item.device;
+
+    var text = JSON.stringify(entry, null, 2);
+    var done = function (label) {
+      button.textContent = label;
+      setTimeout(function () { button.textContent = 'Copy entry'; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done('Copied'); }, function () { revealEntry(button, text, done); });
+      return;
+    }
+    /* No clipboard on a plain-http LAN origin: only localhost counts as a secure context. */
+    revealEntry(button, text, done);
+  }
+
+  function revealEntry(button, text, done) {
+    var li = button.parentNode.parentNode;
+    var existing = li.querySelector('.entry');
+    if (existing) existing.parentNode.removeChild(existing);
+
+    var pre = h('pre', 'entry', text);
+    li.appendChild(pre);
+    var range = document.createRange();
+    range.selectNodeContents(pre);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    done('Selected');
+  }
+
+  /* The path the footer used to send people to a CLI to discover, on a machine where that binary
+     is not on PATH. The process has known it all along. */
+  function renderRegistryPath(path) {
+    if (!changed('registry-path', path)) return;
+    var host = $('where-file');
+    clear(host);
+    if (!path) return;
+    host.appendChild(h('span', 'find-note', 'Printers are configured in'));
+    host.appendChild(h('span', 'path', path));
+    var copy = h('button', 'btn btn-ghost btn-sm', 'Copy');
+    copy.type = 'button';
+    copy.addEventListener('click', function () { copyPlain(path, copy); });
+    host.appendChild(copy);
+  }
+
+  function copyPlain(text, button) {
+    var done = function (label) {
+      button.textContent = label;
+      setTimeout(function () { button.textContent = 'Copy'; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done('Copied'); }, function () { selectSibling(button, done); });
+      return;
+    }
+    selectSibling(button, done);
+  }
+
+  function selectSibling(button, done) {
+    var node = button.parentNode.querySelector('.path');
+    if (!node) return;
+    var range = document.createRange();
+    range.selectNodeContents(node);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    done('Selected');
+  }
+
+
   /* ----------------------------------------------------------------- pairing */
 
   function pairResult(kind, message) {
@@ -1001,7 +1385,21 @@ const SCRIPT = `
   }
 
   function refresh(force) {
-    if (testsInFlight > 0) return Promise.resolve();
+    /*
+     * Two guards, for two different failures.
+     *
+     * testsInFlight stops a redraw replacing a button mid-click — and now SAYS so. It used to
+     * return silently, so pressing Refresh during a test print did nothing at all and read as a
+     * dead button. refreshing stops the fixed ten-second timer stacking requests on a bridge
+     * that is answering slowly, where whichever call returned first re-enabled the button
+     * underneath one that was still running.
+     */
+    if (refreshing) return Promise.resolve();
+    if (testsInFlight > 0) {
+      notice('Waiting for the printer — this will refresh once it answers.');
+      return Promise.resolve();
+    }
+    refreshing = true;
     var button = $('refresh');
     button.disabled = true;
     /* Nothing to forget on the shipped default, where no token is configured at all. */
@@ -1035,7 +1433,8 @@ const SCRIPT = `
       return Promise.all([get(probe), get('/printers'), get('/jobs')]).then(function (all) {
         var status = all[0], registry = all[1], jobs = all[2];
 
-        if (status.status === 401) {
+        /* Any of the three answering 401 means the same thing; only /status was ever checked. */
+        if (status.status === 401 || registry.status === 401 || jobs.status === 401) {
           writeToken('');
           tokenRejected = true;
           setBanners(warnings);
@@ -1056,17 +1455,44 @@ const SCRIPT = `
         }
         setBanners(warnings);
 
-        renderPrinters(status.body.printers || [], registry.body);
-        renderQueue(status.body.queue, jobs.body && jobs.body.jobs);
+        /*
+         * Each payload carries whether it actually arrived. Falling back to an empty list made a
+         * failed /printers empty the Where column of every row, and a failed /jobs state as fact
+         * that nothing had printed since the bridge started — both indistinguishable, on screen,
+         * from the truth.
+         */
+        var registryOk = registry.status === 200 && !!registry.body;
+        var jobsOk = jobs.status === 200 && !!jobs.body;
+        configured = (registryOk && registry.body.printers) || [];
+
+        renderPrinters(status.body.printers || [], registryOk ? registry.body : null, registryOk);
+        renderQueue(status.body.queue, jobsOk ? jobs.body.jobs : null, jobsOk);
         renderTransports(status.body.transports);
+        registryPath = status.body.registry_path || '';
+        renderRegistryPath(registryPath);
+
+        announce(offline.length > 0
+          ? offline.length + (offline.length === 1 ? ' printer is not answering.' : ' printers are not answering.')
+          : 'All printers are answering.');
         $('checked').textContent = 'checked ' + new Date().toLocaleTimeString();
+        setTitle(offline.length);
       });
     }).catch(function (err) {
       setBanners([banner('bad', 'Cannot reach the bridge.',
         (err && err.message ? err.message : String(err)) + ' It may have stopped, or another program may have taken its port.')]);
     }).then(function () {
+      refreshing = false;
       button.disabled = false;
     });
+  }
+
+  /*
+   * The tab title carries the count too. This page is left open on a till, usually behind
+   * something else, and a number in the tab is the only way a problem is noticed without
+   * someone deciding to go and look.
+   */
+  function setTitle(offline) {
+    document.title = offline > 0 ? '(' + offline + ') Hankha Print Bridge' : 'Hankha Print Bridge';
   }
 
   function startPolling() {
@@ -1082,6 +1508,7 @@ const SCRIPT = `
   /* ----------------------------------------------------------------- wiring */
 
   $('refresh').addEventListener('click', function () { refresh(true); });
+  $('find').addEventListener('click', findPrinters);
 
   $('gate-form').addEventListener('submit', function (event) {
     event.preventDefault();
@@ -1185,6 +1612,7 @@ export const INDEX_HTML = `<!doctype html>
 <style>${CSS}</style>
 </head>
 <body>
+<a class="skip" href="#report">Skip to the bridge status</a>
 <div class="wrap">
 
   <header class="top">
@@ -1205,11 +1633,18 @@ export const INDEX_HTML = `<!doctype html>
     </div>
     <span class="badge" id="version">&nbsp;</span>
     <div class="actions">
+      <span class="card-note" id="notice"></span>
       <span class="card-note" id="checked"></span>
       <button type="button" class="btn btn-ghost" id="forget" hidden>Forget token</button>
       <button type="button" class="btn" id="refresh">Refresh</button>
     </div>
   </header>
+
+  <!--
+    The one place this page speaks. Everything it reports arrives as a DOM mutation on a
+    ten-second timer, so without this a screen-reader user is told nothing at all.
+  -->
+  <p class="sr-only" id="live" role="status" aria-live="polite" aria-atomic="true"></p>
 
   <noscript>
     <div class="banner banner-warn">
@@ -1218,18 +1653,18 @@ export const INDEX_HTML = `<!doctype html>
     </div>
   </noscript>
 
-  <div id="banners"></div>
+  <div id="banners" role="alert" aria-live="assertive"></div>
 
   <section class="gate" id="gate" hidden>
     <h2>This bridge needs a token</h2>
-    <p id="gate-message"></p>
+    <p id="gate-message" role="status" aria-live="polite"></p>
     <form id="gate-form" autocomplete="off">
       <input type="password" id="token" placeholder="PRINT_BRIDGE_TOKEN" autocomplete="off" spellcheck="false" aria-label="Bridge token">
       <button type="submit" class="btn">Connect</button>
     </form>
   </section>
 
-  <div class="grid">
+  <main class="grid" id="report">
 
     <section class="card card-wide">
       <div class="card-head">
@@ -1240,17 +1675,38 @@ export const INDEX_HTML = `<!doctype html>
         <table class="table-wide">
           <thead>
             <tr>
-              <th>Printer</th>
-              <th>Where</th>
-              <th>State</th>
-              <th class="num">Latency</th>
-              <th class="num">Test</th>
+              <th scope="col">Printer</th>
+              <th scope="col">Where</th>
+              <th scope="col">State</th>
+              <th scope="col" class="num">Latency</th>
+              <th scope="col" class="num">Actions</th>
             </tr>
           </thead>
           <tbody id="printers-body">
             <tr><td class="empty" colspan="5">Loading&hellip;</td></tr>
           </tbody>
         </table>
+      </div>
+    </section>
+
+    <!--
+      The way out of an empty registry, and the only card here that asks the bridge to do
+      something rather than report. It still writes nothing: printers.json remains the single
+      source of truth, exactly as the header of this file requires. What it removes is the step
+      where an operator was told to open a terminal and run a binary that the macOS installer
+      does not put on PATH.
+    -->
+    <section class="card card-wide">
+      <div class="card-head">
+        <h2 class="card-title">What this machine can see</h2>
+      </div>
+      <div class="card-body">
+        <div class="find">
+          <button type="button" class="btn" id="find">Find printers</button>
+          <span class="find-note" id="find-note">Checks USB and serial, and sweeps this machine&rsquo;s own subnets.</span>
+        </div>
+        <ul class="found" id="found"></ul>
+        <div class="where-file" id="where-file"></div>
       </div>
     </section>
 
@@ -1272,19 +1728,23 @@ export const INDEX_HTML = `<!doctype html>
     </section>
 
     <section class="card card-wide">
-      <div class="card-head"><h2 class="card-title">Recent jobs</h2></div>
+      <div class="card-head">
+        <h2 class="card-title">Recent jobs</h2>
+        <span class="card-note" id="jobs-note"></span>
+      </div>
       <div class="scroll">
         <table class="table-wide">
           <thead>
             <tr>
-              <th>Time</th>
-              <th>Printer</th>
-              <th>Outcome</th>
-              <th class="num">Size</th>
+              <th scope="col">Time</th>
+              <th scope="col">Printer</th>
+              <th scope="col">Outcome</th>
+              <th scope="col" class="num">Size</th>
+              <th scope="col" class="num">Actions</th>
             </tr>
           </thead>
           <tbody id="jobs-body">
-            <tr><td class="empty" colspan="4">Loading&hellip;</td></tr>
+            <tr><td class="empty" colspan="5">Loading&hellip;</td></tr>
           </tbody>
         </table>
       </div>
@@ -1322,11 +1782,11 @@ export const INDEX_HTML = `<!doctype html>
       </div>
     </section>
 
-  </div>
+  </main>
 
   <footer class="foot">
     <span>Printers are configured in <code>printers.json</code> &mdash; not here.</span>
-    <span><code>--list-printers</code> shows where that file is, and what this machine can see.</span>
+    <span>This page reads the bridge and can test it; it never edits the registry.</span>
   </footer>
 
 </div>
