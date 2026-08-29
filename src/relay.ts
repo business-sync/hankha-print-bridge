@@ -483,7 +483,9 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  *
  * Note the guard is only armed once the enrolment check has PASSED. A bridge that boots
  * unenrolled — every bridge, on its first run — must leave the flag clear, or the enrol route
- * could never start the loop it just made possible.
+ * could never start the loop it just made possible. It is released again in the loop's
+ * `finally`, so a bridge whose token was rejected can be re-paired in place: the flag describes
+ * a LIVE loop, and a loop that has returned is not one.
  */
 let relayRunning = false;
 
@@ -538,95 +540,107 @@ export function startRelay(): void {
 
   void (async () => {
     let failures = 0;
-    for (;;) {
-      if (Date.now() >= wsBlockedUntil) {
-        const outcome = await runSocketSession(base, token);
-        if (outcome === 'revoked') {
-          status.connected = false;
-          status.last_error = 'token rejected — re-enrollment required';
-          log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
-            event: 'relay.token_rejected',
-          });
-          clearInterval(beat);
-          return;
-        }
-        if (outcome === 'served') {
-          // A clean session ended: reconnect rather than falling back, because the endpoint
-          // demonstrably exists. Floored all the same — a category that reconnects without
-          // delay is one server-side bug away from being a spin, which is how it got here.
-          failures = 0;
-          await sleep(RECONNECT_FLOOR_MS);
-          continue;
-        }
-        if (outcome === 'unsupported') {
-          wsBlockedUntil = Date.now() + WS_UNSUPPORTED_RETRY_MS;
-          if (!wsUnsupportedLogged) {
-            wsUnsupportedLogged = true;
-            log.info('relay: this server does not offer a websocket endpoint — using long-polling', {
-              event: 'relay.ws.unsupported',
+    try {
+      for (;;) {
+        if (Date.now() >= wsBlockedUntil) {
+          const outcome = await runSocketSession(base, token);
+          if (outcome === 'revoked') {
+            status.connected = false;
+            status.last_error = 'token rejected — re-enrollment required';
+            log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
+              event: 'relay.token_rejected',
             });
+            return;
+          }
+          if (outcome === 'served') {
+            // A clean session ended: reconnect rather than falling back, because the endpoint
+            // demonstrably exists. Floored all the same — a category that reconnects without
+            // delay is one server-side bug away from being a spin, which is how it got here.
+            failures = 0;
+            await sleep(RECONNECT_FLOOR_MS);
+            continue;
+          }
+          if (outcome === 'unsupported') {
+            wsBlockedUntil = Date.now() + WS_UNSUPPORTED_RETRY_MS;
+            if (!wsUnsupportedLogged) {
+              wsUnsupportedLogged = true;
+              log.info('relay: this server does not offer a websocket endpoint — using long-polling', {
+                event: 'relay.ws.unsupported',
+              });
+            }
+          }
+          if (mode === 'ws') {
+            // Explicitly pinned to websocket: never silently start polling instead.
+            const wait = backoffMs(Math.min(failures, 5));
+            failures += 1;
+            await sleep(wait);
+            continue;
           }
         }
-        if (mode === 'ws') {
-          // Explicitly pinned to websocket: never silently start polling instead.
+
+        try {
+          const res = await fetch(
+            `${base}/api/v1/modules/print/bridge/work?wait=${POLL_WAIT_S}`,
+            {
+              headers: { Authorization: `Bearer ${token}` },
+              // Comfortably longer than the server's wait, so a healthy long-poll is never cut
+              // short by the client and mistaken for a network fault.
+              signal: AbortSignal.timeout((POLL_WAIT_S + 15) * 1000),
+            }
+          );
+
+          if (res.status === 401) {
+            // The token was revoked or the bridge was deleted. Stop rather than hammer: only a
+            // human with a fresh enrollment code can fix this.
+            status.connected = false;
+            status.last_error = 'token rejected — re-enrollment required';
+            log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
+              event: 'relay.token_rejected',
+            });
+            return;
+          }
+
+          if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`);
+
+          status.connected = true;
+          status.transport = 'long-poll';
+          status.last_ok_at = new Date().toISOString();
+          status.last_error = null;
+          failures = 0;
+
+          if (res.status === 204) {
+            // The normal, quiet path — not an error. Re-poll immediately with only enough
+            // jitter to keep a fleet from synchronising.
+            await sleep(Math.random() * 250);
+            continue;
+          }
+
+          await dispatch(base, token, (await res.json()) as Work);
+        } catch (err) {
+          status.connected = false;
+          status.last_error = err instanceof Error ? err.message : String(err);
           const wait = backoffMs(Math.min(failures, 5));
           failures += 1;
-          await sleep(wait);
-          continue;
-        }
-      }
-
-      try {
-        const res = await fetch(
-          `${base}/api/v1/modules/print/bridge/work?wait=${POLL_WAIT_S}`,
-          {
-            headers: { Authorization: `Bearer ${token}` },
-            // Comfortably longer than the server's wait, so a healthy long-poll is never cut
-            // short by the client and mistaken for a network fault.
-            signal: AbortSignal.timeout((POLL_WAIT_S + 15) * 1000),
-          }
-        );
-
-        if (res.status === 401) {
-          // The token was revoked or the bridge was deleted. Stop rather than hammer: only a
-          // human with a fresh enrollment code can fix this.
-          status.connected = false;
-          status.last_error = 'token rejected — re-enrollment required';
-          log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
-            event: 'relay.token_rejected',
+          // Logged at most every few seconds by the backoff itself, so a venue that loses its
+          // uplink overnight does not fill the log file.
+          log.error(`relay: ${status.last_error} — retrying in ${Math.round(wait / 1000)}s`, {
+            event: 'relay.retry', detail: status.last_error, wait_ms: wait,
           });
-          clearInterval(beat);
-          return;
+          await sleep(wait);
         }
-
-        if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`);
-
-        status.connected = true;
-        status.transport = 'long-poll';
-        status.last_ok_at = new Date().toISOString();
-        status.last_error = null;
-        failures = 0;
-
-        if (res.status === 204) {
-          // The normal, quiet path — not an error. Re-poll immediately with only enough
-          // jitter to keep a fleet from synchronising.
-          await sleep(Math.random() * 250);
-          continue;
-        }
-
-        await dispatch(base, token, (await res.json()) as Work);
-      } catch (err) {
-        status.connected = false;
-        status.last_error = err instanceof Error ? err.message : String(err);
-        const wait = backoffMs(Math.min(failures, 5));
-        failures += 1;
-        // Logged at most every few seconds by the backoff itself, so a venue that loses its
-        // uplink overnight does not fill the log file.
-        log.error(`relay: ${status.last_error} — retrying in ${Math.round(wait / 1000)}s`, {
-          event: 'relay.retry', detail: status.last_error, wait_ms: wait,
-        });
-        await sleep(wait);
       }
+    } finally {
+      // Every way out of the loop lands here: a rejected token, a revoked bridge, or an
+      // unexpected throw from `runSocketSession`, which is awaited outside the inner try/catch.
+      //
+      // Releasing the guard is the whole point. It used to be set once at start and never
+      // cleared, so a bridge whose token had been rejected reported `isRelayRunning() === true`
+      // forever. `POST /enroll` then took its "a loop is already live" branch, saved the new
+      // credential, answered `restart_required` and reconnected nothing — so re-pairing a
+      // rejected bridge was impossible without restarting the service, which is exactly the
+      // state an operator cannot diagnose from the POS.
+      clearInterval(beat);
+      relayRunning = false;
     }
   })();
 }

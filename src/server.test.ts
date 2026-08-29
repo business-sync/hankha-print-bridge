@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { localInterfaces } from './lan.js';
+import { loadState, type RelayState, saveState } from './identity.js';
 import { resetRegistryCache } from './registry.js';
 import { INDEX_HTML } from './page.js';
 import { BRIDGE_SERVICE, createBridgeServer } from './server.js';
@@ -776,6 +777,50 @@ describe('POST /enroll', () => {
     const { status, json } = await post('/enroll', { code: '6XZR-TTWF' });
     assert.equal(status, 502);
     assert.match(json.message, /HTTP 502/);
+  });
+
+  /*
+   * Re-pairing a bridge that is already paired.
+   *
+   * The gate reads the token from DISK rather than from `relayStatus()`, which describes the
+   * loop and is false on a paired bridge whose relay never came up. Both cases below stop at
+   * that gate, so neither reaches `startRelay()`.
+   */
+  describe('when this bridge already holds a token', () => {
+    let previous: RelayState;
+
+    beforeEach(() => {
+      previous = loadState();
+      saveState({ ...previous, bridge_id: '20', token: 'already-paired-token' });
+    });
+
+    after(() => {
+      saveState(previous);
+    });
+
+    it('refuses a second enrolment, without spending the code', async () => {
+      // Enrolling twice moves this machine's printers to whichever venue supplied the code, so
+      // it must never be the incidental outcome of a pasted string. Not reaching the API also
+      // means the one-time code survives to be typed somewhere it was actually meant to go.
+      const before = apiCalls;
+      const { status, json } = await post('/enroll', { code: '6XZR-TTWF' });
+      assert.equal(status, 409);
+      assert.equal(json.reason, 'already-enrolled');
+      assert.equal(apiCalls, before, 'a refused re-pair must not reach the API');
+    });
+
+    it('lets `force` through, so a rejected credential can be replaced in place', async () => {
+      // The state this exists for: the server has stopped accepting this bridge's token, the
+      // relay loop has exited, and the local page is showing its Re-pair box. Without `force`
+      // the only route back was deleting relay.json from a terminal.
+      const before = apiCalls;
+      const { status, json } = await post('/enroll', { code: '6XZR-TTWF', force: true });
+      assert.equal(apiCalls, before + 1, 'a forced re-pair must reach the API');
+      // The stub answers 404, so this stops short of `startRelay()` — passing the gate is the
+      // assertion, and the failure it reports is the stub's, not the gate's.
+      assert.equal(status, 502);
+      assert.equal(json.reason, 'enroll-failed');
+    });
   });
 });
 
