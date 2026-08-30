@@ -29,6 +29,9 @@ RestartSec=5
 # it the bridge cannot persist its token and silently re-enrolls on every restart.
 StateDirectory=hankha-print-bridge
 Environment=PRINT_BRIDGE_STATE_DIR=/var/lib/hankha-print-bridge
+# How the bridge knows what is supervising it, for the maintenance card on its own page.
+# systemd also sets INVOCATION_ID, which src/service.ts falls back to when this is absent.
+Environment=PRINT_BRIDGE_MANAGED=systemd
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

@@ -12,6 +12,9 @@ rem Loopback by default: a POS served over https can only reach a bridge on loca
 rem till gains nothing from listening wider. The installer's "serve other terminals" option
 rem writes bridge.env to override this.
 set "PRINT_BRIDGE_HOST=127.0.0.1"
+rem How the bridge knows what is supervising it, without shelling out to schtasks to guess.
+rem Read by src/service.ts; the "This computer" card on its page depends on getting this right.
+set "PRINT_BRIDGE_MANAGED=scheduled-task"
 
 set "DATADIR=%ProgramData%\Hankha\PrintBridge"
 set "ENVFILE=%DATADIR%\bridge.env"

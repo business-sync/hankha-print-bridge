@@ -49,6 +49,8 @@
  * submits it; if its JS handler ever failed to run, the browser's default would put the venue's
  * printer token in a URL query string. This makes that navigation impossible rather than unlikely.
  */
+import { SERVICE_CSS, SERVICE_HTML, SERVICE_SCRIPT } from './page-service.js';
+
 export const INDEX_CSP =
   "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; " +
   "img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'";
@@ -465,6 +467,7 @@ noscript .banner { display: block; }
   .ps-dot{animation:pairpulse 1.6s ease-in-out infinite}
 }
 @keyframes pairpulse{0%,100%{opacity:1}50%{opacity:.35}}
+${SERVICE_CSS}
 `;
 
 /*
@@ -1582,6 +1585,12 @@ const SCRIPT = `
         setTitle(offline.length);
       });
     }).catch(function (err) {
+      /*
+       * Silence while WE are the reason it is unreachable. A restart or a reboot the operator
+       * just asked for would otherwise be reported back to them as a failure, in red, one second
+       * after they pressed the button. svcQuiet() is in page-service.ts.
+       */
+      if (svcQuiet()) return;
       setBanners([banner('bad', 'Cannot reach the bridge.',
         (err && err.message ? err.message : String(err)) + ' It may have stopped, or another program may have taken its port.')]);
     }).then(function () {
@@ -1826,6 +1835,9 @@ const SCRIPT = `
         psWriteLang(code);
         psBuildLangs();
         psRender();
+        /* The maintenance card reads the same language table. Without this it keeps the old
+           language until its own poll comes round, which reads as a switch that half worked. */
+        svcRender();
       });
       host.appendChild(button);
     });
@@ -1972,7 +1984,7 @@ const SCRIPT = `
   psBuildLangs();
   psRefresh();
   setInterval(psRefresh, 3000);
-
+${SERVICE_SCRIPT}
   refresh(false);
   startPolling();
 })();
@@ -2189,7 +2201,7 @@ export const INDEX_HTML = `<!doctype html>
         </div>
       </div>
     </section>
-
+${SERVICE_HTML}
   </main>
 
   <footer class="foot">

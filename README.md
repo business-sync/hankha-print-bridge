@@ -138,6 +138,43 @@ sentence instead of a bare `401`.
 It is not a configuration screen. `printers.json` stays the source of truth; the one thing the
 page can do to a printer is send it the same test slip `--test-print` sends.
 
+### The "This computer" card
+
+At the bottom of that page: **restart the bridge**, **start automatically**, **remove from this
+computer**, **restart the computer**, and **clear stored print data**. It exists because every
+one of those needed a terminal before it — `launchctl kickstart`, an elevated PowerShell,
+`sudo …/uninstall.sh` — and the person standing at the till is a café owner.
+
+It says what it can do and what it cannot, and a refusal always carries the command that does it
+by hand:
+
+| | |
+|---|---|
+| **Restart** | Stops cleanly and lets launchd or Task Scheduler bring it back. **Refused outright when nothing would** — a restart button on an unsupervised bridge leaves the till with no bridge at all. |
+| **Start automatically** | Only appears when it is not already registered. Writes the LaunchAgent (no password) or runs `install.ps1 -SkipCopy` — the same call the Setup.exe makes, so there is still one implementation of "install". It restarts once to hand the port over. |
+| **Remove** | Three scopes: stop it starting, remove its files too, or remove everything including printers and pairing. **Logs always survive.** |
+| **Restart the computer** | 60 seconds, with a Cancel; refuses while jobs are queued unless told twice. Both destructive actions ask for the machine's name to be typed. |
+| **Clear stored print data** | A checklist, not a button — waiting jobs, recent records, duplicate protection, logs, each with its size. `printers.json` and `relay.json` are never touched. |
+
+Clearing the **duplicate protection** ring is off by default and says why: it is what stops a job
+the server redelivers from printing a second bill.
+
+The card polls `GET /service`. From another machine that route answers **403**, so the card is
+simply not there — which is the point.
+
+#### Why this family has its own gate
+
+Every other route here answers `Access-Control-Allow-Origin: *` and
+`Access-Control-Allow-Private-Network: true`. That is a deliberate trade for printing: the
+terminal's origin varies too much to pin. It cannot extend to rebooting a till, so `/service/*`
+gets five layers instead — loopback, **no CORS headers at all** (a cross-origin preflight fails
+and the request never arrives), an `Origin` / `Sec-Fetch-Site` check for the form POST that skips
+a preflight, a `Host` pin against DNS rebinding, and a **single-use confirmation token** minted by
+`GET /service`. One action at a time, and every attempt is logged at `warn`.
+
+`PRINT_BRIDGE_TOKEN` still applies on top of all of it. `PRINT_BRIDGE_SERVICE_CONTROL=off`
+removes the whole family for a managed fleet.
+
 ## Configuration
 
 Everything is read from the environment. `.env` supplies it during development and packaging:
@@ -165,6 +202,8 @@ environment variable beats both files, which is how CI overrides one without edi
 | `PRINT_BRIDGE_SYNC_TIMEOUT_MS` | `8000` | how long `POST /print` blocks — matches the POS's own timeout |
 | `PRINT_BRIDGE_LOG_FORMAT` | `text` | `json` gives one object per line, for a log aggregator |
 | `PRINT_BRIDGE_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `PRINT_BRIDGE_SERVICE_CONTROL` | `on` | `off` removes `/service/*` and the "This computer" card |
+| `PRINT_BRIDGE_MANAGED` | *(probed)* | what supervises this process, stamped by the installer |
 
 An **installed** bridge reads none of this. Its configuration comes from the service definition
 instead: `EnvironmentVariables` in the launchd plist on macOS, and

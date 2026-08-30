@@ -1,6 +1,7 @@
 import { localInterfaces } from './lan.js';
 import { discoverAll } from './discovery.js';
 import { ENROLL_CODE_HINT, isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
+import { registerStopper } from './lifecycle.js';
 import { log } from './log.js';
 import { enroll, startRelay } from './relay.js';
 import { startPairing } from './pairing.js';
@@ -64,6 +65,11 @@ Environment:
   PRINT_BRIDGE_LOG_FORMAT       text | json                 (default text)
   PRINT_BRIDGE_LOG_LEVEL        debug | info | warn | error (default info)
   PRINT_BRIDGE_MAX_ATTEMPTS     Retries per job, when nothing printed   (default 3)
+  PRINT_BRIDGE_SERVICE_CONTROL  on | off. 'off' removes the /service routes and the
+                                "This computer" card from the page.       (default on)
+  PRINT_BRIDGE_MANAGED          What supervises this process, stamped by the installer:
+                                launchd-daemon | launchd-agent | scheduled-task | systemd |
+                                container. Worked out by probing when unset.
 
 Endpoints:
   GET  /         a status page for a browser: printers, queue, addresses, recent jobs
@@ -75,7 +81,10 @@ Endpoints:
   POST /print    { ip, port, payload_base64 }   print now, and wait for the answer
   POST /jobs     { printer_id | target, receipt | label | payload_base64 }
   GET  /jobs, GET /jobs/:id, POST /jobs/:id/cancel
-  GET  /printers, PUT /printers, POST /printers/:id/test, POST /printers/:id/identify`);
+  GET  /printers, PUT /printers, POST /printers/:id/test, POST /printers/:id/identify
+  GET  /service  what supervises this bridge, where its files are, and what may be done
+  GET  /service/cache, POST /service/{restart,autostart,uninstall,reboot,cache}
+                 loopback only, origin-pinned, and each needs a confirmation from /service`);
   process.exit(0);
 }
 
@@ -295,26 +304,39 @@ function runService(): void {
     log.error(`uncaught exception: ${err.stack ?? err.message}`, { event: 'process.uncaught_exception' });
   });
 
-  // launchd and Task Scheduler both stop the process with a signal; exiting cleanly keeps a
-  // restart from being logged as a crash.
+  /*
+   * One graceful stop, three callers: SIGINT, SIGTERM, and `POST /service/restart`.
+   *
+   * launchd and Task Scheduler both stop the process with a signal, and exiting cleanly keeps a
+   * restart from being logged as a crash. The restart route needs exactly this sequence too, so
+   * it is registered rather than reimplemented — see lifecycle.ts.
+   *
+   * `exitCode` is not decoration on Windows: a scheduled task that ends CLEANLY is not restarted
+   * by `-RestartInterval`, which only fires when the task ends in error. Exiting 1 is what the
+   * restart route falls back to when it could not write its respawn helper.
+   */
   let shuttingDown = false;
+  const stop = (exitCode: number, why: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info(`${BRIDGE_SERVICE} shutting down`, { event: 'server.shutdown', signal: why, exitCode });
+
+    server.close();
+    // Let the write already on the wire finish. Jobs still WAITING are left on disk on purpose:
+    // they resume next start, and printing a backlog during a restart is how a service bounce
+    // turns into a paper jam.
+    void queue()
+      .drain(DRAIN_TIMEOUT_MS)
+      .then(() => process.exit(exitCode))
+      .catch(() => process.exit(exitCode));
+
+    // Backstop, in case a socket or an in-flight scan refuses to settle.
+    setTimeout(() => process.exit(exitCode), DRAIN_TIMEOUT_MS + 4000).unref();
+  };
+
+  registerStopper((exitCode) => stop(exitCode, 'service-request'));
+
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.on(signal, () => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      log.info(`${BRIDGE_SERVICE} shutting down`, { event: 'server.shutdown', signal });
-
-      server.close();
-      // Let the write already on the wire finish. Jobs still WAITING are left on disk on purpose:
-      // they resume next start, and printing a backlog during a restart is how a service bounce
-      // turns into a paper jam.
-      void queue()
-        .drain(DRAIN_TIMEOUT_MS)
-        .then(() => process.exit(0))
-        .catch(() => process.exit(0));
-
-      // Backstop, in case a socket or an in-flight scan refuses to settle.
-      setTimeout(() => process.exit(0), DRAIN_TIMEOUT_MS + 4000).unref();
-    });
+    process.on(signal, () => stop(0, signal));
   }
 }
