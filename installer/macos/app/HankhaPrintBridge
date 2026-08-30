@@ -165,6 +165,8 @@ cat > "$PLIST" <<PLISTEOF
     <string>$PORT</string>
     <key>PRINT_BRIDGE_HOST</key>
     <string>127.0.0.1</string>
+    <key>PRINT_BRIDGE_MANAGED</key>
+    <string>launchd-agent</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

@@ -24,7 +24,7 @@
  *     a successful print — the second delivery is ANSWERED, not reprinted.
  */
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { backoffMs } from './backoff.js';
 import { stateDir } from './identity.js';
@@ -101,6 +101,33 @@ export interface Submission {
   settled: Promise<JobRecord>;
   /** True when an identical `job_id` had already been handled and nothing was printed again. */
   deduplicated: boolean;
+}
+
+/** One line of the maintenance card's cache panel. */
+export interface CacheItem {
+  count: number;
+  /** Zero where the item lives in memory and has no file to measure. */
+  bytes: number;
+}
+
+export interface CacheReport {
+  spool: CacheItem;
+  history: CacheItem;
+  settled: CacheItem;
+}
+
+export interface PurgeRequest {
+  spool?: boolean;
+  history?: boolean;
+  settled?: boolean;
+}
+
+export interface PurgeReport {
+  spool: number;
+  history: number;
+  settled: number;
+  /** Jobs left alone because bytes were on the wire when the purge ran. */
+  skipped_printing: number;
 }
 
 export interface QueueOptions {
@@ -660,6 +687,111 @@ export class PrintQueue {
     while (this.running.size > 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+  }
+
+  /**
+   * What a purge would remove, so the maintenance card can show it before anyone presses
+   * anything.
+   *
+   * Sizes come off the filesystem rather than from a running total: the spool is also written by
+   * `load()` recovery and trimmed by `finish()`, and a counter kept alongside those would drift
+   * on exactly the bridge worth asking about.
+   */
+  cacheSizes(): CacheReport {
+    let spoolCount = 0;
+    let spoolBytes = 0;
+    try {
+      for (const entry of readdirSync(this.spoolDir())) {
+        if (!entry.endsWith('.json')) continue;
+        spoolCount += 1;
+        try {
+          spoolBytes += statSync(join(this.spoolDir(), entry)).size;
+        } catch {
+          // Raced with a job settling. One file's size is not worth failing the whole report.
+        }
+      }
+    } catch {
+      // No spool directory yet: a bridge that has never printed.
+    }
+
+    let settledBytes = 0;
+    try {
+      settledBytes = statSync(join(this.dir, SETTLED_FILE)).size;
+    } catch {
+      // The ring file only exists once something has settled.
+    }
+
+    return {
+      spool: { count: spoolCount, bytes: spoolBytes },
+      history: { count: this.history.length, bytes: 0 },
+      settled: { count: this.settledResults.size, bytes: settledBytes },
+    };
+  }
+
+  /**
+   * Throw away what an operator means by "clear the cache" — and nothing else.
+   *
+   * Three properties worth stating, because each replaces something that looks simpler:
+   *
+   *  - The spool is CANCELLED, not unlinked. `cancel()` settles each job as `cancelled` with
+   *    `printed_certainty: 'none'`, which resolves everything awaiting `settled` and removes the
+   *    file through the ordinary path. Sweeping the directory underneath a running queue would
+   *    leave the lanes holding jobs whose payloads are gone and every waiter hanging forever.
+   *  - A job that is PRINTING is left alone. Its bytes are on the wire; there is nothing safe to
+   *    do with it, and the count is reported rather than hidden.
+   *  - `settled` is separate and never implied. That ring is what stops a redelivered job
+   *    printing a second bill, so clearing it is a decision, not a side effect of tidying up.
+   *
+   * `printers.json` and `relay.json` are in the same directory and are never touched here: one
+   * is the configuration, the other is this computer's identity and its pairing credential.
+   */
+  purge(what: PurgeRequest): PurgeReport {
+    const report: PurgeReport = { spool: 0, history: 0, settled: 0, skipped_printing: 0 };
+    // Counted before the spool pass, which settles jobs INTO the history it is about to clear.
+    const historyBefore = this.history.length;
+
+    if (what.spool) {
+      for (const job of [...this.active.values()]) {
+        if (job.status === 'printing') {
+          report.skipped_printing += 1;
+          continue;
+        }
+        if (this.cancel(job.job_id)) report.spool += 1;
+      }
+      /*
+       * Then the orphans: files belonging to no live job — a leftover from a crash, or one
+       * `load()` could not parse.
+       *
+       * A job still ACTIVE is skipped even though its file is right there. The only one left by
+       * now is the job currently on the wire, and its spool file is the sole record that it was
+       * being sent: delete it and a crash mid-print loses the job entirely, where `load()` would
+       * otherwise recover it and settle it honestly as 'unknown'.
+       */
+      try {
+        for (const entry of readdirSync(this.spoolDir())) {
+          if (!entry.endsWith('.json')) continue;
+          if (this.active.has(entry.slice(0, -'.json'.length))) continue;
+          rmSync(join(this.spoolDir(), entry), { force: true });
+          report.spool += 1;
+        }
+      } catch {
+        // No spool directory: nothing to sweep.
+      }
+    }
+
+    if (what.history) {
+      report.history = historyBefore;
+      this.history.length = 0;
+    }
+
+    if (what.settled) {
+      report.settled = this.settledResults.size;
+      this.settledResults.clear();
+      this.settledLines = 0;
+      rmSync(join(this.dir, SETTLED_FILE), { force: true });
+    }
+
+    return report;
   }
 }
 

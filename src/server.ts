@@ -16,9 +16,31 @@ import { isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { prepare, targetFrom, type JobRequest } from './jobs.js';
 import { log } from './log.js';
 import { INDEX_CSP, INDEX_HTML } from './page.js';
+import {
+  beginAction,
+  consumeConfirmToken,
+  currentAction,
+  endAction,
+  gateServiceRequest,
+  issueConfirmToken,
+} from './service-control.js';
+import { serviceReport } from './service.js';
+import {
+  cancelReboot,
+  clearLogs,
+  DEFAULT_REBOOT_DELAY_SECONDS,
+  logFileInfo,
+  rebootPending,
+  registerAutostart,
+  restartService,
+  scheduleReboot,
+  uninstallService,
+  type ActionOutcome,
+  type UninstallScope,
+} from './service-actions.js';
 import { describeJob, isSafeJobId, queue } from './queue.js';
 import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
-import { loadState } from './identity.js';
+import { loadState, stateDir, statePath } from './identity.js';
 import { enroll, isRelayRunning, relayStatus, startRelay } from './relay.js';
 import { sampleLabel, sampleReceipt } from './samples.js';
 import { pairingSnapshot, restartPairing } from './pairing.js';
@@ -120,6 +142,21 @@ function withCors(res: ServerResponse): void {
   // Chrome's Private Network Access preflight: a page on a public origin reaching a private
   // address needs this or the request is blocked before it arrives.
   res.setHeader('Access-Control-Allow-Private-Network', 'true');
+}
+
+/**
+ * Take the CORS grant back off, for the one family that must not have it.
+ *
+ * `withCors` runs first for every request — before the target is even parsed, so a malformed one
+ * still gets a usable answer — and this undoes it once the path is known. A cross-origin `fetch`
+ * at `/service/*` then fails its preflight, and the request that would reboot a till never
+ * leaves the attacking page.
+ */
+function withoutCors(res: ServerResponse): void {
+  res.removeHeader('Access-Control-Allow-Origin');
+  res.removeHeader('Access-Control-Allow-Methods');
+  res.removeHeader('Access-Control-Allow-Headers');
+  res.removeHeader('Access-Control-Allow-Private-Network');
 }
 
 /**
@@ -625,6 +662,88 @@ function handlePutPrinters(res: ServerResponse, body: unknown): void {
   sendJson(res, 200, { ok: true, ...registry });
 }
 
+/* ------------------------------------------------------------------ maintenance */
+
+/**
+ * Everything the maintenance card needs, plus a confirmation it can spend on one action.
+ *
+ * The token is minted on every read rather than on demand because the page fetches this
+ * immediately before it submits — that ordering, not a longer lifetime, is what keeps a
+ * confirmation fresh. Several stay live at once so the ten-second poll cannot invalidate the one
+ * an operator is about to use.
+ */
+async function handleServiceReport(res: ServerResponse): Promise<void> {
+  const report = await serviceReport();
+  sendJson(res, 200, {
+    ok: true,
+    service: report,
+    // The page compares this against a later /health to tell "our bridge came back" from
+    // "something else is answering on the port". See svcWaitForNewPid in page-service.ts.
+    pid: process.pid,
+    reboot: rebootPending(),
+    busy: currentAction(),
+    default_reboot_delay_s: DEFAULT_REBOOT_DELAY_SECONDS,
+    ...issueConfirmToken(),
+  });
+}
+
+/**
+ * What "clear cache" would actually remove, itemised.
+ *
+ * Shown before anything is pressed because one of the four items — the dedup ring — can cause a
+ * second bill to print, and a single button labelled "clear cache" cannot say that.
+ */
+function handleServiceCache(res: ServerResponse): void {
+  const cache = queue().cacheSizes();
+  const logs = logFileInfo();
+  sendJson(res, 200, {
+    ok: true,
+    cache: { ...cache, logs: { count: logs.files.length, bytes: logs.bytes, path: logs.path } },
+    state_dir: stateDir(),
+    // Named so the panel can promise, in one line, exactly what it will not touch.
+    never_touched: [registryPath(), statePath()],
+  });
+}
+
+/**
+ * One shape for every mutating action: spend the confirmation, take the lock, run, answer.
+ *
+ * The lock is released in a `finally` even for restart and uninstall, where the process is on its
+ * way out anyway — an action that failed before scheduling anything must not leave the card
+ * permanently reporting "busy".
+ */
+async function runServiceAction(
+  res: ServerResponse,
+  name: string,
+  body: Record<string, unknown>,
+  run: () => Promise<ActionOutcome> | ActionOutcome,
+  successStatus = 202
+): Promise<void> {
+  if (!consumeConfirmToken(body.confirm)) {
+    sendJson(res, 403, { ok: false, reason: 'confirm-required' });
+    return;
+  }
+  if (!beginAction(name)) {
+    sendJson(res, 409, { ok: false, reason: 'busy', busy: currentAction() });
+    return;
+  }
+  try {
+    const outcome = await run();
+    log.warn(`service: ${name} ${outcome.ok ? 'accepted' : 'refused'}`, {
+      event: `service.${name}.result`, ok: outcome.ok, reason: outcome.reason,
+    });
+    sendJson(res, outcome.ok ? successStatus : 409, outcome);
+  } finally {
+    endAction();
+  }
+}
+
+const UNINSTALL_SCOPES: UninstallScope[] = ['autostart', 'files', 'everything'];
+
+function uninstallScope(value: unknown): UninstallScope | null {
+  return UNINSTALL_SCOPES.includes(value as UninstallScope) ? (value as UninstallScope) : null;
+}
+
 /* ------------------------------------------------------------------------------ the server */
 
 export function createBridgeServer(): Server {
@@ -686,6 +805,39 @@ export function createBridgeServer(): Server {
     if ((path === '/enroll' || isPairingPath) && method !== 'OPTIONS' && !isLoopbackRequest(req)) {
       sendJson(res, 403, { ok: false, reason: 'not-loopback' });
       return;
+    }
+
+    /*
+     * `/service/*` — restart, autostart, uninstall, reboot, clear cache.
+     *
+     * Gated BEFORE the token check so a cross-origin attempt is answered 403 rather than 401:
+     * the two mean different things to the page, and only one of them is worth asking an
+     * operator for a token about.
+     *
+     * `/service` is deliberately NOT in `openToAnyone` above. Where a bridge is configured with
+     * PRINT_BRIDGE_TOKEN, this family needs it like every other guarded route — the gate here is
+     * additional to that, never instead of it.
+     */
+    const isServicePath = path === '/service' || path.startsWith('/service/');
+    if (isServicePath) {
+      withoutCors(res);
+      if (method === 'OPTIONS') {
+        // Our own page is same-origin and never preflights. Anything that does is by definition
+        // another origin asking permission to reboot this computer.
+        sendJson(res, 403, { ok: false, reason: 'preflight-refused' });
+        return;
+      }
+      const failure = gateServiceRequest(req, {
+        loopback: isLoopbackRequest(req),
+        mutating: method !== 'GET' && method !== 'HEAD',
+      });
+      if (failure) {
+        log.warn(`service: refused ${method} ${path} (${failure.reason})`, {
+          event: 'service.refused', reason: failure.reason, remote: req.socket.remoteAddress,
+        });
+        sendJson(res, failure.status, { ok: false, reason: failure.reason });
+        return;
+      }
     }
     if (!openToAnyone && method !== 'OPTIONS' && !isAuthorized(req)) {
       sendJson(res, 401, { ok: false, reason: 'unauthorized' });
@@ -811,6 +963,16 @@ export function createBridgeServer(): Server {
       return;
     }
 
+    if (method === 'GET' && path === '/service') {
+      runRoute(res, () => handleServiceReport(res));
+      return;
+    }
+
+    if (method === 'GET' && path === '/service/cache') {
+      handleServiceCache(res);
+      return;
+    }
+
     if (method === 'GET' && path === '/printers') {
       sendJson(res, 200, { ok: true, ...loadRegistry() });
       return;
@@ -902,6 +1064,75 @@ export function createBridgeServer(): Server {
           ok: cancelled,
           reason: cancelled ? undefined : 'already-printing-or-finished',
         });
+        return;
+      }
+
+      if (method === 'POST' && path === '/service/restart') {
+        await runServiceAction(res, 'restart', record, async () => restartService(await serviceReport()));
+        return;
+      }
+
+      if (method === 'POST' && path === '/service/autostart') {
+        await runServiceAction(res, 'autostart', record, async () => registerAutostart(await serviceReport()));
+        return;
+      }
+
+      if (method === 'POST' && path === '/service/uninstall') {
+        const scope = uninstallScope(record.scope);
+        if (!scope) {
+          sendJson(res, 400, { ok: false, reason: 'invalid-scope', allowed: UNINSTALL_SCOPES });
+          return;
+        }
+        await runServiceAction(res, 'uninstall', record, async () =>
+          uninstallService(await serviceReport(), scope)
+        );
+        return;
+      }
+
+      if (method === 'POST' && path === '/service/reboot') {
+        const delay =
+          typeof record.delay_s === 'number' && Number.isFinite(record.delay_s)
+            ? record.delay_s
+            : DEFAULT_REBOOT_DELAY_SECONDS;
+        await runServiceAction(res, 'reboot', record, async () =>
+          scheduleReboot(await serviceReport(), delay, record.force === true)
+        );
+        return;
+      }
+
+      /*
+       * Cancel is exempt from nothing except the reboot's own "already scheduled" conflict — it
+       * must stay reachable while a reboot is pending, which is the only moment it means
+       * anything.
+       */
+      if (method === 'POST' && path === '/service/reboot/cancel') {
+        await runServiceAction(
+          res,
+          'reboot-cancel',
+          record,
+          () => (cancelReboot() ? { ok: true } : { ok: false, reason: 'nothing-scheduled' }),
+          200
+        );
+        return;
+      }
+
+      if (method === 'POST' && path === '/service/cache') {
+        const items = Array.isArray(record.items) ? record.items.map(String) : [];
+        await runServiceAction(
+          res,
+          'clear-cache',
+          record,
+          () => {
+            const purged = queue().purge({
+              spool: items.includes('spool'),
+              history: items.includes('history'),
+              settled: items.includes('settled'),
+            });
+            const logs = items.includes('logs') ? clearLogs() : { cleared: [], bytes: 0 };
+            return { ok: true, purged, logs };
+          },
+          200
+        );
         return;
       }
 
