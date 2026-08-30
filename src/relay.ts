@@ -80,7 +80,7 @@ type Work =
     }
   | { type: 'scan'; command_id: string; port: number };
 
-function relayUrl(state: RelayState): string {
+export function relayUrl(state: RelayState): string {
   const configured = process.env.PRINT_BRIDGE_RELAY_URL?.trim() || state.relay_url;
   return (configured || DEFAULT_RELAY_URL).replace(/\/+$/, '');
 }
@@ -502,8 +502,11 @@ export function startRelay(): void {
 
   const state = loadState();
   if (!state.token || !state.bridge_id) {
+    // Describes the CURRENT flow, not the one that was replaced. This line used to send an
+    // operator to type a code they had to fetch from a tablet; the code now appears on this
+    // machine's own screen and the tablet scans it.
     log.info(
-      'print bridge is not enrolled — open http://localhost:9200 and paste a pairing code from Settings > Printing',
+      'print bridge is not paired yet — open http://localhost:9200 on this computer and scan the code with your Hankha tablet',
       { event: 'relay.not_enrolled' }
     );
     return;
@@ -547,9 +550,13 @@ export function startRelay(): void {
           if (outcome === 'revoked') {
             status.connected = false;
             status.last_error = 'token rejected — re-enrollment required';
-            log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
-              event: 'relay.token_rejected',
-            });
+            // Names the route that actually exists. The CLI this used to point at is not on
+            // PATH under either installer, so following it produced "command not found" —
+            // which is what the on-screen pairing flow replaced.
+            log.error(
+              'relay: token rejected. Open http://localhost:9200 on this computer and press Get a new code',
+              { event: 'relay.token_rejected' }
+            );
             return;
           }
           if (outcome === 'served') {
@@ -594,9 +601,13 @@ export function startRelay(): void {
             // human with a fresh enrollment code can fix this.
             status.connected = false;
             status.last_error = 'token rejected — re-enrollment required';
-            log.error('relay: token rejected. Re-enroll with `hankha-print-bridge --enroll <code>`', {
-              event: 'relay.token_rejected',
-            });
+            // Names the route that actually exists. The CLI this used to point at is not on
+            // PATH under either installer, so following it produced "command not found" —
+            // which is what the on-screen pairing flow replaced.
+            log.error(
+              'relay: token rejected. Open http://localhost:9200 on this computer and press Get a new code',
+              { event: 'relay.token_rejected' }
+            );
             return;
           }
 

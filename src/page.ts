@@ -413,6 +413,58 @@ noscript .banner { display: block; }
   * { transition: none !important; animation: none !important; }
   .btn:active { transform: none; }
 }
+
+/*
+ * The hidden attribute loses to any explicit display.
+ *
+ * #report is .grid { display: grid }, so hiding it for the pairing screen did nothing at all:
+ * the seven diagnostic cards kept their place in the layout and an operator who scrolled found
+ * the whole technician view sitting under the QR code. !important is right here — the attribute
+ * is meant to be the last word on visibility, and every other hidden on this page was relying
+ * on the same assumption.
+ */
+[hidden] { display: none !important; }
+
+/* ── Pairing screen ────────────────────────────────────────────────────────
+   The whole viewport when this bridge has nobody to print for. Everything else on the page is
+   diagnostics for a technician; this is the one screen a shop owner is ever meant to read, so
+   it gets the space and the type size, and the seven cards move behind Details. */
+.pairscreen{
+  min-height:min(72vh,640px);display:flex;flex-direction:column;align-items:center;
+  justify-content:center;text-align:center;gap:18px;padding:32px 16px;
+}
+.ps-lead{font-size:22px;font-weight:800;letter-spacing:-.02em;line-height:1.3;max-width:22ch}
+.ps-sub{font-size:14px;color:var(--muted);max-width:40ch;line-height:1.55}
+.ps-qr{background:#fff;padding:14px;border-radius:14px;box-shadow:0 8px 28px rgba(0,0,0,.18);line-height:0}
+.ps-qr svg{display:block;width:min(280px,62vw);height:auto}
+.ps-codewrap{display:flex;flex-direction:column;align-items:center;gap:6px}
+.ps-codelabel{
+  font-size:11px;font-weight:800;letter-spacing:.11em;text-transform:uppercase;color:var(--muted);
+}
+.ps-code{
+  font-family:var(--mono);font-size:clamp(26px,6vw,38px);font-weight:700;letter-spacing:.16em;
+}
+.ps-meta{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.ps-icon{
+  width:64px;height:64px;border-radius:999px;display:grid;place-items:center;font-size:30px;
+}
+.ps-icon.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+.ps-icon.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+.ps-icon.warn{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}
+.ps-langs{display:flex;gap:4px;flex-wrap:wrap;justify-content:center;margin-top:4px}
+.ps-langs button{
+  appearance:none;border:0;background:transparent;font:inherit;font-size:12px;font-weight:700;
+  color:var(--muted);padding:4px 9px;border-radius:8px;cursor:pointer;
+}
+.ps-langs button[aria-pressed=true]{background:var(--accent-soft);color:var(--accent)}
+.ps-details{
+  appearance:none;border:0;background:transparent;font:inherit;font-size:13px;color:var(--muted);
+  text-decoration:underline;cursor:pointer;padding:8px;
+}
+@media (prefers-reduced-motion:no-preference){
+  .ps-dot{animation:pairpulse 1.6s ease-in-out infinite}
+}
+@keyframes pairpulse{0%,100%{opacity:1}50%{opacity:.35}}
 `;
 
 /*
@@ -427,6 +479,7 @@ noscript .banner { display: block; }
  *    five-second cache lapses, and a page left open on a till overnight would otherwise keep a
  *    permanent trickle of connects running against the venue's network for nobody to look at.
  */
+
 const SCRIPT = `
 (function () {
   'use strict';
@@ -1638,6 +1691,288 @@ const SCRIPT = `
     startPolling();
   });
 
+  /* ------------------------------------------------- pairing screen */
+
+  /*
+   * The one screen on this page written for a shop owner rather than a technician.
+   *
+   * Everything above is diagnostics. This takes the whole viewport whenever the bridge has
+   * nobody to print for, because in that state the diagnostics answer a question nobody asked:
+   * the only useful thing to say is "scan this". The seven cards move behind Details.
+   *
+   * Translated, unlike the rest of the page, and that is the point — this is the screen a
+   * Lao-speaking member of staff is sent to, and it was English-only.
+   */
+
+  var PS_LANGS = ['en', 'lo', 'th', 'zh', 'vi'];
+  var PS_LANG_NAMES = { en: 'English', lo: 'ລາວ', th: 'ไทย', zh: '中文', vi: 'Tiếng Việt' };
+  var PS_LANG_KEY = 'hankha-bridge-lang';
+
+  /* Order matches SUPPORTED_LANGS in the POS, so the two stay comparable by eye. */
+  var PS_T = {
+    waitLead: [
+      'Scan this with your Hankha tablet or phone',
+      'ສະແກນອັນນີ້ດ້ວຍແທັບເລັດ ຫຼື ໂທລະສັບ Hankha',
+      'สแกนรหัสนี้ด้วยแท็บเล็ตหรือมือถือ Hankha',
+      '用你的 Hankha 平板或手机扫描',
+      'Quét mã này bằng máy tính bảng hoặc điện thoại Hankha'
+    ],
+    waitSub: [
+      'Open the Hankha app, then go to Settings, Printing, Connect.',
+      'ເປີດແອັບ Hankha, ໄປທີ່ ຕັ້ງຄ່າ, ການພິມ, ເຊື່ອມຕໍ່.',
+      'เปิดแอป Hankha ไปที่ ตั้งค่า การพิมพ์ เชื่อมต่อ',
+      '打开 Hankha 应用，进入 设置、打印、连接。',
+      'Mở ứng dụng Hankha, vào Cài đặt, In ấn, Kết nối.'
+    ],
+    orType: ['or type this code', 'ຫຼື ພິມລະຫັດນີ້', 'หรือพิมพ์รหัสนี้', '或输入此代码', 'hoặc nhập mã này'],
+    waiting: ['Waiting', 'ກຳລັງລໍຖ້າ', 'กำลังรอ', '等待中', 'Đang chờ'],
+    requesting: [
+      'Getting a code',
+      'ກຳລັງຂໍລະຫັດ',
+      'กำลังขอรหัส',
+      '正在获取代码',
+      'Đang lấy mã'
+    ],
+    connectingLead: ['Connecting to', 'ກຳລັງເຊື່ອມຕໍ່ຫາ', 'กำลังเชื่อมต่อกับ', '正在连接到', 'Đang kết nối tới'],
+    connectingSub: [
+      'Almost done. Do not close this window.',
+      'ເກືອບແລ້ວ. ຢ່າປິດປ່ອງຢ້ຽມນີ້.',
+      'ใกล้เสร็จแล้ว อย่าปิดหน้าต่างนี้',
+      '就快好了。请不要关闭此窗口。',
+      'Sắp xong. Đừng đóng cửa sổ này.'
+    ],
+    okLead: ['Connected', 'ເຊື່ອມຕໍ່ແລ້ວ', 'เชื่อมต่อแล้ว', '已连接', 'Đã kết nối'],
+    okSub: [
+      'Bills sent from your tablets will print here.',
+      'ໃບບິນທີ່ສົ່ງຈາກແທັບເລັດຈະພິມອອກຢູ່ນີ້.',
+      'ใบเสร็จที่ส่งจากแท็บเล็ตจะพิมพ์ที่นี่',
+      '从平板发送的账单将在这里打印。',
+      'Hóa đơn gửi từ máy tính bảng sẽ in ở đây.'
+    ],
+    removedLead: [
+      'This computer was disconnected',
+      'ຄອມພິວເຕີເຄື່ອງນີ້ຖືກຕັດການເຊື່ອມຕໍ່',
+      'คอมพิวเตอร์เครื่องนี้ถูกตัดการเชื่อมต่อ',
+      '这台电脑已被断开',
+      'Máy tính này đã bị ngắt kết nối'
+    ],
+    removedSub: [
+      'Someone removed it from your shop. Get a new code and connect it again.',
+      'ມີຄົນລຶບມັນອອກຈາກຮ້ານຂອງທ່ານ. ຂໍລະຫັດໃໝ່ ແລ້ວເຊື່ອມຕໍ່ອີກຄັ້ງ.',
+      'มีคนลบออกจากร้านของคุณ ขอรหัสใหม่แล้วเชื่อมต่ออีกครั้ง',
+      '有人把它从你的门店中移除了。获取新代码后重新连接。',
+      'Ai đó đã xóa nó khỏi cửa hàng của bạn. Lấy mã mới và kết nối lại.'
+    ],
+    removedBtn: ['Get a new code', 'ຂໍລະຫັດໃໝ່', 'ขอรหัสใหม่', '获取新代码', 'Lấy mã mới'],
+    offlineLead: [
+      'Cannot reach Hankha right now',
+      'ຕິດຕໍ່ Hankha ບໍ່ໄດ້ໃນຕອນນີ້',
+      'ติดต่อ Hankha ไม่ได้ตอนนี้',
+      '目前无法连接 Hankha',
+      'Hiện không kết nối được Hankha'
+    ],
+    offlineSub: [
+      'Retrying. Printing will start again by itself, there is nothing to do.',
+      'ກຳລັງລອງໃໝ່. ການພິມຈະກັບມາເອງ, ບໍ່ຕ້ອງເຮັດຫຍັງ.',
+      'กำลังลองใหม่ การพิมพ์จะกลับมาเอง ไม่ต้องทำอะไร',
+      '正在重试。打印会自行恢复，无需操作。',
+      'Đang thử lại. Việc in sẽ tự khôi phục, không cần làm gì.'
+    ],
+    details: ['Details', 'ລາຍລະອຽດ', 'รายละเอียด', '详细信息', 'Chi tiết'],
+    hideDetails: ['Hide details', 'ເຊື່ອງລາຍລະອຽດ', 'ซ่อนรายละเอียด', '隐藏详细信息', 'Ẩn chi tiết']
+  };
+
+  var psLang = 'en';
+  var psShowDetails = false;
+  /* Null until the first /pairing answer. Kept so a language switch can redraw without refetching. */
+  var psState = null;
+
+  function psIndex() {
+    var at = PS_LANGS.indexOf(psLang);
+    return at < 0 ? 0 : at;
+  }
+
+  /* Falls back to English rather than rendering undefined, exactly as i18next does in the POS. */
+  function psText(key) {
+    var row = PS_T[key];
+    if (!row) return '';
+    return row[psIndex()] || row[0];
+  }
+
+  function psReadLang() {
+    try {
+      var stored = window.localStorage.getItem(PS_LANG_KEY);
+      if (stored && PS_LANGS.indexOf(stored) !== -1) return stored;
+    } catch (err) { /* private mode: fall through to the browser's own preference */ }
+    /* The browser already knows what the person reads. Honour it before defaulting. */
+    var nav = (navigator.language || 'en').slice(0, 2).toLowerCase();
+    return PS_LANGS.indexOf(nav) !== -1 ? nav : 'en';
+  }
+
+  function psWriteLang(value) {
+    try { window.localStorage.setItem(PS_LANG_KEY, value); } catch (err) { /* not worth failing over */ }
+  }
+
+  function psBuildLangs() {
+    var host = $('ps-langs');
+    host.textContent = '';
+    PS_LANGS.forEach(function (code) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = PS_LANG_NAMES[code];
+      button.setAttribute('aria-pressed', String(code === psLang));
+      button.addEventListener('click', function () {
+        psLang = code;
+        psWriteLang(code);
+        psBuildLangs();
+        psRender();
+      });
+      host.appendChild(button);
+    });
+  }
+
+  /*
+   * Which of the five screens to show.
+   *
+   * The distinction that matters is the last two: a bridge whose token the SERVER rejected will
+   * never recover by waiting and needs a person, while one that simply cannot reach the network
+   * recovers on its own and must not be offered a button that throws a working station away.
+   * The pairing phase tells them apart properly, instead of the old page's regex over last_error.
+   */
+  function psScreen(state) {
+    if (!state) return 'hidden';
+    if (state.phase === 'paired') return 'ok';
+    if (state.phase === 'redeeming') return 'connecting';
+    if (state.phase === 'waiting' || state.phase === 'requesting') {
+      return state.has_credential ? 'removed-repairing' : 'waiting';
+    }
+    if (state.phase === 'offline') return 'offline';
+    /* Idle with a credential is the ordinary healthy bridge: nothing to pair, show diagnostics. */
+    if (state.has_credential) {
+      return state.relay && state.relay.connected ? 'hidden' : 'removed';
+    }
+    return 'waiting';
+  }
+
+  function psShow(id, on) {
+    $(id).hidden = !on;
+  }
+
+  function psRender() {
+    var state = psState;
+    var screen = psScreen(state);
+
+    /* Details is a manual override: once someone opens the diagnostics, keep them open. */
+    var showPairing = screen !== 'hidden' && !psShowDetails;
+    $('pairscreen').hidden = !showPairing;
+    $('report').hidden = showPairing;
+    $('ps-details').textContent = psShowDetails ? psText('hideDetails') : psText('details');
+    if (screen === 'hidden') return;
+
+    var icon = $('ps-icon');
+    var lead = $('ps-lead');
+    var sub = $('ps-sub');
+    var action = $('ps-action');
+
+    psShow('ps-qr', false);
+    psShow('ps-codewrap', false);
+    psShow('ps-meta', false);
+    psShow('ps-action', false);
+    psShow('ps-icon', false);
+    icon.className = 'ps-icon';
+
+    var who = [state.org_name, state.branch_name].filter(Boolean).join(' \u00b7 ');
+
+    if (screen === 'waiting' || screen === 'removed-repairing') {
+      lead.textContent = psText('waitLead');
+      sub.textContent = psText('waitSub');
+      if (state.qr_svg) {
+        $('ps-qr').innerHTML = state.qr_svg;
+        psShow('ps-qr', true);
+      }
+      if (state.code) {
+        $('ps-codelabel').textContent = psText('orType');
+        $('ps-code').textContent = state.code;
+        psShow('ps-codewrap', true);
+      }
+      $('ps-metatext').textContent =
+        state.phase === 'requesting' ? psText('requesting') : psText('waiting');
+      psShow('ps-meta', true);
+      return;
+    }
+
+    if (screen === 'connecting') {
+      icon.textContent = '\u2b1c';
+      icon.className = 'ps-icon warn';
+      psShow('ps-icon', true);
+      lead.textContent = who ? psText('connectingLead') + ' ' + who : psText('connectingLead');
+      sub.textContent = psText('connectingSub');
+      return;
+    }
+
+    if (screen === 'ok') {
+      icon.textContent = '\u2713';
+      icon.className = 'ps-icon ok';
+      psShow('ps-icon', true);
+      lead.textContent = psText('okLead');
+      sub.textContent = who ? who + ' \u2014 ' + psText('okSub') : psText('okSub');
+      return;
+    }
+
+    if (screen === 'offline') {
+      icon.textContent = '\u26a0';
+      icon.className = 'ps-icon warn';
+      psShow('ps-icon', true);
+      lead.textContent = psText('offlineLead');
+      sub.textContent = psText('offlineSub');
+      return;
+    }
+
+    /* removed */
+    icon.textContent = '\u26a0';
+    icon.className = 'ps-icon bad';
+    psShow('ps-icon', true);
+    lead.textContent = psText('removedLead');
+    sub.textContent = psText('removedSub');
+    action.textContent = psText('removedBtn');
+    psShow('ps-action', true);
+  }
+
+  /*
+   * Loopback-only, like the route it calls. A 403 here means the page is being viewed from
+   * another machine, which is exactly when the pairing screen must NOT appear: the code on it
+   * would let whoever is looking claim this computer into their own organisation.
+   */
+  function psRefresh() {
+    return get('/pairing').then(function (res) {
+      psState = res.status === 200 && res.body && res.body.ok ? res.body : null;
+      psRender();
+    }).catch(function () {
+      /* Leave the last known state up. The bridge being briefly unreachable from its own
+         browser says nothing about whether it is paired. */
+    });
+  }
+
+  $('ps-details').addEventListener('click', function () {
+    psShowDetails = !psShowDetails;
+    psRender();
+  });
+
+  $('ps-action').addEventListener('click', function () {
+    var button = $('ps-action');
+    button.disabled = true;
+    post('/pairing/restart', {}).then(function () {
+      return psRefresh();
+    }).finally(function () {
+      button.disabled = false;
+    });
+  });
+
+  psLang = psReadLang();
+  psBuildLangs();
+  psRefresh();
+  setInterval(psRefresh, 3000);
+
   refresh(false);
   startPolling();
 })();
@@ -1705,6 +2040,33 @@ export const INDEX_HTML = `<!doctype html>
   </noscript>
 
   <div id="banners" role="alert" aria-live="assertive"></div>
+
+  <!--
+    The pairing screen. Shown INSTEAD of the diagnostics whenever this bridge has nobody to
+    print for, which is the only state a shop owner is ever meant to read. Everything is written
+    by psRender(); the markup is a shell so there is no English baked into the document for a
+    Lao till to fall back to.
+
+    ⚠ Every id here is prefixed ps-. The Cloud relay card further down already owns
+    pair-code, pair-lead and friends, and a duplicate id would have this screen quietly stealing
+    the manual-entry input's element out from under it.
+
+    ⚠ No backticks anywhere in this literal, including in comments. See the file header.
+  -->
+  <section class="pairscreen" id="pairscreen" hidden>
+    <div class="ps-icon" id="ps-icon" hidden></div>
+    <h2 class="ps-lead" id="ps-lead"></h2>
+    <div class="ps-qr" id="ps-qr" hidden></div>
+    <div class="ps-codewrap" id="ps-codewrap" hidden>
+      <span class="ps-codelabel" id="ps-codelabel"></span>
+      <span class="ps-code" id="ps-code"></span>
+    </div>
+    <p class="ps-sub" id="ps-sub"></p>
+    <p class="ps-meta" id="ps-meta" hidden><span class="dot dot-warn ps-dot"></span><span id="ps-metatext"></span></p>
+    <button type="button" class="btn" id="ps-action" hidden></button>
+    <div class="ps-langs" id="ps-langs"></div>
+    <button type="button" class="ps-details" id="ps-details"></button>
+  </section>
 
   <section class="gate" id="gate" hidden>
     <h2>This bridge needs a token</h2>

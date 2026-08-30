@@ -3,6 +3,7 @@ import { discoverAll } from './discovery.js';
 import { ENROLL_CODE_HINT, isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { log } from './log.js';
 import { enroll, startRelay } from './relay.js';
+import { startPairing } from './pairing.js';
 import { queue } from './queue.js';
 import { findPrinter, loadRegistry, registryPath } from './registry.js';
 import { render } from './render/index.js';
@@ -266,8 +267,14 @@ function runService(): void {
 
   // The outbound half: dial the cloud API and wait for jobs, so a phone or a till on mobile data
   // can print through this bridge without reaching the LAN itself. A no-op (with one log line)
-  // until someone runs `--enroll`, so an existing LAN-only install is unaffected.
+  // until this bridge holds a credential, so an existing LAN-only install is unaffected.
   startRelay();
+
+  // The other outbound half, and the only one a brand-new install exercises: announce this
+  // machine to the API and put a code on screen for a tablet to scan. Returns immediately when
+  // a credential already exists, so the two are safe to call unconditionally and in this order
+  // — `startRelay` gets first refusal on an already-paired bridge.
+  startPairing();
 
   /*
    * Survive an unexpected throw instead of vanishing.

@@ -58,11 +58,27 @@ VIAddVersionKey "LegalCopyright"  "${PUBLISHER}"
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+; The finish page is where pairing starts, so it opens the PAIRING SCREEN by default.
+;
+; It used to link to /health -- raw JSON -- and nothing anywhere told an operator that a page
+; existed at all: the address appeared only in a log line. Someone finishing this installer was
+; expected to know to type http://127.0.0.1:9200 from memory. Now the browser opens on the code
+; they are about to scan, and the run box is ticked by default so the common path is zero clicks.
 !define MUI_FINISHPAGE_TITLE "The Print Bridge is running"
-!define MUI_FINISHPAGE_TEXT "Open the POS terminal on this computer and go to Settings > Printing. The Print Bridge card should read $\"Print Bridge is running$\" -- then press Search to find your printers."
-!define MUI_FINISHPAGE_LINK "Check the bridge in a browser"
-!define MUI_FINISHPAGE_LINK_LOCATION "http://127.0.0.1:${PORT}/health"
+!define MUI_FINISHPAGE_TEXT "This computer will now show a code. Scan that code with the Hankha app on your tablet or phone to connect this computer to your shop."
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_FUNCTION OpenPairingPage
+!define MUI_FINISHPAGE_RUN_TEXT "Show the pairing code now"
+!define MUI_FINISHPAGE_LINK "Open the pairing page in a browser"
+!define MUI_FINISHPAGE_LINK_LOCATION "http://127.0.0.1:${PORT}/"
 !insertmacro MUI_PAGE_FINISH
+
+; MUI_FINISHPAGE_RUN normally launches an executable; a function is used instead so the default
+; browser opens the URL rather than the bridge binary being started a second time alongside the
+; scheduled task that is already running it.
+Function OpenPairingPage
+  ExecShell "open" "http://127.0.0.1:${PORT}/"
+FunctionEnd
 
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
@@ -120,6 +136,12 @@ Section "Print Bridge (required)" SecCore
   ; A link straight to /health would show raw JSON to someone whose question is "is the
   ; printer thing working?". status.ps1 answers that in a sentence.
   CreateDirectory "$SMPROGRAMS\Hankha"
+  ; The pairing screen, first in the folder: it is what an operator needs when printing stops or
+  ; when the computer has to be connected to a different shop. The status shortcut below is for
+  ; whoever is diagnosing, which is a rarer and more technical errand.
+  CreateShortcut "$SMPROGRAMS\Hankha\Print Bridge.lnk" \
+    "$SYSDIR\rundll32.exe" "url.dll,FileProtocolHandler http://127.0.0.1:${PORT}/" \
+    "$INSTDIR\hankha-print-bridge.exe" 0
   CreateShortcut "$SMPROGRAMS\Hankha\Print Bridge status.lnk" \
     "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$INSTDIR\status.ps1"' \
