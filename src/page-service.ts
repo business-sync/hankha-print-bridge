@@ -467,6 +467,9 @@ export const SERVICE_SCRIPT = `
         return;
       }
       get('/health', 4000).then(function (res) {
+        /* Cancelled while this request was on the wire — the operator navigated, or a stage
+           moved on. Reading .pid off a null watch here would throw inside a promise. */
+        if (!svcWatch) return;
         var pid = res.body && res.body.pid;
         if (res.status === 200 && pid && pid !== svcWatch.pid) {
           svcWatch = null;

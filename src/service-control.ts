@@ -112,7 +112,7 @@ function siteAllowed(req: IncomingMessage): boolean {
  */
 export function gateServiceRequest(
   req: IncomingMessage,
-  options: { loopback: boolean; mutating: boolean }
+  options: { loopback: boolean }
 ): GateFailure | null {
   if (!serviceControlEnabled()) return { status: 404, reason: 'not-found' };
   if (!options.loopback) return { status: 403, reason: 'not-loopback' };

@@ -1,7 +1,20 @@
 # The "This computer" page — restart, install, uninstall, reboot, clear cache
 
-Design for a maintenance surface on the bridge's own page at `http://localhost:9200`.
-Nothing here is built yet.
+Design for the maintenance surface on the bridge's own page at `http://localhost:9200`.
+
+> **Shipped in 1.10.0**, all four phases. This document is kept as the reasoning behind it — why
+> the family has its own gate, why restart is refused on an unsupervised bridge, why macOS
+> uninstalls in-process while Windows needs a detached helper. The code is `src/service.ts`,
+> `src/service-actions.ts`, `src/service-control.ts` and `src/page-service.ts`; the operator-facing
+> version is in the README under *The "This computer" card*.
+>
+> Two things changed during the build, both noted in place below: the confirm token is a small
+> set rather than a single slot (a single one raced the page's own poll), and "install" hands the
+> port over by stopping itself after bootstrapping, because a second copy cannot bind 9200 while
+> the first still holds it.
+>
+> The four open decisions in §11 were resolved as: local-only with a transport-agnostic action
+> layer, reboot ships, "unpair" stays off the card, and the card is in all five languages.
 
 ## 1. Why
 
@@ -187,8 +200,12 @@ timeout: name the log file and stop pretending.
 - `autostart === true` → state the fact, offer nothing. Show manager, label, install dir, log path.
 - `autostart === false`:
   - **macOS, not root, bundle not under `/Volumes`** → write `~/Library/LaunchAgents/…plist`,
-    `launchctl enable` + `bootstrap gui/$uid`, verify by pid-match. Byte-for-byte what
+    `launchctl enable` + `bootstrap gui/$uid`. Byte-for-byte what
     `installer/macos/app/HankhaPrintBridge` already does.
+    *As built, this ends by stopping ourselves.* Bootstrapping an agent that points at our own
+    binary starts a second copy while we still hold port 9200, and it dies on EADDRINUSE;
+    KeepAlive plus a 10 s ThrottleInterval turns that into a retry loop, so we hand the port over
+    and the next attempt binds. The page waits for a new pid exactly as it does for a restart.
   - **macOS as root, no daemon plist** → write `/Library/LaunchDaemons/…`, `chown root:wheel`,
     `chmod 644`, bootstrap system. The ownership is not hygiene: launchd's refusal of a
     wrongly-owned plist is **silent**, which is why `postinstall` re-stamps it.

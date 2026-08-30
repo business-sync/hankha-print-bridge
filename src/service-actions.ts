@@ -22,7 +22,6 @@ import { spawn } from 'node:child_process';
 import { chmodSync, chownSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
-import { stateDir } from './identity.js';
 import { canStop, requestStop } from './lifecycle.js';
 import { log } from './log.js';
 import { queue } from './queue.js';
@@ -43,7 +42,7 @@ import { runCommand } from './transports/exec.js';
 const STOP_DELAY_MS = 1500;
 /** How long a launchd handover waits before we release the port to the new copy. */
 const HANDOVER_DELAY_MS = 2500;
-const DEFAULT_REBOOT_DELAY_S = 60;
+export const DEFAULT_REBOOT_DELAY_SECONDS = 60;
 const MAX_REBOOT_DELAY_S = 600;
 
 export type UninstallScope = 'autostart' | 'files' | 'everything';
@@ -530,8 +529,6 @@ export function scheduleReboot(
   return { ok: true, rebooting_at: new Date(at).toISOString(), in_s: delay, pending };
 }
 
-export const DEFAULT_REBOOT_DELAY_SECONDS = DEFAULT_REBOOT_DELAY_S;
-
 /** The one command per platform, chosen by who we are rather than by what is installed. */
 export function rebootCommand(report: ServiceReport): { file: string; args: string[] } | null {
   if (platform() === 'win32') {
@@ -608,11 +605,4 @@ export function clearLogs(): { cleared: string[]; bytes: number } {
     }
   }
   return { cleared, bytes: info.bytes };
-}
-
-/* ------------------------------------------------------------------ cache dir */
-
-/** Where the log file lives, for the cache panel. Separated so a test can point it elsewhere. */
-export function stateDirectory(): string {
-  return stateDir();
 }
