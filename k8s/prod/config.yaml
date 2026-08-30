@@ -8,7 +8,7 @@ data:
   # ⚠ Nothing updates this automatically. CI rewrites the image tag in `deployment.yaml` and
   # never touches this file, so a release that forgets it leaves the pod truthfully reporting a
   # version it is not running — and the POS gates document rendering on exactly that string.
-  APP_VERSION: 1.8.0
+  APP_VERSION: 1.9.0
   PRINT_BRIDGE_PORT: '9200'
   PRINT_BRIDGE_HOST: "0.0.0.0"
   HANKHA_MACOS_SIGN_IDENTITY: ""
