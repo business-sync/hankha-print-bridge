@@ -49,6 +49,7 @@
  * submits it; if its JS handler ever failed to run, the browser's default would put the venue's
  * printer token in a URL query string. This makes that navigation impossible rather than unlikely.
  */
+import { I18N_CSS, I18N_SCRIPT } from './page-i18n.js';
 import { SERVICE_CSS, SERVICE_HTML, SERVICE_SCRIPT } from './page-service.js';
 
 export const INDEX_CSP =
@@ -467,6 +468,7 @@ noscript .banner { display: block; }
   .ps-dot{animation:pairpulse 1.6s ease-in-out infinite}
 }
 @keyframes pairpulse{0%,100%{opacity:1}50%{opacity:.35}}
+${I18N_CSS}
 ${SERVICE_CSS}
 `;
 
@@ -486,6 +488,7 @@ ${SERVICE_CSS}
 const SCRIPT = `
 (function () {
   'use strict';
+${I18N_SCRIPT}
 
   /*
    * Double the /status probe cache (5s), so roughly every other poll is a real probe rather than
@@ -603,8 +606,8 @@ const SCRIPT = `
    * an operator concludes the bridge is broken when it is merely asking them for a password.
    */
   function awaitingToken() {
-    placeholder($('printers-body'), 5, 'Waiting for the token above.');
-    placeholder($('jobs-body'), 5, 'Waiting for the token above.');
+    placeholder($('printers-body'), 5, t('awaitingToken'));
+    placeholder($('jobs-body'), 5, t('awaitingToken'));
     clear($('transports-body'));
     clear($('queue-counts'));
     clear($('where-file'));
@@ -671,7 +674,7 @@ const SCRIPT = `
         done();
         /* An abort is a timeout as far as anyone reading this page is concerned. */
         throw (err && err.name === 'AbortError')
-          ? new Error('The bridge did not answer within ' + Math.round((timeoutMs || TIMEOUT_MS) / 1000) + 's.')
+          ? new Error(t('timeout', { s: Math.round((timeoutMs || TIMEOUT_MS) / 1000) }))
           : err;
       }
     );
@@ -688,25 +691,25 @@ const SCRIPT = `
     var d = Math.floor(s / 86400);
     var hrs = Math.floor((s % 86400) / 3600);
     var m = Math.floor((s % 3600) / 60);
-    if (d) return d + 'd ' + hrs + 'h';
-    if (hrs) return hrs + 'h ' + m + 'm';
-    if (m) return m + 'm ' + (s % 60) + 's';
-    return s + 's';
+    if (d) return d + t('unitDay') + ' ' + hrs + t('unitHour');
+    if (hrs) return hrs + t('unitHour') + ' ' + m + t('unitMinute');
+    if (m) return m + t('unitMinute') + ' ' + (s % 60) + t('unitSecond');
+    return s + t('unitSecond');
   }
 
   function ago(iso) {
-    if (!iso) return 'never';
+    if (!iso) return t('never');
     var then = Date.parse(iso);
     if (isNaN(then)) return String(iso);
     var delta = Math.round((Date.now() - then) / 1000);
-    if (delta < 2) return 'just now';
-    return duration(delta) + ' ago';
+    if (delta < 2) return t('justNow');
+    return t('ago', { d: duration(delta) });
   }
 
   function clockOf(iso) {
-    var t = Date.parse(iso);
-    if (isNaN(t)) return '\\u2014';
-    return new Date(t).toLocaleTimeString();
+    var at = Date.parse(iso);
+    if (isNaN(at)) return '\\u2014';
+    return new Date(at).toLocaleTimeString(psLocale());
   }
 
   function sizeOf(n) {
@@ -735,7 +738,7 @@ const SCRIPT = `
       health.hostname,
       health.platform + '/' + health.arch,
       'pid ' + health.pid,
-      'up ' + duration(health.uptime_s)
+      t('up') + ' ' + duration(health.uptime_s)
     ];
     for (var i = 0; i < bits.length; i++) {
       if (i > 0) sub.appendChild(h('span', 'sep', '\\u00b7'));
@@ -767,23 +770,19 @@ const SCRIPT = `
 
     var rows = [{
       url: scheme + '//localhost' + port,
-      why: secure
-        ? 'What a POS on this machine should use.'
-        : 'What a POS on this machine should use \\u2014 and the only address one served over https can reach.'
+      why: secure ? t('reachLocal') : t('reachLocalOnly')
     }];
     var interfaces = health.interfaces || [];
     for (var i = 0; i < interfaces.length; i++) {
       rows.push({
         url: scheme + '//' + interfaces[i].address + port,
-        why: secure
-          ? 'This LAN (' + interfaces[i].cidr + ') \\u2014 reachable by any POS that trusts this bridge\\u2019s certificate.'
-          : 'This LAN (' + interfaces[i].cidr + ') \\u2014 reachable only by a POS served over plain http.'
+        why: t(secure ? 'reachLanTls' : 'reachLanHttp', { cidr: interfaces[i].cidr })
       });
     }
 
     for (var j = 0; j < rows.length; j++) list.appendChild(urlRow(rows[j]));
     if (rows.length === 1) {
-      list.appendChild(h('li', 'empty', 'No other network interfaces \\u2014 this bridge is bound to loopback.'));
+      list.appendChild(h('li', 'empty', t('reachNone')));
     }
   }
 
@@ -793,7 +792,7 @@ const SCRIPT = `
     text.appendChild(h('span', 'url-why', row.why));
     li.appendChild(text);
 
-    var copy = h('button', 'btn btn-ghost btn-sm copy', 'Copy');
+    var copy = h('button', 'btn btn-ghost btn-sm copy', t('copy'));
     copy.type = 'button';
     copy.addEventListener('click', function () { copyUrl(row.url, copy); });
     li.appendChild(copy);
@@ -808,10 +807,10 @@ const SCRIPT = `
   function copyUrl(url, button) {
     var done = function (label) {
       button.textContent = label;
-      setTimeout(function () { button.textContent = 'Copy'; }, 1600);
+      setTimeout(function () { button.textContent = t('copy'); }, 1600);
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(url).then(function () { done('Copied'); }, function () { selectText(button, done); });
+      navigator.clipboard.writeText(url).then(function () { done(t('copied')); }, function () { selectText(button, done); });
       return;
     }
     selectText(button, done);
@@ -824,7 +823,7 @@ const SCRIPT = `
     var selection = window.getSelection();
     selection.removeAllRanges();
     selection.addRange(range);
-    done('Selected');
+    done(t('selected'));
   }
 
   function renderPrinters(statuses, registry, registryOk) {
@@ -839,7 +838,9 @@ const SCRIPT = `
     for (var i = 0; i < configured.length; i++) byId[configured[i].id] = configured[i];
 
     clear(body);
-    $('printers-note').textContent = statuses.length === 1 ? '1 configured' : statuses.length + ' configured';
+    $('printers-note').textContent = statuses.length === 1
+      ? t('configuredOne')
+      : t('configuredMany', { n: statuses.length });
 
     if (statuses.length === 0) {
       /*
@@ -848,7 +849,7 @@ const SCRIPT = `
        * binary that is not on PATH after the macOS installer, to a person who runs a cafe. The
        * card below answers the same question without either.
        */
-      placeholder(body, 5, 'No printers configured yet. Use Find printers below to see what this machine can see.');
+      placeholder(body, 5, t('noPrinters'));
       return;
     }
 
@@ -875,7 +876,7 @@ const SCRIPT = `
     var state = h('td');
     state.appendChild(h('span',
       'pill pill-' + (!status.enabled ? 'warn' : status.online ? 'ok' : 'bad'),
-      !status.enabled ? 'Disabled' : status.online ? 'Online' : 'Offline'));
+      !status.enabled ? t('stateDisabled') : status.online ? t('stateOnline') : t('stateOffline')));
     if (status.detail) state.appendChild(h('span', 'detail', status.detail));
     tr.appendChild(state);
 
@@ -893,7 +894,7 @@ const SCRIPT = `
     var actions = h('div', 'row-actions');
     var feedback = h('span', 'feedback');
 
-    var test = h('button', 'btn btn-ghost btn-sm', 'Test print');
+    var test = h('button', 'btn btn-ghost btn-sm', t('testPrint'));
     test.type = 'button';
     test.disabled = !status.enabled;
     test.addEventListener('click', function () { testPrint(status, test, feedback); });
@@ -909,9 +910,9 @@ const SCRIPT = `
      * it is pressed rather than after.
      */
     if (status.transport === 'network') {
-      var ident = h('button', 'btn btn-ghost btn-sm', 'Identify');
+      var ident = h('button', 'btn btn-ghost btn-sm', t('identify'));
       ident.type = 'button';
-      ident.title = 'Asks the printer which language it speaks. Harmless, but it may print a few stray characters.';
+      ident.title = t('identifyTitle');
       ident.disabled = !status.enabled;
       ident.addEventListener('click', function () { identify(status, ident, feedback); });
       actions.appendChild(ident);
@@ -928,7 +929,7 @@ const SCRIPT = `
      answer "is that the one by the till". */
   function locate(status, record, registryOk) {
     /* Distinct from an em dash: "we asked and it has no address" is not "we could not ask". */
-    if (!registryOk) return 'not loaded';
+    if (!registryOk) return t('notLoaded');
     if (!record) return '—';
     if (record.queue) return record.queue;
     if (record.device) return record.device;
@@ -961,7 +962,7 @@ const SCRIPT = `
       setFeedback(feedback, told.kind, told.text);
       announce(label + ' — ' + status.name + ': ' + told.text);
     }, function (err) {
-      var why = (err && err.message) || 'The bridge did not answer.';
+      var why = (err && err.message) || t('noAnswer');
       setFeedback(feedback, 'bad', why);
       announce(label + ' — ' + status.name + ': ' + why);
     }).then(function () {
@@ -974,17 +975,17 @@ const SCRIPT = `
 
   function testPrint(status, button, feedback) {
     rowAction(
-      status, button, feedback, 'Printing…', 'Sending a test slip…',
+      status, button, feedback, t('printingBusy'), t('sendingTest'),
       function () { return post('/printers/' + encodeURIComponent(status.id) + '/test', undefined, TEST_TIMEOUT_MS); },
       function (res) {
         var body = res.body || {};
         if (res.status === 200 && body.ok === true) {
-          return { kind: 'ok', text: 'Test slip sent — check the paper.' };
+          return { kind: 'ok', text: t('testSent') };
         }
         var result = body.job && body.job.result;
         return {
           kind: 'bad',
-          text: body.detail || (result && (result.detail || result.reason)) || 'The bridge answered ' + res.status + '.'
+          text: body.detail || (result && (result.detail || result.reason)) || t('answered', { status: res.status })
         };
       }
     );
@@ -997,27 +998,28 @@ const SCRIPT = `
    */
   function identify(status, button, feedback) {
     rowAction(
-      status, button, feedback, 'Asking…', 'Asking the printer what it is…',
+      status, button, feedback, t('asking'), t('askingWhat'),
       function () { return post('/printers/' + encodeURIComponent(status.id) + '/identify', undefined, TEST_TIMEOUT_MS); },
       function (res) {
         var body = res.body || {};
         /* Not a fault: a spooler simply has nothing to answer on. */
         if (res.status === 501) {
-          return { kind: 'busy', text: 'Only network printers can answer — ' + status.transport + ' is one-way.' };
+          return { kind: 'busy', text: t('identOneWay', { transport: status.transport }) };
         }
         if (res.status !== 200 || body.ok !== true) {
-          return { kind: 'bad', text: body.detail || 'The bridge answered ' + res.status + '.' };
+          return { kind: 'bad', text: body.detail || t('answered', { status: res.status }) };
         }
         if (!body.detected_language) {
-          return { kind: 'busy', text: body.detail || 'The printer did not answer — many models never do.' };
+          return { kind: 'busy', text: body.detail || t('identSilent') };
         }
         if (body.detected_language === body.configured_language) {
-          return { kind: 'ok', text: 'Answered as ' + body.detected_language + ', which matches printers.json.' };
+          return { kind: 'ok', text: t('identMatch', { detected: body.detected_language }) };
         }
         return {
           kind: 'bad',
-          text: 'Answered as ' + body.detected_language + ', but printers.json says '
-            + body.configured_language + '. Set language to ' + body.detected_language + '.'
+          text: t('identMismatch', {
+            detected: body.detected_language, configured: body.configured_language
+          })
         };
       }
     );
@@ -1028,10 +1030,10 @@ const SCRIPT = `
     clear(counts);
     var order = ['queued', 'printing', 'done', 'failed', 'expired'];
     for (var i = 0; i < order.length; i++) {
-      counts.appendChild(h('dt', null, order[i]));
+      counts.appendChild(h('dt', null, tCode('status', order[i]) || order[i]));
       counts.appendChild(h('dd', 'num', queue && typeof queue[order[i]] === 'number' ? queue[order[i]] : 0));
     }
-    $('queue-note').textContent = (queue && queue.pending ? queue.pending : 0) + ' in flight';
+    $('queue-note').textContent = t('inFlight', { n: queue && queue.pending ? queue.pending : 0 });
 
     var body = $('jobs-body');
     clear(body);
@@ -1041,11 +1043,11 @@ const SCRIPT = `
      * nothing had printed since the bridge started. Only /status's status code was ever checked.
      */
     if (!jobsOk) {
-      placeholder(body, 5, 'Could not load recent jobs.');
+      placeholder(body, 5, t('jobsFailed'));
       return;
     }
     if (!jobs || jobs.length === 0) {
-      placeholder(body, 5, 'Nothing printed since this bridge started.');
+      placeholder(body, 5, t('jobsNone'));
       return;
     }
 
@@ -1057,7 +1059,7 @@ const SCRIPT = `
     for (var j = 0; j < recent.length; j++) body.appendChild(jobRow(recent[j]));
     if (jobs.length > recent.length) {
       /* Say what was left out. A list silently capped reads as a complete one. */
-      $('jobs-note').textContent = 'newest ' + recent.length + ' of ' + jobs.length;
+      $('jobs-note').textContent = t('jobsNewest', { n: recent.length, total: jobs.length });
     } else {
       $('jobs-note').textContent = '';
     }
@@ -1074,7 +1076,7 @@ const SCRIPT = `
      * relay jobs are arriving at all — and the bridge has always reported it and the page has
      * always thrown it away.
      */
-    if (job.source) when.appendChild(h('span', 'detail', job.source === 'relay' ? 'via relay' : 'over LAN'));
+    if (job.source) when.appendChild(h('span', 'detail', t(job.source === 'relay' ? 'viaRelay' : 'overLan')));
     tr.appendChild(when);
 
     var who = h('td');
@@ -1086,22 +1088,28 @@ const SCRIPT = `
     var kind = job.status === 'done' ? 'ok'
       : job.status === 'failed' || job.status === 'expired' ? 'bad'
       : 'warn';
-    state.appendChild(h('span', 'pill pill-' + kind, job.status));
+    state.appendChild(h('span', 'pill pill-' + kind, tCode('status', job.status) || job.status));
     if (job.result && !job.result.ok) {
-      var why = job.result.reason || 'failed';
+      /* A bridge newer than this page can send a reason we have no wording for; print it. */
+      var why = tCode('reason', job.result.reason) || job.result.reason || t('statusFailed');
       /* printed_certainty is the field that decides whether a retry is safe. It is the whole
          reason a failure here is not simply "try again". */
-      if (job.result.printed_certainty) why += ' · printed: ' + job.result.printed_certainty;
+      if (job.result.printed_certainty) {
+        why += ' · ' + t('printedCertainty', {
+          value: tCode('certainty', job.result.printed_certainty) || job.result.printed_certainty
+        });
+      }
       state.appendChild(h('span', 'detail', why));
     } else if (job.status === 'queued' && job.expires_at) {
       /* The offline banner promises jobs queue "until they expire". This is that deadline. */
-      state.appendChild(h('span', 'detail', 'expires ' + clockOf(job.expires_at)));
+      state.appendChild(h('span', 'detail', t('expiresAt', { time: clockOf(job.expires_at) })));
     }
     tr.appendChild(state);
 
     var meta = h('td', 'num');
     meta.textContent = sizeOf(job.bytes);
-    meta.appendChild(h('span', 'detail', 'attempt ' + job.attempts + (job.copies > 1 ? ' · ' + job.copies + ' copies' : '')));
+    meta.appendChild(h('span', 'detail', t('attempt', { n: job.attempts })
+      + (job.copies > 1 ? ' · ' + t('copies', { n: job.copies }) : '')));
     tr.appendChild(meta);
 
     /*
@@ -1113,7 +1121,7 @@ const SCRIPT = `
     if (job.status === 'queued') {
       var actions = h('div', 'row-actions');
       var feedback = h('span', 'feedback');
-      var cancel = h('button', 'btn btn-ghost btn-sm', 'Cancel');
+      var cancel = h('button', 'btn btn-ghost btn-sm', t('cancel'));
       cancel.type = 'button';
       cancel.addEventListener('click', function () { cancelJob(job, cancel, feedback); });
       actions.appendChild(cancel);
@@ -1128,14 +1136,14 @@ const SCRIPT = `
   function cancelJob(job, button, feedback) {
     var name = job.printer_name || job.printer_id;
     rowAction(
-      { id: job.job_id, name: name }, button, feedback, 'Cancelling…', 'Withdrawing this job…',
+      { id: job.job_id, name: name }, button, feedback, t('cancelling'), t('withdrawing'),
       function () { return post('/jobs/' + encodeURIComponent(job.job_id) + '/cancel', {}); },
       function (res) {
-        if (res.status === 200) return { kind: 'ok', text: 'Cancelled before it reached the printer.' };
+        if (res.status === 200) return { kind: 'ok', text: t('cancelled') };
         /* 409 is not a failure to report as one: it means the paper is already moving. */
-        if (res.status === 409) return { kind: 'busy', text: 'Too late — it had already started printing.' };
-        if (res.status === 404) return { kind: 'bad', text: 'That job is no longer in the queue.' };
-        return { kind: 'bad', text: 'The bridge answered ' + res.status + '.' };
+        if (res.status === 409) return { kind: 'busy', text: t('cancelTooLate') };
+        if (res.status === 404) return { kind: 'bad', text: t('cancelGone') };
+        return { kind: 'bad', text: t('answered', { status: res.status }) };
       }
     ).then(function () { delete lastRendered.queue; });
   }
@@ -1145,15 +1153,16 @@ const SCRIPT = `
     var body = $('transports-body');
     clear(body);
     for (var i = 0; i < (transports || []).length; i++) {
-      var t = transports[i];
+      var item = transports[i];
       var tr = h('tr');
       var first = h('td');
-      first.appendChild(dot(t.available ? 'ok' : 'off'));
-      first.appendChild(h('span', 'name', t.kind));
+      first.appendChild(dot(item.available ? 'ok' : 'off'));
+      first.appendChild(h('span', 'name', item.kind));
       tr.appendChild(first);
       var state = h('td');
-      state.appendChild(h('span', 'pill pill-' + (t.available ? 'ok' : ''), t.available ? 'Available' : 'Unavailable'));
-      if (t.reason) state.appendChild(h('span', 'detail', t.reason));
+      state.appendChild(h('span', 'pill pill-' + (item.available ? 'ok' : ''),
+        t(item.available ? 'available' : 'unavailable')));
+      if (item.reason) state.appendChild(h('span', 'detail', item.reason));
       tr.appendChild(state);
       body.appendChild(tr);
     }
@@ -1178,13 +1187,13 @@ const SCRIPT = `
     clear(list);
     relay = relay || {};
 
-    var rows = [['Enrolled', relay.enrolled ? 'yes' : 'no']];
+    var rows = [[t('relayEnrolled'), t(relay.enrolled ? 'yes' : 'no')]];
     if (relay.enrolled) {
-      rows.push(['Bridge id', relay.bridge_id || '\\u2014']);
-      rows.push(['Connected', relay.connected ? 'yes' : 'no']);
-      rows.push(['Channel', relay.transport || 'not yet established']);
-      rows.push(['Last contact', ago(relay.last_ok_at)]);
-      if (relay.last_error) rows.push(['Last error', relay.last_error]);
+      rows.push([t('relayBridgeId'), relay.bridge_id || '\\u2014']);
+      rows.push([t('relayConnected'), t(relay.connected ? 'yes' : 'no')]);
+      rows.push([t('relayChannel'), relay.transport || t('relayNotEstablished')]);
+      rows.push([t('relayLastContact'), ago(relay.last_ok_at)]);
+      if (relay.last_error) rows.push([t('relayLastError'), relay.last_error]);
     }
 
     for (var i = 0; i < rows.length; i++) {
@@ -1192,7 +1201,9 @@ const SCRIPT = `
       list.appendChild(h('dd', null, rows[i][1]));
     }
 
-    $('relay-note').textContent = !relay.enrolled ? 'not enrolled' : relay.connected ? 'connected' : 'offline';
+    $('relay-note').textContent = t(!relay.enrolled
+      ? 'relayNotEnrolled'
+      : relay.connected ? 'relayOnline' : 'relayOffline');
 
     /*
      * Hidden once the bridge is paired AND connected, including when the pairing came from
@@ -1217,15 +1228,10 @@ const SCRIPT = `
     var rejected = pairForce && /token rejected|revoked|re-?enroll/i.test(relay.last_error || '');
     var why = relay.last_error ? ' (' + relay.last_error + ')' : '';
 
-    $('pair-submit').textContent = pairForce ? 'Re-pair' : 'Connect';
+    $('pair-submit').textContent = t(pairForce ? 'repair' : 'connect');
     $('pair-lead').textContent = !pairForce
-      ? 'Jobs only arrive over the LAN. To let a phone or tablet print through this bridge, ' +
-        'pair it with your venue.'
-      : rejected
-        ? 'This bridge is paired, but the server is not accepting its credential' + why +
-          '. Pair it again with a fresh code.'
-        : 'This bridge is paired, but it is not reaching the server right now' + why +
-          '. It usually reconnects on its own — pair it again only if this does not clear.';
+      ? t('pairLeadNew')
+      : t(rejected ? 'pairLeadRejected' : 'pairLeadDropped', { why: why });
 
     /*
      * The removal step is not tidiness. One computer holds one bridge row per organisation, so
@@ -1237,11 +1243,11 @@ const SCRIPT = `
     var steps = $('pair-steps');
     clear(steps);
     if (rejected) {
-      steps.appendChild(h('li', null, 'In the POS, open Settings > Printing, remove this print bridge, then tap Add bridge.'));
-      steps.appendChild(h('li', null, 'Type the new pairing code into the box below.'));
+      steps.appendChild(h('li', null, t('pairStepRemove')));
+      steps.appendChild(h('li', null, t('pairStepNewCode')));
     } else {
-      steps.appendChild(h('li', null, 'In the POS, open Settings > Printing and tap Add bridge.'));
-      steps.appendChild(h('li', null, 'Type the pairing code it shows into the box below.'));
+      steps.appendChild(h('li', null, t('pairStepAdd')));
+      steps.appendChild(h('li', null, t('pairStepCode')));
     }
   }
 
@@ -1267,19 +1273,21 @@ const SCRIPT = `
     var label = button.textContent;
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
-    button.textContent = 'Looking…';
-    note.textContent = 'Checking USB, serial and this machine’s own subnets…';
+    button.textContent = t('looking');
+    /* This note started as the markup's own data-t string; from here it is ours to write. */
+    note.removeAttribute('data-t');
+    note.textContent = t('findBusy');
     clear($('found'));
 
     post('/discover', {}, DISCOVER_TIMEOUT_MS).then(function (res) {
       var body = res.body || {};
       if (res.status !== 200 || body.ok !== true) {
-        note.textContent = 'Could not look: the bridge answered ' + res.status + '.';
+        note.textContent = t('findFailedStatus', { status: res.status });
         return;
       }
       renderFound(body);
     }, function (err) {
-      note.textContent = (err && err.message) || 'Could not look.';
+      note.textContent = (err && err.message) || t('findFailed');
     }).then(function () {
       button.textContent = label;
       button.disabled = false;
@@ -1298,12 +1306,12 @@ const SCRIPT = `
      * cannot see the network your printers are on" — and the second is exactly what a
      * containerised bridge reports, confidently and wrongly.
      */
-    var where = subnets.length
-      ? 'Swept ' + subnets.join(', ') + '.'
-      : 'No subnets to sweep — this bridge can only see its own machine.';
-    var summary = found.length
-      ? found.length + (found.length === 1 ? ' device found. ' : ' devices found. ') + where
-      : 'Nothing found. ' + where;
+    var where = subnets.length ? t('swept', { subnets: subnets.join(', ') }) : t('sweptNone');
+    var summary = !found.length
+      ? t('foundNone', { where: where })
+      : found.length === 1
+        ? t('foundOne', { where: where })
+        : t('foundMany', { n: found.length, where: where });
     $('find-note').textContent = summary;
     announce(summary);
 
@@ -1344,12 +1352,12 @@ const SCRIPT = `
 
     var actions = h('div', 'found-actions');
     if (isConfigured(item)) {
-      actions.appendChild(h('span', 'pill pill-ok', 'In printers.json'));
+      actions.appendChild(h('span', 'pill pill-ok', t('inRegistry')));
     } else {
-      actions.appendChild(h('span', 'pill pill-off', 'Not configured'));
-      var copy = h('button', 'btn btn-ghost btn-sm', 'Copy entry');
+      actions.appendChild(h('span', 'pill pill-off', t('notConfigured')));
+      var copy = h('button', 'btn btn-ghost btn-sm', t('copyEntry'));
       copy.type = 'button';
-      copy.title = 'Copies a printers.json entry for this device, ready to paste.';
+      copy.title = t('copyEntryTitle');
       copy.addEventListener('click', function () { copyEntry(item, index, copy); });
       actions.appendChild(copy);
     }
@@ -1386,10 +1394,10 @@ const SCRIPT = `
     var text = JSON.stringify(entry, null, 2);
     var done = function (label) {
       button.textContent = label;
-      setTimeout(function () { button.textContent = 'Copy entry'; }, 1600);
+      setTimeout(function () { button.textContent = t('copyEntry'); }, 1600);
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(function () { done('Copied'); }, function () { revealEntry(button, text, done); });
+      navigator.clipboard.writeText(text).then(function () { done(t('copied')); }, function () { revealEntry(button, text, done); });
       return;
     }
     /* No clipboard on a plain-http LAN origin: only localhost counts as a secure context. */
@@ -1408,7 +1416,7 @@ const SCRIPT = `
     var selection = window.getSelection();
     selection.removeAllRanges();
     selection.addRange(range);
-    done('Selected');
+    done(t('selected'));
   }
 
   /* The path the footer used to send people to a CLI to discover, on a machine where that binary
@@ -1418,9 +1426,9 @@ const SCRIPT = `
     var host = $('where-file');
     clear(host);
     if (!path) return;
-    host.appendChild(h('span', 'find-note', 'Printers are configured in'));
+    host.appendChild(h('span', 'find-note', t('configuredIn')));
     host.appendChild(h('span', 'path', path));
-    var copy = h('button', 'btn btn-ghost btn-sm', 'Copy');
+    var copy = h('button', 'btn btn-ghost btn-sm', t('copy'));
     copy.type = 'button';
     copy.addEventListener('click', function () { copyPlain(path, copy); });
     host.appendChild(copy);
@@ -1429,10 +1437,10 @@ const SCRIPT = `
   function copyPlain(text, button) {
     var done = function (label) {
       button.textContent = label;
-      setTimeout(function () { button.textContent = 'Copy'; }, 1600);
+      setTimeout(function () { button.textContent = t('copy'); }, 1600);
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(function () { done('Copied'); }, function () { selectSibling(button, done); });
+      navigator.clipboard.writeText(text).then(function () { done(t('copied')); }, function () { selectSibling(button, done); });
       return;
     }
     selectSibling(button, done);
@@ -1446,7 +1454,7 @@ const SCRIPT = `
     var selection = window.getSelection();
     selection.removeAllRanges();
     selection.addRange(range);
-    done('Selected');
+    done(t('selected'));
   }
 
 
@@ -1503,7 +1511,7 @@ const SCRIPT = `
      */
     if (refreshing) return Promise.resolve();
     if (testsInFlight > 0) {
-      notice('Waiting for the printer — this will refresh once it answers.');
+      notice(t('waitingPrinter'));
       return Promise.resolve();
     }
     refreshing = true;
@@ -1514,7 +1522,7 @@ const SCRIPT = `
 
     return get('/health').then(function (res) {
       if (res.status !== 200 || !res.body) {
-        throw new Error('The bridge answered ' + res.status + ' on /health.');
+        throw new Error(t('answeredOn', { status: res.status, path: '/health' }));
       }
       var health = res.body;
       renderIdentity(health);
@@ -1523,16 +1531,13 @@ const SCRIPT = `
 
       var warnings = [];
       if (health.net_warning === 'container-suspect') {
-        warnings.push(banner('warn', 'Running in a container without host networking.',
-          'Printing still works, but the addresses above are the container\\u2019s own \\u2014 not this machine\\u2019s, and a scan will sweep the wrong network.'));
+        warnings.push(banner('warn', t('containerLead'), t('containerRest')));
       }
 
       if (health.auth_required && !readToken()) {
         setBanners(warnings);
         awaitingToken();
-        showGate(tokenRejected
-          ? 'That token was not accepted. Check PRINT_BRIDGE_TOKEN on the machine running the bridge.'
-          : 'This bridge is started with PRINT_BRIDGE_TOKEN set, so everything except its health check needs that token.');
+        showGate(t(tokenRejected ? 'gateRejected' : 'gateNeeded'));
         return;
       }
 
@@ -1546,19 +1551,19 @@ const SCRIPT = `
           tokenRejected = true;
           setBanners(warnings);
           awaitingToken();
-          showGate('That token was not accepted. Check PRINT_BRIDGE_TOKEN on the machine running the bridge.');
+          showGate(t('gateRejected'));
           return;
         }
         if (status.status !== 200 || !status.body) {
-          throw new Error('The bridge answered ' + status.status + ' on /status.');
+          throw new Error(t('answeredOn', { status: status.status, path: '/status' }));
         }
 
         hideGate();
         var offline = (status.body.printers || []).filter(function (p) { return p.enabled && !p.online; });
         if (offline.length > 0) {
           warnings.push(banner('bad',
-            offline.length === 1 ? '1 printer is not answering.' : offline.length + ' printers are not answering.',
-            'Jobs for them queue until they come back, or until they expire.'));
+            offline.length === 1 ? t('offlineOne') : t('offlineMany', { n: offline.length }),
+            t('offlineRest')));
         }
         setBanners(warnings);
 
@@ -1578,10 +1583,10 @@ const SCRIPT = `
         registryPath = status.body.registry_path || '';
         renderRegistryPath(registryPath);
 
-        announce(offline.length > 0
-          ? offline.length + (offline.length === 1 ? ' printer is not answering.' : ' printers are not answering.')
-          : 'All printers are answering.');
-        $('checked').textContent = 'checked ' + new Date().toLocaleTimeString();
+        announce(offline.length === 0
+          ? t('allAnswering')
+          : offline.length === 1 ? t('offlineOne') : t('offlineMany', { n: offline.length }));
+        $('checked').textContent = t('checkedAt', { time: new Date().toLocaleTimeString(psLocale()) });
         setTitle(offline.length);
       });
     }).catch(function (err) {
@@ -1591,8 +1596,8 @@ const SCRIPT = `
        * after they pressed the button. svcQuiet() is in page-service.ts.
        */
       if (svcQuiet()) return;
-      setBanners([banner('bad', 'Cannot reach the bridge.',
-        (err && err.message ? err.message : String(err)) + ' It may have stopped, or another program may have taken its port.')]);
+      setBanners([banner('bad', t('unreachableLead'),
+        (err && err.message ? err.message : String(err)) + ' ' + t('unreachableRest'))]);
     }).then(function () {
       refreshing = false;
       button.disabled = false;
@@ -1647,13 +1652,13 @@ const SCRIPT = `
     event.preventDefault();
     var code = formatPairCode($('pair-code').value);
     if (code.length < 9) {
-      pairResult('err', 'A pairing code is eight characters, like XXXX-XXXX.');
+      pairResult('err', t('pairCodeShort'));
       return;
     }
 
     var button = $('pair-submit');
     button.disabled = true;
-    pairResult('busy', 'Connecting\\u2026');
+    pairResult('busy', t('pairConnecting'));
 
     post('/enroll', { code: code, force: pairForce }).then(function (res) {
       var body = res.body || {};
@@ -1668,15 +1673,15 @@ const SCRIPT = `
         pairResult(
           'ok',
           body.restart_required
-            ? 'Paired as bridge ' + body.bridge_id + '. Restart the Print Bridge service to finish.'
-            : 'Connected. This bridge is now paired \\u2014 the POS should show it within a few seconds.'
+            ? t('pairedRestart', { id: body.bridge_id })
+            : t('pairedOk')
         );
         refresh(false);
         return;
       }
       pairResult('err', pairError(res.status, body));
     }).catch(function () {
-      pairResult('err', 'Could not reach the Print Bridge on this computer.');
+      pairResult('err', t('pairUnreachable'));
     }).then(function () {
       button.disabled = false;
     });
@@ -1684,11 +1689,11 @@ const SCRIPT = `
 
   /* The reasons are the bridge's own; each one has a different thing for the operator to do. */
   function pairError(status, body) {
-    if (body.reason === 'invalid-code-format') return 'That does not look like a pairing code. Check it against the POS.';
-    if (body.reason === 'already-enrolled') return 'This bridge is already paired with a venue. Remove it in Settings > Printing first.';
-    if (body.reason === 'not-loopback') return 'Pairing has to be done in a browser on this computer, not from another device.';
+    if (body.reason === 'invalid-code-format') return t('pairBadFormat');
+    if (body.reason === 'already-enrolled') return t('pairAlready');
+    if (body.reason === 'not-loopback') return t('pairNotLoopback');
     if (body.message) return body.message;
-    return 'Pairing failed (HTTP ' + status + '). Check this computer is online, then try again.';
+    return t('pairFailed', { status: status });
   }
 
   document.addEventListener('visibilitychange', function () {
@@ -1709,139 +1714,13 @@ const SCRIPT = `
    * nobody to print for, because in that state the diagnostics answer a question nobody asked:
    * the only useful thing to say is "scan this". The seven cards move behind Details.
    *
-   * Translated, unlike the rest of the page, and that is the point — this is the screen a
-   * Lao-speaking member of staff is sent to, and it was English-only.
+   * Its words come from the same five-language table as the rest of the page now does:
+   * psText(key) in page-i18n.ts is t('ps.' + key).
    */
 
-  var PS_LANGS = ['en', 'lo', 'th', 'zh', 'vi'];
-  var PS_LANG_NAMES = { en: 'English', lo: 'ລາວ', th: 'ไทย', zh: '中文', vi: 'Tiếng Việt' };
-  var PS_LANG_KEY = 'hankha-bridge-lang';
-
-  /* Order matches SUPPORTED_LANGS in the POS, so the two stay comparable by eye. */
-  var PS_T = {
-    waitLead: [
-      'Scan this with your Hankha tablet or phone',
-      'ສະແກນອັນນີ້ດ້ວຍແທັບເລັດ ຫຼື ໂທລະສັບ Hankha',
-      'สแกนรหัสนี้ด้วยแท็บเล็ตหรือมือถือ Hankha',
-      '用你的 Hankha 平板或手机扫描',
-      'Quét mã này bằng máy tính bảng hoặc điện thoại Hankha'
-    ],
-    waitSub: [
-      'Open the Hankha app, then go to Settings, Printing, Connect.',
-      'ເປີດແອັບ Hankha, ໄປທີ່ ຕັ້ງຄ່າ, ການພິມ, ເຊື່ອມຕໍ່.',
-      'เปิดแอป Hankha ไปที่ ตั้งค่า การพิมพ์ เชื่อมต่อ',
-      '打开 Hankha 应用，进入 设置、打印、连接。',
-      'Mở ứng dụng Hankha, vào Cài đặt, In ấn, Kết nối.'
-    ],
-    orType: ['or type this code', 'ຫຼື ພິມລະຫັດນີ້', 'หรือพิมพ์รหัสนี้', '或输入此代码', 'hoặc nhập mã này'],
-    waiting: ['Waiting', 'ກຳລັງລໍຖ້າ', 'กำลังรอ', '等待中', 'Đang chờ'],
-    requesting: [
-      'Getting a code',
-      'ກຳລັງຂໍລະຫັດ',
-      'กำลังขอรหัส',
-      '正在获取代码',
-      'Đang lấy mã'
-    ],
-    connectingLead: ['Connecting to', 'ກຳລັງເຊື່ອມຕໍ່ຫາ', 'กำลังเชื่อมต่อกับ', '正在连接到', 'Đang kết nối tới'],
-    connectingSub: [
-      'Almost done. Do not close this window.',
-      'ເກືອບແລ້ວ. ຢ່າປິດປ່ອງຢ້ຽມນີ້.',
-      'ใกล้เสร็จแล้ว อย่าปิดหน้าต่างนี้',
-      '就快好了。请不要关闭此窗口。',
-      'Sắp xong. Đừng đóng cửa sổ này.'
-    ],
-    okLead: ['Connected', 'ເຊື່ອມຕໍ່ແລ້ວ', 'เชื่อมต่อแล้ว', '已连接', 'Đã kết nối'],
-    okSub: [
-      'Bills sent from your tablets will print here.',
-      'ໃບບິນທີ່ສົ່ງຈາກແທັບເລັດຈະພິມອອກຢູ່ນີ້.',
-      'ใบเสร็จที่ส่งจากแท็บเล็ตจะพิมพ์ที่นี่',
-      '从平板发送的账单将在这里打印。',
-      'Hóa đơn gửi từ máy tính bảng sẽ in ở đây.'
-    ],
-    removedLead: [
-      'This computer was disconnected',
-      'ຄອມພິວເຕີເຄື່ອງນີ້ຖືກຕັດການເຊື່ອມຕໍ່',
-      'คอมพิวเตอร์เครื่องนี้ถูกตัดการเชื่อมต่อ',
-      '这台电脑已被断开',
-      'Máy tính này đã bị ngắt kết nối'
-    ],
-    removedSub: [
-      'Someone removed it from your shop. Get a new code and connect it again.',
-      'ມີຄົນລຶບມັນອອກຈາກຮ້ານຂອງທ່ານ. ຂໍລະຫັດໃໝ່ ແລ້ວເຊື່ອມຕໍ່ອີກຄັ້ງ.',
-      'มีคนลบออกจากร้านของคุณ ขอรหัสใหม่แล้วเชื่อมต่ออีกครั้ง',
-      '有人把它从你的门店中移除了。获取新代码后重新连接。',
-      'Ai đó đã xóa nó khỏi cửa hàng của bạn. Lấy mã mới và kết nối lại.'
-    ],
-    removedBtn: ['Get a new code', 'ຂໍລະຫັດໃໝ່', 'ขอรหัสใหม่', '获取新代码', 'Lấy mã mới'],
-    offlineLead: [
-      'Cannot reach Hankha right now',
-      'ຕິດຕໍ່ Hankha ບໍ່ໄດ້ໃນຕອນນີ້',
-      'ติดต่อ Hankha ไม่ได้ตอนนี้',
-      '目前无法连接 Hankha',
-      'Hiện không kết nối được Hankha'
-    ],
-    offlineSub: [
-      'Retrying. Printing will start again by itself, there is nothing to do.',
-      'ກຳລັງລອງໃໝ່. ການພິມຈະກັບມາເອງ, ບໍ່ຕ້ອງເຮັດຫຍັງ.',
-      'กำลังลองใหม่ การพิมพ์จะกลับมาเอง ไม่ต้องทำอะไร',
-      '正在重试。打印会自行恢复，无需操作。',
-      'Đang thử lại. Việc in sẽ tự khôi phục, không cần làm gì.'
-    ],
-    details: ['Details', 'ລາຍລະອຽດ', 'รายละเอียด', '详细信息', 'Chi tiết'],
-    hideDetails: ['Hide details', 'ເຊື່ອງລາຍລະອຽດ', 'ซ่อนรายละเอียด', '隐藏详细信息', 'Ẩn chi tiết']
-  };
-
-  var psLang = 'en';
   var psShowDetails = false;
   /* Null until the first /pairing answer. Kept so a language switch can redraw without refetching. */
   var psState = null;
-
-  function psIndex() {
-    var at = PS_LANGS.indexOf(psLang);
-    return at < 0 ? 0 : at;
-  }
-
-  /* Falls back to English rather than rendering undefined, exactly as i18next does in the POS. */
-  function psText(key) {
-    var row = PS_T[key];
-    if (!row) return '';
-    return row[psIndex()] || row[0];
-  }
-
-  function psReadLang() {
-    try {
-      var stored = window.localStorage.getItem(PS_LANG_KEY);
-      if (stored && PS_LANGS.indexOf(stored) !== -1) return stored;
-    } catch (err) { /* private mode: fall through to the browser's own preference */ }
-    /* The browser already knows what the person reads. Honour it before defaulting. */
-    var nav = (navigator.language || 'en').slice(0, 2).toLowerCase();
-    return PS_LANGS.indexOf(nav) !== -1 ? nav : 'en';
-  }
-
-  function psWriteLang(value) {
-    try { window.localStorage.setItem(PS_LANG_KEY, value); } catch (err) { /* not worth failing over */ }
-  }
-
-  function psBuildLangs() {
-    var host = $('ps-langs');
-    host.textContent = '';
-    PS_LANGS.forEach(function (code) {
-      var button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = PS_LANG_NAMES[code];
-      button.setAttribute('aria-pressed', String(code === psLang));
-      button.addEventListener('click', function () {
-        psLang = code;
-        psWriteLang(code);
-        psBuildLangs();
-        psRender();
-        /* The maintenance card reads the same language table. Without this it keeps the old
-           language until its own poll comes round, which reads as a switch that half worked. */
-        svcRender();
-      });
-      host.appendChild(button);
-    });
-  }
 
   /*
    * Which of the five screens to show.
@@ -1981,7 +1860,14 @@ const SCRIPT = `
   });
 
   psLang = psReadLang();
-  psBuildLangs();
+  buildLangs();
+  applyChrome();
+  /*
+   * Not a data-t attribute like the rest of the chrome: renderIdentity() owns this line from the
+   * first /health answer onward, and a chrome pass that reset it to "connecting" on every
+   * language change would blank the hostname for as long as a poll takes.
+   */
+  $('sub').textContent = t('connecting');
   psRefresh();
   setInterval(psRefresh, 3000);
 ${SERVICE_SCRIPT}
@@ -2010,7 +1896,7 @@ export const INDEX_HTML = `<!doctype html>
 <style>${CSS}</style>
 </head>
 <body>
-<a class="skip" href="#report">Skip to the bridge status</a>
+<a class="skip" href="#report" data-t="skip"></a>
 <div class="wrap">
 
   <header class="top">
@@ -2026,15 +1912,21 @@ export const INDEX_HTML = `<!doctype html>
       </svg>
       <div>
         <h1 class="title">Hankha Print Bridge</h1>
-        <div class="sub" id="sub">connecting&hellip;</div>
+        <div class="sub" id="sub"></div>
       </div>
     </div>
     <span class="badge" id="version">&nbsp;</span>
     <div class="actions">
       <span class="card-note" id="notice"></span>
       <span class="card-note" id="checked"></span>
-      <button type="button" class="btn btn-ghost" id="forget" hidden>Forget token</button>
-      <button type="button" class="btn" id="refresh">Refresh</button>
+      <!--
+        The diagnostics half of the language picker. The pairing screen has its own row of
+        names, where there is room for five and nothing else to look at; behind it, in a header
+        that already carries two buttons, a select is the control that fits.
+      -->
+      <select class="lang" id="lang" data-t-label="language"></select>
+      <button type="button" class="btn btn-ghost" id="forget" hidden data-t="forget"></button>
+      <button type="button" class="btn" id="refresh" data-t="refresh"></button>
     </div>
   </header>
 
@@ -2044,10 +1936,24 @@ export const INDEX_HTML = `<!doctype html>
   -->
   <p class="sr-only" id="live" role="status" aria-live="polite" aria-atomic="true"></p>
 
+  <!--
+    The one place on this page that carries all five languages as markup rather than reading them
+    from the table. It is shown only when scripts are off, which is exactly when nothing can
+    translate it — so it says the same sentence five times instead of saying it once in English
+    to someone who does not read English.
+  -->
   <noscript>
     <div class="banner banner-warn">
-      <b>JavaScript is turned off,</b> so this page cannot show the bridge&rsquo;s state. The same
-      information is available as JSON at <code>/health</code> and <code>/status</code>.
+      <p lang="en">JavaScript is turned off, so this page cannot show the bridge&rsquo;s state.
+        The same information is available as JSON at <code>/health</code> and <code>/status</code>.</p>
+      <p lang="lo">JavaScript ຖືກປິດ, ໜ້ານີ້ຈຶ່ງບໍ່ສາມາດສະແດງສະຖານະຂອງໂປຣແກຣມພິມໄດ້.
+        ຂໍ້ມູນດຽວກັນມີເປັນ JSON ຢູ່ <code>/health</code> ແລະ <code>/status</code>.</p>
+      <p lang="th">JavaScript ถูกปิดอยู่ หน้านี้จึงแสดงสถานะไม่ได้
+        ข้อมูลเดียวกันมีเป็น JSON ที่ <code>/health</code> และ <code>/status</code></p>
+      <p lang="zh">JavaScript 已关闭，本页无法显示打印桥状态。
+        相同的信息可在 <code>/health</code> 和 <code>/status</code> 以 JSON 提供。</p>
+      <p lang="vi">JavaScript đang tắt nên trang này không thể hiển thị trạng thái.
+        Cùng thông tin đó có ở dạng JSON tại <code>/health</code> và <code>/status</code>.</p>
     </div>
   </noscript>
 
@@ -2081,11 +1987,11 @@ export const INDEX_HTML = `<!doctype html>
   </section>
 
   <section class="gate" id="gate" hidden>
-    <h2>This bridge needs a token</h2>
+    <h2 data-t="gateTitle"></h2>
     <p id="gate-message" role="status" aria-live="polite"></p>
     <form id="gate-form" autocomplete="off">
-      <input type="password" id="token" placeholder="PRINT_BRIDGE_TOKEN" autocomplete="off" spellcheck="false" aria-label="Bridge token">
-      <button type="submit" class="btn">Connect</button>
+      <input type="password" id="token" placeholder="PRINT_BRIDGE_TOKEN" autocomplete="off" spellcheck="false" data-t-label="tokenAria">
+      <button type="submit" class="btn" data-t="connect"></button>
     </form>
   </section>
 
@@ -2093,22 +1999,22 @@ export const INDEX_HTML = `<!doctype html>
 
     <section class="card card-wide">
       <div class="card-head">
-        <h2 class="card-title">Printers</h2>
+        <h2 class="card-title" data-t="cardPrinters"></h2>
         <span class="card-note" id="printers-note"></span>
       </div>
       <div class="scroll">
         <table class="table-wide">
           <thead>
             <tr>
-              <th scope="col">Printer</th>
-              <th scope="col">Where</th>
-              <th scope="col">State</th>
-              <th scope="col" class="num">Latency</th>
-              <th scope="col" class="num">Actions</th>
+              <th scope="col" data-t="colPrinter"></th>
+              <th scope="col" data-t="colWhere"></th>
+              <th scope="col" data-t="colState"></th>
+              <th scope="col" class="num" data-t="colLatency"></th>
+              <th scope="col" class="num" data-t="colActions"></th>
             </tr>
           </thead>
           <tbody id="printers-body">
-            <tr><td class="empty" colspan="5">Loading&hellip;</td></tr>
+            <tr><td class="empty" colspan="5" data-t="loading"></td></tr>
           </tbody>
         </table>
       </div>
@@ -2123,12 +2029,12 @@ export const INDEX_HTML = `<!doctype html>
     -->
     <section class="card card-wide">
       <div class="card-head">
-        <h2 class="card-title">What this machine can see</h2>
+        <h2 class="card-title" data-t="cardSeen"></h2>
       </div>
       <div class="card-body">
         <div class="find">
-          <button type="button" class="btn" id="find">Find printers</button>
-          <span class="find-note" id="find-note">Checks USB and serial, and sweeps this machine&rsquo;s own subnets.</span>
+          <button type="button" class="btn" id="find" data-t="findBtn"></button>
+          <span class="find-note" id="find-note" data-t="findIdle"></span>
         </div>
         <ul class="found" id="found"></ul>
         <div class="where-file" id="where-file"></div>
@@ -2136,7 +2042,7 @@ export const INDEX_HTML = `<!doctype html>
     </section>
 
     <section class="card">
-      <div class="card-head"><h2 class="card-title">Point a terminal here</h2></div>
+      <div class="card-head"><h2 class="card-title" data-t="cardPoint"></h2></div>
       <div class="card-body">
         <ul class="urls" id="urls"></ul>
       </div>
@@ -2144,7 +2050,7 @@ export const INDEX_HTML = `<!doctype html>
 
     <section class="card">
       <div class="card-head">
-        <h2 class="card-title">Queue</h2>
+        <h2 class="card-title" data-t="cardQueue"></h2>
         <span class="card-note" id="queue-note"></span>
       </div>
       <div class="card-body">
@@ -2154,29 +2060,29 @@ export const INDEX_HTML = `<!doctype html>
 
     <section class="card card-wide">
       <div class="card-head">
-        <h2 class="card-title">Recent jobs</h2>
+        <h2 class="card-title" data-t="cardJobs"></h2>
         <span class="card-note" id="jobs-note"></span>
       </div>
       <div class="scroll">
         <table class="table-wide">
           <thead>
             <tr>
-              <th scope="col">Time</th>
-              <th scope="col">Printer</th>
-              <th scope="col">Outcome</th>
-              <th scope="col" class="num">Size</th>
-              <th scope="col" class="num">Actions</th>
+              <th scope="col" data-t="colTime"></th>
+              <th scope="col" data-t="colPrinter"></th>
+              <th scope="col" data-t="colOutcome"></th>
+              <th scope="col" class="num" data-t="colSize"></th>
+              <th scope="col" class="num" data-t="colActions"></th>
             </tr>
           </thead>
           <tbody id="jobs-body">
-            <tr><td class="empty" colspan="5">Loading&hellip;</td></tr>
+            <tr><td class="empty" colspan="5" data-t="loading"></td></tr>
           </tbody>
         </table>
       </div>
     </section>
 
     <section class="card">
-      <div class="card-head"><h2 class="card-title">Transports on this machine</h2></div>
+      <div class="card-head"><h2 class="card-title" data-t="cardTransports"></h2></div>
       <div class="scroll">
         <table><tbody id="transports-body"></tbody></table>
       </div>
@@ -2184,7 +2090,7 @@ export const INDEX_HTML = `<!doctype html>
 
     <section class="card">
       <div class="card-head">
-        <h2 class="card-title">Cloud relay</h2>
+        <h2 class="card-title" data-t="cardRelay"></h2>
         <span class="card-note" id="relay-note"></span>
       </div>
       <div class="card-body">
@@ -2194,8 +2100,8 @@ export const INDEX_HTML = `<!doctype html>
           <ol class="pair-steps" id="pair-steps"></ol>
           <form id="pair-form" autocomplete="off">
             <input type="text" id="pair-code" placeholder="XXXX-XXXX" maxlength="9" spellcheck="false"
-              autocapitalize="characters" autocorrect="off" aria-label="Pairing code">
-            <button type="submit" class="btn" id="pair-submit">Connect</button>
+              autocapitalize="characters" autocorrect="off" data-t-label="pairCodeAria">
+            <button type="submit" class="btn" id="pair-submit" data-t="connect"></button>
           </form>
           <p class="pair-result" id="pair-result" hidden></p>
         </div>
@@ -2205,8 +2111,10 @@ ${SERVICE_HTML}
   </main>
 
   <footer class="foot">
-    <span>Printers are configured in <code>printers.json</code> &mdash; not here.</span>
-    <span>This page reads the bridge and can test it; it never edits the registry.</span>
+    <!-- The filename sits INSIDE this sentence, and the words move around it between
+         languages, so applyChrome() splits on {file} rather than this being a data-t. -->
+    <span id="foot-one"></span>
+    <span data-t="footTwo"></span>
   </footer>
 
 </div>
