@@ -25,7 +25,7 @@ function request(headers: Record<string, string> = {}): IncomingMessage {
   return { headers: { host: '127.0.0.1:9200', ...headers } } as unknown as IncomingMessage;
 }
 
-const allow = { loopback: true, mutating: true };
+const allow = { loopback: true };
 
 afterEach(() => {
   resetConfirmTokens();
@@ -46,7 +46,7 @@ describe('the /service gate', () => {
   });
 
   it('refuses anything that did not arrive on loopback', () => {
-    assert.deepEqual(gateServiceRequest(request(), { loopback: false, mutating: true }), {
+    assert.deepEqual(gateServiceRequest(request(), { loopback: false }), {
       status: 403,
       reason: 'not-loopback',
     });

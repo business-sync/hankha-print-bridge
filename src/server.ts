@@ -827,10 +827,7 @@ export function createBridgeServer(): Server {
         sendJson(res, 403, { ok: false, reason: 'preflight-refused' });
         return;
       }
-      const failure = gateServiceRequest(req, {
-        loopback: isLoopbackRequest(req),
-        mutating: method !== 'GET' && method !== 'HEAD',
-      });
+      const failure = gateServiceRequest(req, { loopback: isLoopbackRequest(req) });
       if (failure) {
         log.warn(`service: refused ${method} ${path} (${failure.reason})`, {
           event: 'service.refused', reason: failure.reason, remote: req.socket.remoteAddress,
