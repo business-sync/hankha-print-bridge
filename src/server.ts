@@ -21,6 +21,8 @@ import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } 
 import { loadState } from './identity.js';
 import { enroll, isRelayRunning, relayStatus, startRelay } from './relay.js';
 import { sampleLabel, sampleReceipt } from './samples.js';
+import { pairingSnapshot, restartPairing } from './pairing.js';
+import { qrSvg } from './qr.js';
 import { printerStatuses } from './status.js';
 import { render } from './render/index.js';
 import { driverFor } from './transports/index.js';
@@ -672,8 +674,16 @@ export function createBridgeServer(): Server {
     // a bridge being paired for the first time has none, and the person pasting the code is
     // standing at the machine. Loopback is its gate instead, checked first and unconditionally
     // so no later edit to the POST block below can widen it by accident.
-    const openToAnyone = path === '/health' || path === '/enroll' || isPageRequest;
-    if (path === '/enroll' && method !== 'OPTIONS' && !isLoopbackRequest(req)) {
+    //
+    // `/pairing` and `/pairing/restart` are open to the same degree and gated the same way, for
+    // a sharper version of the same reason: `/pairing` DISPLAYS a live pairing code. Anyone who
+    // can read it can claim this computer into their own organisation, so serving it to the
+    // venue wifi would hand over the shop's printers to whoever asked first. Loopback is the
+    // boundary, exactly as it is for `/enroll`.
+    const isPairingPath = path === '/pairing' || path === '/pairing/restart';
+    const openToAnyone =
+      path === '/health' || path === '/enroll' || isPairingPath || isPageRequest;
+    if ((path === '/enroll' || isPairingPath) && method !== 'OPTIONS' && !isLoopbackRequest(req)) {
       sendJson(res, 403, { ok: false, reason: 'not-loopback' });
       return;
     }
@@ -695,6 +705,37 @@ export function createBridgeServer(): Server {
     // its root. Node suppresses the body on a HEAD itself, so the headers stay honest.
     if (isPageRequest) {
       sendHtml(res, INDEX_HTML);
+      return;
+    }
+
+    /*
+     * What the pairing screen renders, and the one control on it.
+     *
+     * The QR is built here rather than in the browser because the page has a
+     * `script-src 'unsafe-inline'` CSP with no room for a bundled encoder, and because the code
+     * must never be reconstructed client-side from something weaker than the code itself.
+     */
+    if (path === '/pairing' && (method === 'GET' || method === 'HEAD')) {
+      const snapshot = pairingSnapshot();
+      const state = loadState();
+      sendJson(res, 200, {
+        ok: true,
+        ...snapshot,
+        // Both are needed to tell the three screens apart: a bridge with a credential whose
+        // relay is refused shows "removed", one with no credential at all shows a code, and one
+        // that is simply offline shows neither.
+        has_credential: Boolean(state.token),
+        relay: relayStatus(),
+        qr_svg: snapshot.code ? qrSvg(snapshot.code, 320) : null,
+      });
+      return;
+    }
+
+    // "Get a new code" — the escape hatch for a bridge the server has stopped accepting. It
+    // deliberately does NOT clear the existing token; see `restartPairing`.
+    if (path === '/pairing/restart' && method === 'POST') {
+      restartPairing();
+      sendJson(res, 202, { ok: true });
       return;
     }
 

@@ -36,6 +36,15 @@ while [ $i -lt 20 ]; do
 
   if [ -n "$answered" ] && [ "$answered" = "$ours" ]; then
     echo "hankha-print-bridge is running on http://127.0.0.1:$PORT"
+    # Open the pairing screen for the person standing here. This script runs as ROOT, so a bare
+    # `open` would target root's session and put the window nowhere the operator can see it —
+    # `launchctl asuser` hands it to the console user's GUI session instead. Best-effort: an
+    # unattended or SSH install has no console user, and failing to open a browser must never
+    # fail an otherwise good installation.
+    console_uid=$(/usr/bin/stat -f %u /dev/console 2>/dev/null)
+    if [ -n "$console_uid" ] && [ "$console_uid" != "0" ]; then
+      launchctl asuser "$console_uid" /usr/bin/open "http://127.0.0.1:$PORT/" >/dev/null 2>&1 || true
+    fi
     exit 0
   fi
 

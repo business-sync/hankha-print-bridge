@@ -200,9 +200,14 @@ while [ $i -lt 20 ]; do
   BODY="$(health)"
   MINE="$(agent_pid)"
   if [ -n "$BODY" ] && [ -n "$MINE" ] && [ "$(pid_of "$BODY")" = "$MINE" ]; then
+    # Open the pairing screen rather than describing where to find it. Nothing else in this
+    # installer ever told an operator that a page exists — the address appeared only in a log
+    # line — so "go to Settings > Printing" was being read by someone who had no way to know a
+    # code was waiting for them on this machine.
+    open "http://127.0.0.1:$PORT/" >/dev/null 2>&1 || true
     say "Hankha Print Bridge v$(version_of "$BODY") is running on port $PORT, and will start again every time you log in.
 
-In the POS terminal, open Settings > Printing — the Print Bridge card should turn green. Then press Search to find your printers."
+Your browser is now showing a code. Scan that code with the Hankha app on your tablet or phone to connect this computer to your shop."
     exit 0
   fi
   i=$((i + 1))
