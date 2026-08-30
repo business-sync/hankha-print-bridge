@@ -32,6 +32,16 @@ const FILES: { name: string; openers: RegExp[] }[] = [
       /^export const SERVICE_SCRIPT = `$/,
     ],
   },
+  /*
+   * The five-language table's own literals. Only the CODE around the table is guarded here —
+   * the strings themselves are a plain TypeScript object above these literals, precisely so a
+   * translation containing a backtick cannot reach the served page as one. `embed()` rewrites it
+   * to \u0060 on the way in, and `page-i18n.test.ts` asserts that.
+   */
+  {
+    name: 'page-i18n.ts',
+    openers: [/^export const I18N_CSS = `$/, /^export const I18N_SCRIPT = `$/],
+  },
 ];
 
 /** Every line inside one of a file's page literals, with its 1-based line number. */

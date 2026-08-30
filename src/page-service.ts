@@ -87,232 +87,13 @@ export const SERVICE_SCRIPT = `
   /* ================================================================ this computer */
 
   /*
-   * Five languages, like the pairing screen and for the same reason: a shop owner is exactly who
-   * presses Restart. Facts stay in English — a path, a version and a hostname read the same in
-   * every language, and translating the labels around them is what actually helps.
+   * Five languages, like the rest of the page and for the same reason: a shop owner is exactly
+   * who presses Restart. The words live in page-i18n.ts under the svc. prefix, and svcText(key)
+   * is t('svc.' + key) — this file keeps its own vocabulary, not its own table.
    *
-   * Row order matches PS_LANGS in page.ts, and svcText reuses its psIndex().
+   * FACTS stay as the bridge reports them: a path, a version and a hostname read the same in
+   * every language and have to match what is on disk. Only the terms beside them move.
    */
-  var SVC_T = {
-    title: ['This computer', 'ຄອມພິວເຕີເຄື່ອງນີ້', 'คอมพิวเตอร์เครื่องนี้', '这台电脑', 'Máy tính này'],
-    restartLabel: [
-      'Restart the print bridge',
-      'ເປີດໂປຣແກຣມພິມຄືນໃໝ່',
-      'เริ่มตัวเชื่อมเครื่องพิมพ์ใหม่',
-      '重启打印桥',
-      'Khởi động lại cầu nối in'
-    ],
-    restartNote: [
-      'Printing pauses for a few seconds, then carries on.',
-      'ການພິມຈະຢຸດຊົ່ວຄາວສອງສາມວິນາທີ ແລ້ວສືບຕໍ່.',
-      'การพิมพ์จะหยุดชั่วครู่ แล้วทำงานต่อ',
-      '打印会暂停几秒，然后继续。',
-      'Việc in tạm dừng vài giây rồi tiếp tục.'
-    ],
-    restartBtn: ['Restart', 'ເປີດຄືນໃໝ່', 'เริ่มใหม่', '重启', 'Khởi động lại'],
-    restartAsk: [
-      'Restart now? Anything waiting to print will print when it is back.',
-      'ເປີດຄືນໃໝ່ດຽວນີ້ບໍ? ວຽກທີ່ລໍຖ້າຢູ່ຈະພິມເມື່ອກັບມາ.',
-      'เริ่มใหม่ตอนนี้ไหม งานที่รออยู่จะพิมพ์เมื่อกลับมา',
-      '现在重启？排队的打印会在恢复后继续。',
-      'Khởi động lại ngay? Các bản in đang chờ sẽ in khi hoạt động lại.'
-    ],
-
-    installLabel: [
-      'Start automatically',
-      'ເລີ່ມເອງອັດຕະໂນມັດ',
-      'เริ่มอัตโนมัติ',
-      '开机自动启动',
-      'Tự động khởi chạy'
-    ],
-    installOn: [
-      'It comes back on its own every time this computer starts.',
-      'ມັນຈະເປີດເອງທຸກຄັ້ງທີ່ຄອມພິວເຕີເປີດ.',
-      'จะเปิดเองทุกครั้งที่เปิดเครื่อง',
-      '每次开机都会自动运行。',
-      'Sẽ tự chạy mỗi lần máy khởi động.'
-    ],
-    installOff: [
-      'Nothing starts it when this computer boots.',
-      'ບໍ່ມີຫຍັງເປີດມັນເມື່ອຄອມພິວເຕີເປີດ.',
-      'ไม่มีอะไรเปิดให้เมื่อเปิดเครื่อง',
-      '开机时没有任何程序会启动它。',
-      'Không có gì khởi chạy nó khi máy bật.'
-    ],
-    installBtn: ['Turn on', 'ເປີດໃຊ້', 'เปิดใช้', '开启', 'Bật'],
-    installAsk: [
-      'Let this computer start the print bridge on its own? It restarts once to hand over.',
-      'ໃຫ້ຄອມພິວເຕີເປີດໂປຣແກຣມນີ້ເອງບໍ? ມັນຈະເປີດຄືນໃໝ່ໜຶ່ງຄັ້ງ.',
-      'ให้เครื่องเปิดโปรแกรมนี้เองไหม จะเริ่มใหม่หนึ่งครั้ง',
-      '让这台电脑自动启动打印桥？它会重启一次完成交接。',
-      'Cho máy tự khởi chạy cầu nối in? Nó sẽ khởi động lại một lần.'
-    ],
-
-    removeLabel: [
-      'Remove from this computer',
-      'ລຶບອອກຈາກຄອມພິວເຕີນີ້',
-      'ลบออกจากเครื่องนี้',
-      '从这台电脑移除',
-      'Gỡ khỏi máy tính này'
-    ],
-    removeNote: [
-      'This computer stops printing. The log file is always kept.',
-      'ຄອມພິວເຕີນີ້ຈະຢຸດພິມ. ໄຟລ໌ບັນທຶກຈະຖືກເກັບໄວ້ສະເໝີ.',
-      'เครื่องนี้จะหยุดพิมพ์ ไฟล์บันทึกจะถูกเก็บไว้เสมอ',
-      '这台电脑将停止打印。日志文件始终保留。',
-      'Máy này sẽ ngừng in. Tệp nhật ký luôn được giữ lại.'
-    ],
-    removeBtn: ['Remove', 'ລຶບອອກ', 'ลบออก', '移除', 'Gỡ bỏ'],
-    removeAsk: [
-      'This computer will stop printing. Type its name to confirm:',
-      'ຄອມພິວເຕີນີ້ຈະຢຸດພິມ. ພິມຊື່ຂອງມັນເພື່ອຢືນຢັນ:',
-      'เครื่องนี้จะหยุดพิมพ์ พิมพ์ชื่อเครื่องเพื่อยืนยัน:',
-      '这台电脑将停止打印。请输入它的名称以确认：',
-      'Máy này sẽ ngừng in. Nhập tên máy để xác nhận:'
-    ],
-    scopeAutostart: [
-      'Only stop it starting by itself',
-      'ພຽງແຕ່ຢຸດການເປີດເອງ',
-      'แค่หยุดการเปิดเอง',
-      '仅停止自动启动',
-      'Chỉ tắt tự khởi chạy'
-    ],
-    scopeFiles: ['Remove its files too', 'ລຶບໄຟລ໌ຂອງມັນນຳ', 'ลบไฟล์ของมันด้วย', '同时删除它的文件', 'Xoá cả tệp của nó'],
-    scopeEverything: [
-      'Remove everything, including printers and pairing',
-      'ລຶບທັງໝົດ ລວມທັງເຄື່ອງພິມ ແລະ ການຈັບຄູ່',
-      'ลบทั้งหมด รวมถึงเครื่องพิมพ์และการจับคู่',
-      '全部删除，包括打印机和配对',
-      'Xoá tất cả, kể cả máy in và ghép nối'
-    ],
-
-    rebootLabel: [
-      'Restart this computer',
-      'ເປີດຄອມພິວເຕີນີ້ຄືນໃໝ່',
-      'รีสตาร์ตเครื่องนี้',
-      '重启这台电脑',
-      'Khởi động lại máy tính'
-    ],
-    rebootNote: [
-      'Everything on this computer closes. Finish any open sale first.',
-      'ທຸກຢ່າງໃນຄອມພິວເຕີນີ້ຈະປິດ. ຈົບການຂາຍທີ່ຄ້າງຢູ່ກ່ອນ.',
-      'ทุกอย่างบนเครื่องนี้จะปิด ปิดการขายที่ค้างอยู่ก่อน',
-      '这台电脑上的所有程序都会关闭。请先结束未完成的销售。',
-      'Mọi thứ trên máy sẽ đóng. Hãy kết thúc đơn hàng đang mở trước.'
-    ],
-    rebootBtn: ['Restart computer', 'ເປີດເຄື່ອງຄືນໃໝ່', 'รีสตาร์ตเครื่อง', '重启电脑', 'Khởi động lại máy'],
-    rebootAsk: [
-      'Everything on this computer will close. Type its name to confirm:',
-      'ທຸກຢ່າງໃນຄອມພິວເຕີນີ້ຈະປິດ. ພິມຊື່ຂອງມັນເພື່ອຢືນຢັນ:',
-      'ทุกอย่างบนเครื่องนี้จะปิด พิมพ์ชื่อเครื่องเพื่อยืนยัน:',
-      '这台电脑上的一切都会关闭。请输入它的名称以确认：',
-      'Mọi thứ trên máy sẽ đóng. Nhập tên máy để xác nhận:'
-    ],
-    rebootQueue: [
-      'Jobs are still waiting to print. They will print after the computer restarts.',
-      'ຍັງມີວຽກລໍຖ້າພິມຢູ່. ພວກມັນຈະພິມຫຼັງຈາກເປີດເຄື່ອງຄືນໃໝ່.',
-      'ยังมีงานรอพิมพ์อยู่ จะพิมพ์หลังเครื่องเริ่มใหม่',
-      '仍有打印任务在排队，它们会在重启后打印。',
-      'Vẫn còn bản in đang chờ. Chúng sẽ in sau khi máy khởi động lại.'
-    ],
-
-    cacheLabel: [
-      'Clear stored print data',
-      'ລ້າງຂໍ້ມູນການພິມທີ່ເກັບໄວ້',
-      'ล้างข้อมูลการพิมพ์ที่เก็บไว้',
-      '清除已保存的打印数据',
-      'Xoá dữ liệu in đã lưu'
-    ],
-    cacheNote: [
-      'Your printers and this computer\\u2019s pairing are never touched.',
-      'ເຄື່ອງພິມ ແລະ ການຈັບຄູ່ຂອງຄອມພິວເຕີນີ້ຈະບໍ່ຖືກແຕະຕ້ອງ.',
-      'เครื่องพิมพ์และการจับคู่ของเครื่องนี้จะไม่ถูกแตะต้อง',
-      '不会影响您的打印机和这台电脑的配对。',
-      'Máy in và ghép nối của máy này không bị ảnh hưởng.'
-    ],
-    cacheBtn: ['Choose\\u2026', 'ເລືອກ\\u2026', 'เลือก\\u2026', '选择\\u2026', 'Chọn\\u2026'],
-    itemSpool: [
-      'Print jobs still waiting',
-      'ວຽກພິມທີ່ຍັງລໍຖ້າຢູ່',
-      'งานพิมพ์ที่ยังรออยู่',
-      '仍在排队的打印任务',
-      'Bản in vẫn đang chờ'
-    ],
-    itemHistory: ['Recent job records', 'ບັນທຶກວຽກຫຼ້າສຸດ', 'บันทึกงานล่าสุด', '最近的任务记录', 'Bản ghi công việc gần đây'],
-    itemSettled: ['Duplicate protection', 'ການປ້ອງກັນການພິມຊ້ຳ', 'การป้องกันพิมพ์ซ้ำ', '重复打印保护', 'Chống in trùng'],
-    itemSettledWarn: [
-      'Clearing this can let a repeated job print a second bill.',
-      'ການລ້າງອັນນີ້ອາດເຮັດໃຫ້ວຽກທີ່ສົ່ງຊ້ຳພິມໃບບິນທີສອງ.',
-      'การล้างนี้อาจทำให้งานที่ส่งซ้ำพิมพ์บิลใบที่สอง',
-      '清除后，重复的任务可能会打出第二张单。',
-      'Xoá mục này có thể khiến một đơn lặp in ra hoá đơn thứ hai.'
-    ],
-    itemLogs: ['Log files', 'ໄຟລ໌ບັນທຶກ', 'ไฟล์บันทึก', '日志文件', 'Tệp nhật ký'],
-    clearBtn: ['Clear selected', 'ລ້າງທີ່ເລືອກ', 'ล้างที่เลือก', '清除所选', 'Xoá mục đã chọn'],
-    cleared: ['Cleared.', 'ລ້າງແລ້ວ.', 'ล้างแล้ว', '已清除。', 'Đã xoá.'],
-
-    cancel: ['Cancel', 'ຍົກເລີກ', 'ยกเลิก', '取消', 'Huỷ'],
-    working: ['Working\\u2026', 'ກຳລັງດຳເນີນການ\\u2026', 'กำลังทำงาน\\u2026', '处理中\\u2026', 'Đang xử lý\\u2026'],
-    nameWrong: [
-      'That is not this computer\\u2019s name.',
-      'ນັ້ນບໍ່ແມ່ນຊື່ຂອງຄອມພິວເຕີນີ້.',
-      'นั่นไม่ใช่ชื่อของเครื่องนี้',
-      '这不是这台电脑的名称。',
-      'Đó không phải tên của máy này.'
-    ],
-    restartingLead: [
-      'Restarting\\u2026',
-      'ກຳລັງເປີດຄືນໃໝ່\\u2026',
-      'กำลังเริ่มใหม่\\u2026',
-      '正在重启\\u2026',
-      'Đang khởi động lại\\u2026'
-    ],
-    restartingSub: [
-      'This page updates on its own when it is back.',
-      'ໜ້ານີ້ຈະອັບເດດເອງເມື່ອມັນກັບມາ.',
-      'หน้านี้จะอัปเดตเองเมื่อกลับมา',
-      '恢复后此页面会自动更新。',
-      'Trang này sẽ tự cập nhật khi nó hoạt động lại.'
-    ],
-    backLead: ['It is back.', 'ມັນກັບມາແລ້ວ.', 'กลับมาแล้ว', '已恢复。', 'Đã hoạt động lại.'],
-    notBackLead: [
-      'It has not come back.',
-      'ມັນຍັງບໍ່ກັບມາ.',
-      'ยังไม่กลับมา',
-      '它没有恢复。',
-      'Nó chưa hoạt động lại.'
-    ],
-    notBackSub: [
-      'The reason will be in the log file:',
-      'ເຫດຜົນຈະຢູ່ໃນໄຟລ໌ບັນທຶກ:',
-      'เหตุผลจะอยู่ในไฟล์บันทึก:',
-      '原因会记录在日志文件中：',
-      'Lý do sẽ có trong tệp nhật ký:'
-    ],
-    rebootingLead: [
-      'This computer restarts in',
-      'ຄອມພິວເຕີນີ້ຈະເປີດຄືນໃໝ່ໃນ',
-      'เครื่องนี้จะรีสตาร์ตใน',
-      '这台电脑将在以下时间后重启',
-      'Máy tính sẽ khởi động lại sau'
-    ],
-    rebootStop: ['Stop the restart', 'ຢຸດການເປີດຄືນໃໝ່', 'หยุดการรีสตาร์ต', '停止重启', 'Dừng khởi động lại'],
-    removedLead: ['Removed.', 'ລຶບອອກແລ້ວ.', 'ลบออกแล้ว', '已移除。', 'Đã gỡ bỏ.'],
-    removedKept: ['Kept:', 'ເກັບໄວ້:', 'เก็บไว้:', '保留：', 'Giữ lại:'],
-    removedManual: [
-      'To finish, drag this to the Trash:',
-      'ເພື່ອໃຫ້ຈົບ ໃຫ້ລາກອັນນີ້ໄປໃສ່ຖັງຂີ້ເຫຍື້ອ:',
-      'เพื่อให้เสร็จ ลากสิ่งนี้ไปที่ถังขยะ:',
-      '要完成，请将它拖到废纸篓：',
-      'Để hoàn tất, kéo mục này vào Thùng rác:'
-    ]
-  };
-
-  function svcText(key) {
-    var row = SVC_T[key];
-    if (!row) return '';
-    return row[psIndex()] || row[0];
-  }
 
   /* Last /service body, last /service/cache body, and which strip is open. */
   var svcState = null;
@@ -397,7 +178,7 @@ export const SERVICE_SCRIPT = `
   function svcPost(path, payload) {
     return get('/service').then(function (res) {
       if (res.status !== 200 || !res.body || !res.body.confirm_token) {
-        throw new Error('This bridge did not offer a confirmation.');
+        throw new Error(svcText('noConfirm'));
       }
       svcState = res.body;
       var body = { confirm: res.body.confirm_token };
@@ -410,11 +191,11 @@ export const SERVICE_SCRIPT = `
 
   function svcReason(res) {
     var body = res && res.body ? res.body : null;
-    if (!body) return 'The bridge answered ' + (res ? res.status : '?') + '.';
+    if (!body) return t('answered', { status: res ? res.status : '?' });
     if (body.reason === 'queue-not-empty') return svcText('rebootQueue');
-    if (body.reason === 'busy') return 'Something else is already running.';
-    if (body.reason === 'confirm-required') return 'That confirmation expired \\u2014 press again.';
-    return (body.hint || body.detail || body.reason || 'It did not work.');
+    if (body.reason === 'busy') return svcText('busy');
+    if (body.reason === 'confirm-required') return svcText('confirmExpired');
+    return (body.hint || body.detail || body.reason || svcText('didNotWork'));
   }
 
   /* ---------------------------------------------------------------- actions */
@@ -489,14 +270,34 @@ export const SERVICE_SCRIPT = `
 
   /* --------------------------------------------------------------- rendering */
 
+  /*
+   * Reasons whose hint is a COMMAND or a settings path rather than a sentence. For these the
+   * translated reason explains WHY the button is missing and the bridge's own hint is still
+   * printed under it, in mono, because a command is not a thing to translate. For every other
+   * reason the hint IS the sentence, and the translation replaces it outright.
+   */
+  var SVC_HINT_IS_COMMAND = {
+    'needs-root': true, 'needs-elevation': true, 'installer-missing': true,
+    'no-session': true, 'unsupported-platform': true
+  };
+
   function svcRow(key, label, note, capability, buttonText, onClick) {
     var row = h('li', 'svc-row');
     var head = h('div', 'svc-head');
     var text = h('div', 'svc-text');
     text.appendChild(h('span', 'svc-label', label));
     text.appendChild(h('span', 'svc-note', note));
+    /*
+     * Gated on the HINT, not on the translation: a reason with no hint rendered nothing before
+     * and must keep rendering nothing, or rows the offer() below deliberately hides would come
+     * back as headings with a sentence and no button.
+     */
     if (capability && !capability.allowed && capability.hint) {
-      text.appendChild(h('span', 'svc-hint', capability.hint));
+      var why = tCode('svc.cap', capability.reason);
+      if (why) text.appendChild(h('span', 'svc-note', why));
+      if (!why || SVC_HINT_IS_COMMAND[capability.reason]) {
+        text.appendChild(h('span', 'svc-hint', capability.hint));
+      }
     }
     head.appendChild(text);
 
@@ -747,14 +548,11 @@ export const SERVICE_SCRIPT = `
     list.appendChild(h('dd', 'mono', value));
   }
 
-  var MANAGER_NAMES = {
-    'launchd-daemon': 'launchd (all users)',
-    'launchd-agent': 'launchd (this login)',
-    'scheduled-task': 'Task Scheduler',
-    systemd: 'systemd',
-    container: 'a container',
-    none: 'nobody \\u2014 started by hand'
-  };
+  /* 'launchd-daemon' -> svc.mgrLaunchdDaemon. A manager this page has never heard of prints
+     its own name, which is more use than an empty cell. */
+  function svcManager(manager) {
+    return tCode('svc.mgr', manager) || manager;
+  }
 
   function svcRender() {
     var card = $('svc');
@@ -788,11 +586,11 @@ export const SERVICE_SCRIPT = `
 
     var facts = $('svc-facts');
     clear(facts);
-    svcFact(facts, 'Started by', MANAGER_NAMES[svc.manager] || svc.manager);
-    svcFact(facts, 'Starts at boot', svc.autostart ? 'yes' : 'no');
-    if (svc.install_dir) svcFact(facts, 'Files', svc.install_dir);
-    svcFact(facts, 'Data', svc.state_dir);
-    if (svc.log_path) svcFact(facts, 'Log', svc.log_path);
+    svcFact(facts, svcText('factStartedBy'), svcManager(svc.manager));
+    svcFact(facts, svcText('factBoot'), t(svc.autostart ? 'yes' : 'no'));
+    if (svc.install_dir) svcFact(facts, svcText('factFiles'), svc.install_dir);
+    svcFact(facts, svcText('factData'), svc.state_dir);
+    if (svc.log_path) svcFact(facts, svcText('factLog'), svc.log_path);
 
     var rows = $('svc-rows');
     clear(rows);
