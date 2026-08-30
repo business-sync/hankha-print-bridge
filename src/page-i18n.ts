@@ -117,7 +117,12 @@ export const PAGE_STRINGS: Record<string, Row> = {
   cardRelay: ['Cloud relay', 'ຕົວກາງຄລາວ', 'ตัวกลางบนคลาวด์', '云中继', 'Trung chuyển đám mây'],
 
   colPrinter: ['Printer', 'ເຄື່ອງພິມ', 'เครื่องพิมพ์', '打印机', 'Máy in'],
-  colWhere: ['Where', 'ຢູ່ໃສ', 'อยู่ที่ไหน', '位置', 'Ở đâu'],
+  /*
+   * 'Address' rather than 'Where'. The column holds 192.168.1.103:9100, a spooler queue name or
+   * a device path — all of them answers to 'what is its address', none of them to a question
+   * that reads as a place in the room.
+   */
+  colWhere: ['Address', 'ທີ່ຢູ່', 'ที่อยู่', '地址', 'Địa chỉ'],
   colState: ['State', 'ສະຖານະ', 'สถานะ', '状态', 'Trạng thái'],
   colLatency: ['Latency', 'ຄວາມຊັກຊ້າ', 'ความหน่วง', '延迟', 'Độ trễ'],
   colActions: ['Actions', 'ການກະທຳ', 'การทำงาน', '操作', 'Thao tác'],
@@ -280,6 +285,20 @@ export const PAGE_STRINGS: Record<string, Row> = {
   stateOnline: ['Online', 'ອອນລາຍ', 'ออนไลน์', '在线', 'Trực tuyến'],
   stateOffline: ['Offline', 'ອອບລາຍ', 'ออฟไลน์', '离线', 'Ngoại tuyến'],
   notLoaded: ['not loaded', 'ໂຫຼດບໍ່ໄດ້', 'โหลดไม่ได้', '未载入', 'chưa tải được'],
+
+  /*
+   * Two printers sharing one name. printers.json is hand-edited and only ids are unique, so this
+   * is an ordinary state, not a corrupt one — and it is the one state where the label on a row
+   * cannot be trusted to say which machine Test print will reach.
+   */
+  dupName: ['Same name', 'ຊື່ຊ້ຳກັນ', 'ชื่อซ้ำ', '名称重复', 'Trùng tên'],
+  dupTitle: [
+    'Another printer is called this too. Check the address before you print to it.',
+    'ມີເຄື່ອງພິມອື່ນຊື່ດຽວກັນ. ໃຫ້ກວດທີ່ຢູ່ກ່ອນສັ່ງພິມ.',
+    'มีเครื่องพิมพ์อื่นชื่อเดียวกัน ตรวจที่อยู่ก่อนสั่งพิมพ์',
+    '另一台打印机也叫这个名字。打印前请先核对地址。',
+    'Một máy in khác cũng tên này. Hãy kiểm tra địa chỉ trước khi in.',
+  ],
 
   testPrint: ['Test print', 'ພິມທົດສອບ', 'พิมพ์ทดสอบ', '测试打印', 'In thử'],
   printingBusy: ['Printing…', 'ກຳລັງພິມ…', 'กำลังพิมพ์…', '正在打印…', 'Đang in…'],
@@ -794,6 +813,41 @@ export const PAGE_STRINGS: Record<string, Row> = {
     '从平板发送的账单将在这里打印。',
     'Hóa đơn gửi từ máy tính bảng sẽ in ở đây.',
   ],
+  /*
+   * What the pairing screen says about the printers themselves.
+   *
+   * 'Connected' is about the cloud relay and nothing else, and an owner reading it has every
+   * reason to think it covers the printer by the till. These rows are the half it does not say.
+   */
+  'ps.factsOneReady': [
+    '1 printer ready',
+    'ເຄື່ອງພິມ 1 ເຄື່ອງພ້ອມແລ້ວ',
+    'เครื่องพิมพ์ 1 เครื่องพร้อมแล้ว',
+    '1 台打印机就绪',
+    '1 máy in sẵn sàng',
+  ],
+  'ps.factsReady': [
+    '{n} printers ready',
+    'ເຄື່ອງພິມ {n} ເຄື່ອງພ້ອມແລ້ວ',
+    'เครื่องพิมพ์ {n} เครื่องพร้อมแล้ว',
+    '{n} 台打印机就绪',
+    '{n} máy in sẵn sàng',
+  ],
+  'ps.factsOffline': [
+    '{n} of {total} printers are not answering',
+    'ເຄື່ອງພິມ {n} ໃນ {total} ເຄື່ອງບໍ່ຕອບ',
+    'เครื่องพิมพ์ {n} จาก {total} เครื่องไม่ตอบ',
+    '{total} 台打印机中有 {n} 台没有回应',
+    '{n} trong {total} máy in không trả lời',
+  ],
+  'ps.factsNone': [
+    'No printers set up on this computer yet',
+    'ຍັງບໍ່ມີເຄື່ອງພິມໃນຄອມພິວເຕີນີ້',
+    'ยังไม่มีเครื่องพิมพ์บนเครื่องนี้',
+    '这台电脑尚未设置打印机',
+    'Máy tính này chưa có máy in nào',
+  ],
+
   'ps.removedLead': [
     'This computer was disconnected',
     'ຄອມພິວເຕີເຄື່ອງນີ້ຖືກຕັດການເຊື່ອມຕໍ່',

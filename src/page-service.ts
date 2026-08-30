@@ -281,6 +281,17 @@ export const SERVICE_SCRIPT = `
     'no-session': true, 'unsupported-platform': true
   };
 
+  /*
+   * Which rows end printing rather than pause it.
+   *
+   * Restart is a few seconds of nothing and comes back on its own. Remove uninstalls the bridge,
+   * and Restart the computer drops whatever sale is open on this till. All three were the same
+   * ghost button, so the first thing telling an operator that one of them was different in kind
+   * was the confirmation strip — after it had already been pressed. The strip still does the
+   * real work; this is what stops them being pressed alike.
+   */
+  var SVC_RISKY = { remove: true, reboot: true };
+
   function svcRow(key, label, note, capability, buttonText, onClick) {
     var row = h('li', 'svc-row');
     var head = h('div', 'svc-head');
@@ -302,7 +313,8 @@ export const SERVICE_SCRIPT = `
     head.appendChild(text);
 
     if (capability && capability.allowed) {
-      var button = h('button', 'btn btn-ghost btn-sm', buttonText);
+      var button = h('button',
+        'btn btn-ghost btn-sm' + (SVC_RISKY[key] ? ' btn-risk' : ''), buttonText);
       button.type = 'button';
       button.disabled = svcBusy;
       button.addEventListener('click', function () {

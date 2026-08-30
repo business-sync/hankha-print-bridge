@@ -90,8 +90,15 @@ const CSS = `
   --border: #E7E1D9;
   --border-strong: #D5CCC2;
   --text: #1B1917;
-  --muted: #6D6660;
-  --faint: #9B938B;
+  /*
+   * Both grey tiers carry body-sized text — a card note, a column header, the sentence under a
+   * URL — so both have to clear 4.5:1, and the old --faint never did: #9B938B on --bg was
+   * 2.8:1, which is a WCAG AA failure on a screen read at arm's length in a kitchen. Raising it
+   * alone would have collapsed the two tiers into one shade, so --muted moved down as --faint
+   * moved up. Measured against --bg, the palest thing either sits on: muted 6.1:1, faint 4.7:1.
+   */
+  --muted: #625B55;
+  --faint: #736D66;
   --ok: #15703A;      --ok-bg: #E7F4EB;
   --bad: #B32424;     --bad-bg: #FBEBEB;
   --warn: #8A5D04;    --warn-bg: #FBF1DE;
@@ -111,8 +118,9 @@ const CSS = `
     --border: #302B27;
     --border-strong: #443C36;
     --text: #F4F0EC;
-    --muted: #A39A92;
-    --faint: #786F68;
+    /* Same rule, the other way up: measured against --surface-2, muted 7.0:1, faint 5.0:1. */
+    --muted: #B0A79F;
+    --faint: #948B83;
     --ok: #5FD08A;      --ok-bg: #12261A;
     --bad: #FF8A8A;     --bad-bg: #2B1616;
     --warn: #F3C05F;    --warn-bg: #2A2011;
@@ -146,19 +154,33 @@ body {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
 }
 .sub .sep { color: var(--faint); }
+/*
+ * Outline, not fill. The accent is the page's call-to-action colour and this pill is not a
+ * control — filled in orange beside Refresh it read as a third button, and the one thing on the
+ * header that cannot be pressed was the most eye-catching.
+ */
 .badge {
   font: 600 11.5px/1 var(--mono);
   padding: 5px 8px; border-radius: 999px;
-  background: var(--accent-soft); color: var(--accent);
-  border: 1px solid transparent;
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border-strong);
 }
 .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 
 /* ------------------------------------------------------------------ controls */
 
+/*
+ * min-height, not padding, is what sets the hit area: the label inside these buttons is one
+ * short word in five different scripts, and Lao and Thai sit taller than Latin, so a height
+ * derived from padding alone differed by language. Stated once, it does not.
+ */
 .btn {
   font: 500 13px var(--sans);
-  padding: 7px 13px; border-radius: 8px; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 34px; padding: 7px 13px; border-radius: 8px; cursor: pointer;
+  /* One short word, in five scripts. Wrapping it made a two-line button in the Actions column
+     the moment min-height gave the row somewhere to wrap into. */
+  white-space: nowrap;
   background: var(--accent); color: var(--accent-ink);
   border: 1px solid transparent;
 }
@@ -167,12 +189,43 @@ body {
 .btn:disabled { opacity: .55; cursor: default; transform: none; filter: none; }
 .btn-ghost { background: var(--surface); color: var(--text); border-color: var(--border-strong); }
 .btn-ghost:hover { background: var(--surface-2); filter: none; }
-.btn-sm { font-size: 12px; padding: 4px 9px; border-radius: 7px; }
+.btn-sm { font-size: 12px; min-height: 30px; padding: 4px 10px; border-radius: 7px; }
+
+/*
+ * The risky half of the maintenance card. Restart pauses printing for a few seconds; Remove and
+ * Restart the computer end it — one uninstalls the bridge, the other drops whatever sale is
+ * open on this till. They were all the same ghost button, so the only thing telling them apart
+ * was the sentence above them, and the confirmation strip was the first hint that one of them
+ * was different in kind.
+ */
+.btn-risk { color: var(--bad); border-color: var(--bad); }
+.btn-risk:hover { background: var(--bad-bg); }
+
+/*
+ * Fingers, not a mouse. This page is opened on the till PC most of the time, where a 30px
+ * target is comfortable and a 44px one would double the height of every table row for nothing.
+ * A coarse pointer is the case the size guidance is actually about, and there the whole page
+ * moves to 44px at once rather than one control at a time.
+ */
+@media (pointer: coarse) {
+  .btn { min-height: 44px; padding: 10px 16px; }
+  .btn-sm { min-height: 44px; font-size: 13px; padding: 8px 14px; }
+  .lang, .ps-details, input[type=password], input[type=text] { min-height: 44px; }
+  .ps-langs button { min-height: 44px; padding: 8px 14px; }
+  .svc-items input[type=checkbox] { width: 20px; height: 20px; }
+}
+
+/*
+ * Two rings, because one colour cannot serve both button kinds. The accent outline is clear on
+ * every neutral surface here, and nearly invisible around a button already filled with the
+ * accent — so a filled .btn gets a ring of page background between itself and the outline.
+ */
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn:focus-visible { box-shadow: 0 0 0 2px var(--bg); }
 
 input[type=password], input[type=text] {
   font: 13px var(--mono);
-  padding: 8px 10px; border-radius: 8px;
+  min-height: 34px; padding: 8px 10px; border-radius: 8px;
   border: 1px solid var(--border-strong);
   background: var(--surface); color: var(--text);
   min-width: 0;
@@ -232,6 +285,11 @@ input[type=password], input[type=text] {
  */
 .grid { display: grid; gap: 14px; grid-template-columns: 1fr; align-items: start; }
 @media (min-width: 800px) { .grid { grid-template-columns: 1fr 1fr; } }
+/*
+ * overflow stays hidden — it is what cuts the card-head's background to the rounded corner, and
+ * the clip/overflow-clip-margin pair that would let a focus ring escape it is younger than the
+ * browsers a venue PC actually runs. The ring is given room INSIDE the box instead; see .scroll.
+ */
 .card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius); overflow: hidden;
@@ -246,7 +304,13 @@ input[type=password], input[type=text] {
   margin: 0; font-size: 11px; font-weight: 650;
   letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
 }
+/*
+ * Mostly a quiet count ("3 configured"). The relay card puts a status pill in here instead: its
+ * note is the one that says the venue's phones cannot print, and stating that in the palest
+ * text on the page was the wrong weight for it.
+ */
 .card-note { margin-left: auto; font-size: 12px; color: var(--faint); }
+.card-note .pill { vertical-align: 1px; }
 .card-body { padding: 14px 16px; }
 .card-body > p { margin: 0 0 10px; color: var(--muted); font-size: 12.5px; }
 .card-body > p:last-child { margin-bottom: 0; }
@@ -259,7 +323,14 @@ input[type=password], input[type=text] {
 
 /* ------------------------------------------------------------------ tables */
 
-.scroll { overflow-x: auto; }
+/*
+ * The padding is not spacing, it is room for a focus ring.
+ *
+ * A box that scrolls on one axis is a scroll container on BOTH, so this clips vertically as well
+ * — and the buttons in a table's last row sit flush against its bottom edge, which cut the ring
+ * off the one control a keyboard user was actually on. 4px is the 2px outline plus its offset.
+ */
+.scroll { overflow-x: auto; padding-bottom: 4px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 /*
  * A floor for the tables that carry real columns. A plain width of 100% makes a narrow screen
@@ -278,6 +349,14 @@ td { padding: 11px 16px; border-bottom: 1px solid var(--border); vertical-align:
 tr:last-child td { border-bottom: 0; }
 .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .name { font-weight: 550; }
+/*
+ * Two printers can carry the same name — printers.json is hand-edited and nothing stops it —
+ * and the row a technician then presses Test print on is a coin toss. The marker says the names
+ * collide; renderPrinters also lifts the address into the name cell for exactly these rows, so
+ * the bold line a scanning eye reads is the one that tells them apart.
+ */
+.dupe { margin-left: 7px; }
+.name-where { display: block; margin-top: 3px; font: 12px var(--mono); color: var(--warn); }
 .detail { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: break-word; }
 
 /* ------------------------------------------------------------------ status marks */
@@ -300,8 +379,15 @@ tr:last-child td { border-bottom: 0; }
 .pill-ok   { background: var(--ok-bg);   color: var(--ok); }
 .pill-bad  { background: var(--bad-bg);  color: var(--bad); }
 .pill-warn { background: var(--warn-bg); color: var(--warn); }
-/* The neutral one, named rather than left as a bare .pill built from an empty string. */
-.pill-off  { background: var(--surface-2); color: var(--muted); }
+/*
+ * The neutral one, named rather than left as a bare .pill built from an empty string — and
+ * ringed, because its fill IS the card-head's own background. On the relay card, where this pill
+ * says the venue's phones cannot print through this computer, it rendered as plain text.
+ */
+.pill-off  {
+  background: var(--surface-2); color: var(--muted);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
 
 .mono { font: 12.5px/1.5 var(--mono); }
 .empty { color: var(--faint); font-size: 13px; padding: 4px 0; }
@@ -454,16 +540,42 @@ noscript .banner { display: block; }
 .ps-icon.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
 .ps-icon.bad{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
 .ps-icon.warn{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}
-.ps-langs{display:flex;gap:4px;flex-wrap:wrap;justify-content:center;margin-top:4px}
+/*
+ * The count of printers and how many are answering, on the screen a shop owner reads.
+ *
+ * It is the one fact worth putting in the empty space above Details: "connected" answers whether
+ * Hankha can reach this computer, and says nothing about whether the printer by the till is on.
+ */
+.ps-facts{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);margin-top:4px}
+
+/*
+ * Two language pickers, deliberately: five names laid out here where the screen is empty and a
+ * person may not read the language it is currently in, and a select in the diagnostics header
+ * where there is no room for five. The border is what makes them read as the same control in
+ * two sizes rather than as two unrelated widgets.
+ */
+.ps-langs{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;margin-top:4px}
 .ps-langs button{
-  appearance:none;border:0;background:transparent;font:inherit;font-size:12px;font-weight:700;
-  color:var(--muted);padding:4px 9px;border-radius:8px;cursor:pointer;
+  appearance:none;background:var(--surface);font:inherit;font-size:12px;font-weight:700;
+  color:var(--muted);padding:6px 11px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--border);
 }
-.ps-langs button[aria-pressed=true]{background:var(--accent-soft);color:var(--accent)}
+.ps-langs button:hover{background:var(--surface-2)}
+.ps-langs button[aria-pressed=true]{
+  background:var(--accent-soft);color:var(--accent);border-color:var(--accent);
+}
+
+/*
+ * The only way from this screen to everything else on the page, under half a viewport of
+ * nothing. As an underlined 13px text link it read as a footnote; it is the screen's secondary
+ * action and now looks like one.
+ */
 .ps-details{
-  appearance:none;border:0;background:transparent;font:inherit;font-size:13px;color:var(--muted);
-  text-decoration:underline;cursor:pointer;padding:8px;
+  appearance:none;font:inherit;font-size:13px;font-weight:600;cursor:pointer;
+  color:var(--text);background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:9px;padding:10px 18px;min-height:40px;
 }
+.ps-details:hover{background:var(--surface-2)}
 @media (prefers-reduced-motion:no-preference){
   .ps-dot{animation:pairpulse 1.6s ease-in-out infinite}
 }
@@ -706,10 +818,25 @@ ${I18N_SCRIPT}
     return t('ago', { d: duration(delta) });
   }
 
+  /*
+   * A clock, and the date as well once the job is not from today.
+   *
+   * Recent jobs holds the last twelve, and a bridge that printed four slips yesterday evening
+   * still shows them at 09:00 the next morning — as bare times, which read as this morning. The
+   * date is dropped for today's jobs because it is the same on every row and repeating it turns
+   * the narrowest column into the widest.
+   */
   function clockOf(iso) {
     var at = Date.parse(iso);
     if (isNaN(at)) return '\\u2014';
-    return new Date(at).toLocaleTimeString(psLocale());
+    var when = new Date(at);
+    var time = when.toLocaleTimeString(psLocale());
+    var today = new Date();
+    var sameDay = when.getFullYear() === today.getFullYear()
+      && when.getMonth() === today.getMonth()
+      && when.getDate() === today.getDate();
+    if (sameDay) return time;
+    return when.toLocaleDateString(psLocale(), { month: 'short', day: 'numeric' }) + ' ' + time;
   }
 
   function sizeOf(n) {
@@ -836,6 +963,7 @@ ${I18N_SCRIPT}
 
     var byId = {};
     for (var i = 0; i < configured.length; i++) byId[configured[i].id] = configured[i];
+    var dupes = duplicateNames(statuses);
 
     clear(body);
     $('printers-note').textContent = statuses.length === 1
@@ -854,22 +982,62 @@ ${I18N_SCRIPT}
     }
 
     for (var j = 0; j < statuses.length; j++) {
-      body.appendChild(printerRow(statuses[j], byId[statuses[j].id], registryOk));
+      body.appendChild(printerRow(statuses[j], byId[statuses[j].id], registryOk, dupes));
     }
   }
 
-  function printerRow(status, record, registryOk) {
+  /*
+   * Which display names more than one printer answers to.
+   *
+   * Nothing stops printers.json holding two printers called Printer2 — ids are unique, names are
+   * not — and when it does, the bold label is the same on both rows and the technician pressing
+   * Test print is guessing which machine will produce paper. Compared case- and space-blind,
+   * because Counter and 'counter ' are the same name to everyone but a string comparison.
+   */
+  function duplicateNames(statuses) {
+    var seen = {};
+    var dupes = {};
+    for (var i = 0; i < statuses.length; i++) {
+      var key = String(statuses[i].name || '').trim().toLowerCase();
+      if (!key) continue;
+      if (seen[key]) dupes[key] = true;
+      seen[key] = true;
+    }
+    return dupes;
+  }
+
+  function isDuplicate(status, dupes) {
+    return Boolean(dupes && dupes[String(status.name || '').trim().toLowerCase()]);
+  }
+
+  function printerRow(status, record, registryOk, dupes) {
     var tr = h('tr');
     var label = status.name || status.id;
+    var at = locate(status, record, registryOk);
+    var shared = isDuplicate(status, dupes);
+    /* What a test print's result says it printed to, and what the live region reads out. Both
+       have to name the machine unambiguously or the row's own disambiguation is undone. */
+    var spoken = shared ? label + ' (' + at + ')' : label;
 
     var first = h('td');
     first.appendChild(dot(!status.enabled ? 'off' : status.online ? 'ok' : 'bad'));
     first.appendChild(h('span', 'name', label));
+    /*
+     * The address is repeated here, in the name cell, ONLY when the name is shared. The Address
+     * column already carries it for every row, but a scanning eye reads the bold label and
+     * stops — so for the two rows where the bold label is a lie, the qualifier has to sit in it.
+     */
+    if (shared) {
+      var mark = h('span', 'pill pill-warn dupe', t('dupName'));
+      mark.title = t('dupTitle');
+      first.appendChild(mark);
+      first.appendChild(h('span', 'name-where', at));
+    }
     first.appendChild(h('span', 'detail mono', status.id));
     tr.appendChild(first);
 
     var where = h('td', 'mono');
-    where.textContent = locate(status, record, registryOk);
+    where.textContent = at;
     where.appendChild(h('span', 'detail', status.transport + ' · ' + status.type + ' · ' + status.language));
     tr.appendChild(where);
 
@@ -897,7 +1065,7 @@ ${I18N_SCRIPT}
     var test = h('button', 'btn btn-ghost btn-sm', t('testPrint'));
     test.type = 'button';
     test.disabled = !status.enabled;
-    test.addEventListener('click', function () { testPrint(status, test, feedback); });
+    test.addEventListener('click', function () { testPrint(status, spoken, test, feedback); });
     actions.appendChild(test);
 
     /*
@@ -914,7 +1082,7 @@ ${I18N_SCRIPT}
       ident.type = 'button';
       ident.title = t('identifyTitle');
       ident.disabled = !status.enabled;
-      ident.addEventListener('click', function () { identify(status, ident, feedback); });
+      ident.addEventListener('click', function () { identify(status, spoken, ident, feedback); });
       actions.appendChild(ident);
     }
 
@@ -949,7 +1117,7 @@ ${I18N_SCRIPT}
    * and it MUST come back to zero on every path — including a rejection. When it did not, the
    * page stopped refreshing for the rest of the session.
    */
-  function rowAction(status, button, feedback, busyLabel, busyText, run, describe) {
+  function rowAction(name, button, feedback, busyLabel, busyText, run, describe) {
     testsInFlight++;
     var label = button.textContent;
     button.disabled = true;
@@ -960,11 +1128,11 @@ ${I18N_SCRIPT}
     return run().then(function (res) {
       var told = describe(res);
       setFeedback(feedback, told.kind, told.text);
-      announce(label + ' — ' + status.name + ': ' + told.text);
+      announce(label + ' — ' + name + ': ' + told.text);
     }, function (err) {
       var why = (err && err.message) || t('noAnswer');
       setFeedback(feedback, 'bad', why);
-      announce(label + ' — ' + status.name + ': ' + why);
+      announce(label + ' — ' + name + ': ' + why);
     }).then(function () {
       button.textContent = label;
       button.disabled = false;
@@ -973,9 +1141,9 @@ ${I18N_SCRIPT}
     });
   }
 
-  function testPrint(status, button, feedback) {
+  function testPrint(status, spoken, button, feedback) {
     rowAction(
-      status, button, feedback, t('printingBusy'), t('sendingTest'),
+      spoken, button, feedback, t('printingBusy'), t('sendingTest'),
       function () { return post('/printers/' + encodeURIComponent(status.id) + '/test', undefined, TEST_TIMEOUT_MS); },
       function (res) {
         var body = res.body || {};
@@ -996,9 +1164,9 @@ ${I18N_SCRIPT}
    * is invisible: the printer is online, the job succeeds, and the paper is nonsense. This is the
    * only way to see it without walking to the printer.
    */
-  function identify(status, button, feedback) {
+  function identify(status, spoken, button, feedback) {
     rowAction(
-      status, button, feedback, t('asking'), t('askingWhat'),
+      spoken, button, feedback, t('asking'), t('askingWhat'),
       function () { return post('/printers/' + encodeURIComponent(status.id) + '/identify', undefined, TEST_TIMEOUT_MS); },
       function (res) {
         var body = res.body || {};
@@ -1136,7 +1304,7 @@ ${I18N_SCRIPT}
   function cancelJob(job, button, feedback) {
     var name = job.printer_name || job.printer_id;
     rowAction(
-      { id: job.job_id, name: name }, button, feedback, t('cancelling'), t('withdrawing'),
+      name, button, feedback, t('cancelling'), t('withdrawing'),
       function () { return post('/jobs/' + encodeURIComponent(job.job_id) + '/cancel', {}); },
       function (res) {
         if (res.status === 200) return { kind: 'ok', text: t('cancelled') };
@@ -1160,7 +1328,9 @@ ${I18N_SCRIPT}
       first.appendChild(h('span', 'name', item.kind));
       tr.appendChild(first);
       var state = h('td');
-      state.appendChild(h('span', 'pill pill-' + (item.available ? 'ok' : ''),
+      /* pill-off, not an empty modifier: the neutral pill is a named class and building
+         'pill pill-' from an empty string was relying on the base .pill alone to style it. */
+      state.appendChild(h('span', 'pill pill-' + (item.available ? 'ok' : 'off'),
         t(item.available ? 'available' : 'unavailable')));
       if (item.reason) state.appendChild(h('span', 'detail', item.reason));
       tr.appendChild(state);
@@ -1201,9 +1371,16 @@ ${I18N_SCRIPT}
       list.appendChild(h('dd', null, rows[i][1]));
     }
 
-    $('relay-note').textContent = t(!relay.enrolled
-      ? 'relayNotEnrolled'
-      : relay.connected ? 'relayOnline' : 'relayOffline');
+    /*
+     * A pill, not the card-note's own faint text. This note is the one that says the venue's
+     * phones and tablets cannot print through this computer, and it was set in the palest colour
+     * on the page — the same weight as the printer count two cards up.
+     */
+    var note = $('relay-note');
+    clear(note);
+    note.appendChild(h('span',
+      'pill pill-' + (!relay.enrolled ? 'off' : relay.connected ? 'ok' : 'bad'),
+      t(!relay.enrolled ? 'relayNotEnrolled' : relay.connected ? 'relayOnline' : 'relayOffline')));
 
     /*
      * Hidden once the bridge is paired AND connected, including when the pairing came from
@@ -1583,6 +1760,10 @@ ${I18N_SCRIPT}
         registryPath = status.body.registry_path || '';
         renderRegistryPath(registryPath);
 
+        /* Read by the pairing screen, which has no /status of its own and is the screen a shop
+           owner is actually looking at. See psFacts(). */
+        psPrinters = { total: (status.body.printers || []).length, offline: offline.length };
+
         announce(offline.length === 0
           ? t('allAnswering')
           : offline.length === 1 ? t('offlineOne') : t('offlineMany', { n: offline.length }));
@@ -1721,6 +1902,8 @@ ${I18N_SCRIPT}
   var psShowDetails = false;
   /* Null until the first /pairing answer. Kept so a language switch can redraw without refetching. */
   var psState = null;
+  /* {total, offline}, from the diagnostics poll behind this screen. Null until it first answers. */
+  var psPrinters = null;
 
   /*
    * Which of the five screens to show.
@@ -1757,6 +1940,12 @@ ${I18N_SCRIPT}
     var showPairing = screen !== 'hidden' && !psShowDetails;
     $('pairscreen').hidden = !showPairing;
     $('report').hidden = showPairing;
+    /*
+     * The footer names printers.json and says this page never edits the registry. Both are true
+     * and both are for a technician; on the screen a shop owner reads it is a file path they
+     * have no reason to know, sitting under the one instruction that matters.
+     */
+    $('foot').hidden = showPairing;
     $('ps-details').textContent = psShowDetails ? psText('hideDetails') : psText('details');
     if (screen === 'hidden') return;
 
@@ -1770,6 +1959,7 @@ ${I18N_SCRIPT}
     psShow('ps-meta', false);
     psShow('ps-action', false);
     psShow('ps-icon', false);
+    psShow('ps-facts', false);
     icon.className = 'ps-icon';
 
     var who = [state.org_name, state.branch_name].filter(Boolean).join(' \u00b7 ');
@@ -1807,6 +1997,7 @@ ${I18N_SCRIPT}
       psShow('ps-icon', true);
       lead.textContent = psText('okLead');
       sub.textContent = who ? who + ' \u2014 ' + psText('okSub') : psText('okSub');
+      psFacts();
       return;
     }
 
@@ -1816,6 +2007,9 @@ ${I18N_SCRIPT}
       psShow('ps-icon', true);
       lead.textContent = psText('offlineLead');
       sub.textContent = psText('offlineSub');
+      /* Printing over the LAN is unaffected by the relay being unreachable, so the printer
+         count is the useful half of this screen rather than a decoration on it. */
+      psFacts();
       return;
     }
 
@@ -1827,6 +2021,32 @@ ${I18N_SCRIPT}
     sub.textContent = psText('removedSub');
     action.textContent = psText('removedBtn');
     psShow('ps-action', true);
+  }
+
+  /*
+   * The one fact worth the space above Details.
+   *
+   * Connected answers whether Hankha can reach this computer; it says nothing about whether the
+   * printer by the till is switched on, which is the question the owner reading this screen
+   * actually has. The counts come from the diagnostics poll behind the screen, so for the first
+   * few seconds there are none — and the line stays hidden rather than claiming zero.
+   */
+  function psFacts() {
+    if (!psPrinters) return;
+    var kind = 'off';
+    var text = psText('factsNone');
+    if (psPrinters.total > 0 && psPrinters.offline === 0) {
+      kind = 'ok';
+      text = psPrinters.total === 1
+        ? psText('factsOneReady')
+        : t('ps.factsReady', { n: psPrinters.total });
+    } else if (psPrinters.total > 0) {
+      kind = 'bad';
+      text = t('ps.factsOffline', { n: psPrinters.offline, total: psPrinters.total });
+    }
+    $('ps-facts-dot').className = 'dot dot-' + kind;
+    $('ps-facts-text').textContent = text;
+    psShow('ps-facts', true);
   }
 
   /*
@@ -1982,7 +2202,8 @@ export const INDEX_HTML = `<!doctype html>
     <p class="ps-sub" id="ps-sub"></p>
     <p class="ps-meta" id="ps-meta" hidden><span class="dot dot-warn ps-dot"></span><span id="ps-metatext"></span></p>
     <button type="button" class="btn" id="ps-action" hidden></button>
-    <div class="ps-langs" id="ps-langs"></div>
+    <p class="ps-facts" id="ps-facts" hidden><span class="dot" id="ps-facts-dot"></span><span id="ps-facts-text"></span></p>
+    <div class="ps-langs" id="ps-langs" role="group" data-t-label="language"></div>
     <button type="button" class="ps-details" id="ps-details"></button>
   </section>
 
@@ -2110,7 +2331,7 @@ export const INDEX_HTML = `<!doctype html>
 ${SERVICE_HTML}
   </main>
 
-  <footer class="foot">
+  <footer class="foot" id="foot">
     <!-- The filename sits INSIDE this sentence, and the words move around it between
          languages, so applyChrome() splits on {file} rather than this being a data-t. -->
     <span id="foot-one"></span>
