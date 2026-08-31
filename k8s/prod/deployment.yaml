@@ -10,11 +10,14 @@ spec:
     matchLabels:
       app: hankha-print-bridge
   replicas: 1
-  # Recreate, not RollingUpdate. Two things forbid an overlap: the relay identity in `relay.json`
-  # is single-holder by construction (two pods sharing one `bridge_id` would race each other for
-  # the same claimed jobs), and the PVC below is ReadWriteOnce. `maxSurge: 25%` rounds UP to 1
-  # on a single replica, so the old strategy started the replacement BEFORE the old pod exited —
-  # which on a multi-node cluster deadlocks on the volume.
+  # Recreate, not RollingUpdate, and it is now the ONLY thing keeping this single-holder.
+  # The relay identity in `relay.json` cannot be shared: two pods on one `bridge_id` would both
+  # claim from the same queue and race for the same jobs. This used to be enforced twice over,
+  # because the state volume was a ReadWriteOnce PVC — but that PVC could never bind on this
+  # cluster (see the volume below), so the storage layer no longer refuses a second attacher.
+  # `replicas: 1` + `Recreate` is the whole guarantee. Do not raise the replica count, and do
+  # not switch to RollingUpdate: `maxSurge: 25%` rounds UP to 1 on a single replica, which
+  # starts the replacement BEFORE the old pod exits.
   strategy:
     type: Recreate
   template:
@@ -76,12 +79,29 @@ spec:
         # Must match PRINT_BRIDGE_STATE_DIR in config.yaml.
         - name: state
           mountPath: /var/lib/hankha-print-bridge
+          # Own subdirectory on the shared export, exactly as hankha-backend does for
+          # /app/uploads. The export root is shared with every other app that mounts it.
+          subPath: hankha-print-bridge/state
 
       volumes:
       - name: localtime
         hostPath:
           path: /usr/share/zoneinfo/Asia/Bangkok
+      # The cluster's real storage: an NFS export on gfs-01, mounted directly. This was a
+      # ReadWriteOnce PVC with `storageClassName` omitted "so the cluster default applies" —
+      # but this cluster has NO StorageClasses and NO PersistentVolumes at all, so there is no
+      # default and nothing to provision from. The claim sat Pending on
+      # `FailedBinding: no persistent volumes available … and no storage class is set`, the pod
+      # sat Unschedulable on `unbound immediate PersistentVolumeClaims`, and because `Recreate`
+      # deletes the old pod FIRST, the bridge was down outright for ~2.3 days across nine
+      # consecutive revisions rather than merely failing to update.
+      #
+      # Direct NFS is what every mounted volume in this namespace uses (hankha-backend's
+      # /app/uploads is the live example). Trade-off taken knowingly: NFS is RWX, so the storage
+      # layer no longer enforces single-holder — see the `strategy` comment above, which now
+      # carries that guarantee alone.
       - name: state
-        persistentVolumeClaim:
-          claimName: hankha-print-bridge-state
+        nfs:
+          path: /gv0
+          server: gfs-01
       restartPolicy: Always
