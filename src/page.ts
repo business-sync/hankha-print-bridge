@@ -534,6 +534,26 @@ noscript .banner { display: block; }
   font-family:var(--mono);font-size:clamp(26px,6vw,38px);font-weight:700;letter-spacing:.16em;
 }
 .ps-meta{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+/*
+ * The one-computer action, and the rule that separates it from the QR beneath.
+ *
+ * Sized above the code rather than beside it: the two are alternatives, not a pair, and a shop
+ * with a tablet must still be able to ignore the top half without reading it twice.
+ */
+.ps-here{display:flex;flex-direction:column;align-items:center;gap:8px;width:min(360px,90vw)}
+/* white-space is overridden from .btn: that nowrap exists for one-word buttons in a table
+   column, and "Pair on this computer" is five words in five scripts across a full-width
+   control — in Lao it is wider than the 360px this sits in. Two lines beat a clipped one. */
+.ps-herebtn{
+  width:100%;min-height:48px;font-size:15px;font-weight:700;text-decoration:none;
+  white-space:normal;text-align:center;line-height:1.35;padding:11px 16px;
+}
+.ps-heresub{font-size:13px;color:var(--muted);line-height:1.5;max-width:34ch}
+.ps-or{
+  display:flex;align-items:center;gap:12px;width:min(360px,90vw);
+  font-size:12px;font-weight:700;letter-spacing:.04em;color:var(--faint);text-transform:uppercase;
+}
+.ps-or::before,.ps-or::after{content:'';flex:1;height:1px;background:var(--border)}
 .ps-icon{
   width:64px;height:64px;border-radius:999px;display:grid;place-items:center;font-size:30px;
 }
@@ -1957,6 +1977,8 @@ ${I18N_SCRIPT}
     psShow('ps-qr', false);
     psShow('ps-codewrap', false);
     psShow('ps-meta', false);
+    psShow('ps-here', false);
+    psShow('ps-or', false);
     psShow('ps-action', false);
     psShow('ps-icon', false);
     psShow('ps-facts', false);
@@ -1965,8 +1987,24 @@ ${I18N_SCRIPT}
     var who = [state.org_name, state.branch_name].filter(Boolean).join(' \u00b7 ');
 
     if (screen === 'waiting' || screen === 'removed-repairing') {
-      lead.textContent = psText('waitLead');
+      /*
+       * Two ways to pair, ranked by which machine the operator is standing at.
+       *
+       * With a till address from the API this computer can hand its own code straight to the
+       * POS, which is the only route that works when both run here — nothing can scan its own
+       * screen. Without one (POS_BASE_URL unset) the screen is exactly what it was, so a venue
+       * that pairs from a tablet sees no change and no dead button.
+       */
+      var here = state.pos_pair_url ? true : false;
+      lead.textContent = here ? psText('hereLead') : psText('waitLead');
       sub.textContent = psText('waitSub');
+      if (here) {
+        $('ps-herebtn').textContent = psText('hereBtn');
+        $('ps-heresub').textContent = psText('hereSub');
+        psShow('ps-here', true);
+        $('ps-or').textContent = psText('orScan');
+        psShow('ps-or', true);
+      }
       if (state.qr_svg) {
         $('ps-qr').innerHTML = state.qr_svg;
         psShow('ps-qr', true);
@@ -2194,6 +2232,19 @@ export const INDEX_HTML = `<!doctype html>
   <section class="pairscreen" id="pairscreen" hidden>
     <div class="ps-icon" id="ps-icon" hidden></div>
     <h2 class="ps-lead" id="ps-lead"></h2>
+    <!--
+      The one-computer path, above the QR because on the machine that has both it is the only
+      one that works. An anchor, not a button posting a form: this page's CSP is
+      form-action 'none', and a link navigation is what carries the code across the
+      mixed-content wall an XHR cannot cross.
+      Ids are prefixed ps- like the rest of this screen; the relay card below already owns
+      pair-code and pair-lead.
+    -->
+    <div class="ps-here" id="ps-here" hidden>
+      <a class="btn ps-herebtn" id="ps-herebtn" href="/pairing/handoff"></a>
+      <p class="ps-heresub" id="ps-heresub"></p>
+    </div>
+    <p class="ps-or" id="ps-or" hidden></p>
     <div class="ps-qr" id="ps-qr" hidden></div>
     <div class="ps-codewrap" id="ps-codewrap" hidden>
       <span class="ps-codelabel" id="ps-codelabel"></span>

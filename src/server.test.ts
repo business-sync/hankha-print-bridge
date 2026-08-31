@@ -9,7 +9,23 @@ import { localInterfaces } from './lan.js';
 import { loadState, type RelayState, saveState } from './identity.js';
 import { resetRegistryCache } from './registry.js';
 import { INDEX_HTML } from './page.js';
+import {
+  isPairingRunning,
+  pairingSnapshot,
+  startPairing,
+  stopPairing,
+} from './pairing.js';
 import { BRIDGE_SERVICE, createBridgeServer } from './server.js';
+
+/** Poll a condition rather than sleep a guessed interval — the pairing loop is asynchronous
+ *  and its first announce lands in single-digit milliseconds against a local stub. */
+async function waitFor(ready: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!ready()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for the pairing loop');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 let stateDir = '';
 
@@ -974,3 +990,120 @@ describe('cancelling a job', () => {
     assert.equal(json.reason, 'not-found');
   });
 })
+
+/**
+ * The one-computer hand-off.
+ *
+ * `GET /pairing/handoff` is how a machine running BOTH the till and this bridge pairs itself:
+ * the till cannot ask this process for the code (an HTTPS page can never reach loopback), so
+ * this redirects the browser into the till with the code attached instead. Two properties are
+ * load-bearing and neither is visible from the happy path — it never 404s, and it is refused
+ * from anywhere but this machine, because the code travels in a Location header.
+ */
+describe('GET /pairing/handoff', () => {
+  let api: Server;
+  let previousRelayUrl: string | undefined;
+  /** What the fake API hands back when this bridge announces itself. */
+  let session = {
+    code: 'K4TP-9WMX',
+    pos_pair_url: 'https://pos.hankha.la/settings/printing' as string | null,
+  };
+
+  const redirect = async (): Promise<{ status: number; location: string | null; cache: string | null }> => {
+    const res = await fetch(`${baseUrl}/pairing/handoff`, { redirect: 'manual' });
+    // Draining matters: an undrained body keeps the socket alive and the suite never exits.
+    await res.arrayBuffer();
+    return {
+      status: res.status,
+      location: res.headers.get('location'),
+      cache: res.headers.get('cache-control'),
+    };
+  };
+
+  before(async () => {
+    previousRelayUrl = process.env.PRINT_BRIDGE_RELAY_URL;
+    api = createHttpServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      // Poll answers pending forever: this suite only cares about the code being on screen,
+      // and a claim would call startRelay(), an unbounded loop it cannot stop.
+      const item = req.url?.includes('/poll')
+        ? { status: 'pending', expires_at: new Date(Date.now() + 600_000).toISOString(),
+            claimed_org_name: null, claimed_branch_name: null, pos_pair_url: session.pos_pair_url }
+        // One second, so stopPairing() unwinds inside a test rather than after the poll
+        // interval a real deployment uses.
+        : { session_id: '1', code: session.code, poll_interval_s: 1,
+            expires_at: new Date(Date.now() + 600_000).toISOString(),
+            pos_pair_url: session.pos_pair_url };
+      res.end(JSON.stringify({ data: { item } }));
+    });
+    process.env.PRINT_BRIDGE_RELAY_URL = `http://127.0.0.1:${await listen(api)}`;
+  });
+
+  after(() => {
+    stopPairing();
+    api.close();
+    if (previousRelayUrl === undefined) delete process.env.PRINT_BRIDGE_RELAY_URL;
+    else process.env.PRINT_BRIDGE_RELAY_URL = previousRelayUrl;
+  });
+
+  it('sends the browser to this bridge’s own page while there is no code yet', async () => {
+    // Never a 404. The page is already live, already in five languages, and already says which
+    // of the three things is happening — inventing an error screen here would be a fourth
+    // place to keep those sentences.
+    const { status, location } = await redirect();
+    assert.equal(status, 302);
+    assert.equal(location, '/');
+  });
+
+  it('redirects into the till with the live code once one is on screen', async () => {
+    saveState({ ...loadState(), token: undefined, bridge_id: undefined } as RelayState);
+    startPairing();
+    await waitFor(() => pairingSnapshot().code !== null);
+
+    const { status, location, cache } = await redirect();
+    assert.equal(status, 302);
+    assert.equal(location, `https://pos.hankha.la/settings/printing?pair_code=${session.code}`);
+    // A cached redirect would keep sending an operator to a code that has since been renewed
+    // or spent, and the till would call it invalid.
+    assert.equal(cache, 'no-store');
+  });
+
+  it('refuses to hand the code to anything but this machine', async () => {
+    // Sharper than the gate on /pairing: this one puts the code in a response HEADER, and a
+    // browser follows it. Anyone who can read it can claim this computer into their own shop.
+    const lan = localInterfaces().find((i) => i.address && !i.address.startsWith('127.'));
+    if (!lan) return; // CI containers sometimes have loopback only.
+
+    const open = createHttpServer(bridge.listeners('request')[0] as never);
+    const port = await new Promise<number>((resolve) => {
+      open.listen(0, '0.0.0.0', () => {
+        const address = open.address();
+        if (typeof address === 'string' || address === null) throw new Error('no port');
+        resolve(address.port);
+      });
+    });
+
+    try {
+      const res = await fetch(`http://${lan.address}:${port}/pairing/handoff`, { redirect: 'manual' });
+      assert.equal(res.status, 403);
+      assert.equal((await res.json()).reason, 'not-loopback');
+    } finally {
+      open.close();
+    }
+  });
+
+  it('falls back to the page when the API named no till address', async () => {
+    // A deployment with POS_BASE_URL unset. The button is hidden on the page for the same
+    // reason, so the only way here is the till's own "Pair this computer" — and landing on the
+    // pairing screen, which shows the code, is exactly the fallback that still works.
+    stopPairing();
+    await waitFor(() => !isPairingRunning());
+    session = { code: 'TR4M-8XQP', pos_pair_url: null };
+    startPairing();
+    await waitFor(() => pairingSnapshot().code === 'TR4M-8XQP');
+
+    const { status, location } = await redirect();
+    assert.equal(status, 302);
+    assert.equal(location, '/');
+  });
+});

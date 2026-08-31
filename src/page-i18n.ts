@@ -788,6 +788,43 @@ export const PAGE_STRINGS: Record<string, Row> = {
     '打开 Hankha 应用，进入 设置、打印、连接。',
     'Mở ứng dụng Hankha, vào Cài đặt, In ấn, Kết nối.',
   ],
+  /*
+   * The one-computer path. Shown above the QR whenever the API told this bridge where the till
+   * lives, because a machine running BOTH the POS and this bridge has no second device to scan
+   * its own screen with — the operator would otherwise be reading eight characters off one
+   * window and typing them into another on the same monitor.
+   *
+   * The QR stays, demoted: the same screen still has to serve the venue where the till is a
+   * tablet and this is the back-office PC.
+   */
+  'ps.hereLead': [
+    'Connect this computer to your shop',
+    'ເຊື່ອມຕໍ່ຄອມພິວເຕີເຄື່ອງນີ້ກັບຮ້ານຂອງທ່ານ',
+    'เชื่อมต่อคอมพิวเตอร์เครื่องนี้กับร้านของคุณ',
+    '将这台电脑连接到你的门店',
+    'Kết nối máy tính này với cửa hàng của bạn',
+  ],
+  'ps.hereBtn': [
+    'Pair on this computer',
+    'ຈັບຄູ່ຢູ່ຄອມພິວເຕີເຄື່ອງນີ້',
+    'จับคู่บนคอมพิวเตอร์เครื่องนี้',
+    '在这台电脑上配对',
+    'Ghép nối trên máy tính này',
+  ],
+  'ps.hereSub': [
+    'Opens Hankha on this computer with the code already filled in.',
+    'ເປີດ Hankha ຢູ່ຄອມພິວເຕີເຄື່ອງນີ້ ພ້ອມລະຫັດທີ່ຕື່ມໃຫ້ແລ້ວ.',
+    'เปิด Hankha บนคอมพิวเตอร์เครื่องนี้ พร้อมกรอกรหัสให้แล้ว',
+    '在这台电脑上打开 Hankha，代码已自动填好。',
+    'Mở Hankha trên máy tính này với mã đã điền sẵn.',
+  ],
+  'ps.orScan': [
+    'Or scan with a tablet or phone',
+    'ຫຼື ສະແກນດ້ວຍແທັບເລັດ ຫຼື ໂທລະສັບ',
+    'หรือสแกนด้วยแท็บเล็ตหรือมือถือ',
+    '或用平板或手机扫描',
+    'Hoặc quét bằng máy tính bảng hoặc điện thoại',
+  ],
   'ps.orType': ['or type this code', 'ຫຼື ພິມລະຫັດນີ້', 'หรือพิมพ์รหัสนี้', '或输入此代码', 'hoặc nhập mã này'],
   'ps.waiting': ['Waiting', 'ກຳລັງລໍຖ້າ', 'กำลังรอ', '等待中', 'Đang chờ'],
   'ps.requesting': ['Getting a code', 'ກຳລັງຂໍລະຫັດ', 'กำลังขอรหัส', '正在获取代码', 'Đang lấy mã'],
