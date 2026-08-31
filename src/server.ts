@@ -43,7 +43,7 @@ import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } 
 import { loadState, stateDir, statePath } from './identity.js';
 import { enroll, isRelayRunning, relayStatus, startRelay } from './relay.js';
 import { sampleLabel, sampleReceipt } from './samples.js';
-import { pairingSnapshot, restartPairing } from './pairing.js';
+import { pairingHandoffTarget, pairingSnapshot, restartPairing } from './pairing.js';
 import { qrSvg } from './qr.js';
 import { printerStatuses } from './status.js';
 import { render } from './render/index.js';
@@ -799,7 +799,8 @@ export function createBridgeServer(): Server {
     // can read it can claim this computer into their own organisation, so serving it to the
     // venue wifi would hand over the shop's printers to whoever asked first. Loopback is the
     // boundary, exactly as it is for `/enroll`.
-    const isPairingPath = path === '/pairing' || path === '/pairing/restart';
+    const isPairingPath =
+      path === '/pairing' || path === '/pairing/restart' || path === '/pairing/handoff';
     const openToAnyone =
       path === '/health' || path === '/enroll' || isPairingPath || isPageRequest;
     if ((path === '/enroll' || isPairingPath) && method !== 'OPTIONS' && !isLoopbackRequest(req)) {
@@ -877,6 +878,40 @@ export function createBridgeServer(): Server {
         relay: relayStatus(),
         qr_svg: snapshot.code ? qrSvg(snapshot.code, 320) : null,
       });
+      return;
+    }
+
+    /*
+     * The one-computer hand-off: send this browser to the till with the code already on it.
+     *
+     * This is the whole answer to a machine that runs BOTH the POS and this bridge. There is no
+     * second device to scan the code with, and the till cannot ask this process for it either —
+     * a page on `https://pos.hankha.la` can never `fetch` `http://localhost:9200`. A top-level
+     * navigation can, in both directions, so one redirect serves both entry points: the button
+     * on this bridge's own screen, and the "Pair this computer" button in the till's wizard.
+     *
+     * Loopback-gated with the rest of `/pairing/*`, and for the sharpest version of that reason
+     * — the code travels in a `Location` header. It grants nothing new: `/pairing` already
+     * hands the same code to anything that can reach loopback.
+     *
+     * Every blocked case redirects to this bridge's own page rather than inventing an error
+     * screen. That page is already live, already in five languages, and already says which of
+     * the three things is happening — no code minted yet, no till address configured, or
+     * already paired. A bespoke page here would be a fourth place to keep those sentences.
+     */
+    if (path === '/pairing/handoff' && method === 'GET') {
+      const target = pairingHandoffTarget();
+      const location = 'url' in target ? target.url : '/';
+      if (!('url' in target)) {
+        log.info(`pairing: hand-off unavailable (${target.blocked})`, {
+          event: 'pairing.handoff_blocked',
+          reason: target.blocked,
+        });
+      }
+      // `no-store` is load-bearing: a cached redirect would keep sending an operator to a code
+      // that has since been renewed or spent, and the till would call it invalid.
+      res.writeHead(302, { Location: location, 'Cache-Control': 'no-store' });
+      res.end();
       return;
     }
 

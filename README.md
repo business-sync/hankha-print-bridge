@@ -491,6 +491,15 @@ Everything below needs `Authorization: Bearer <PRINT_BRIDGE_TOKEN>` when a token
   net_warning, auth_required, relay, printers, queue }`. `ok` is first and never changes shape —
   older terminals read only that. Deliberately does **not** probe printers: this is the endpoint the
   POS polls, so it stays a memory read.
+- `GET /pairing` → the pairing screen's own state: phase, the code on screen, who claimed it, and
+  the QR as SVG. **Loopback only** (`403 not-loopback`) — it displays a live pairing code.
+- `POST /pairing/restart` → mint a fresh code without clearing the credential this bridge holds.
+  Loopback only.
+- `GET /pairing/handoff` → **302** into the till at `{POS_BASE_URL}/settings/printing?pair_code=…`,
+  the code appended at the moment of the request so a renewed one is never handed out stale.
+  Loopback only, and more sharply than the two above: the code travels in a `Location` header that
+  a browser follows. When there is no code yet, or the server named no till address, it redirects
+  to `/` — the pairing screen already says which of those is happening, in five languages.
 - `GET /status` → everything in `/health` plus per-printer online/offline with latency, transport
   availability, and queue depth by state. Probes are cached for five seconds; `?probe=1` forces a
   fresh one.
@@ -533,9 +542,21 @@ The bridge dials **out** to the cloud API, so a phone or a till on mobile data c
 without reaching the shop LAN. No inbound port, no certificate on the shop PC, nothing to configure
 on the router. Pair once with a code from **Settings → Printing**.
 
-**On the machine itself, open <http://localhost:9200> and paste the code into the Cloud relay
-card.** That is the path to hand an operator: it needs no terminal, and it cannot hit the two
-failure modes the command line has. Neither installer puts `hankha-print-bridge` on PATH — on
+**On the machine itself, open <http://localhost:9200>.** That page is where pairing starts, and
+the installers open it for you when they finish. What it shows depends on where the till is:
+
+- **The till is a tablet or phone** — the page shows a QR code. Open Hankha there and go to
+  Settings → Printing → Connect, then point the camera at this screen.
+- **The till is this same computer** — the page shows **Pair on this computer** above the QR.
+  Press it and the browser lands in Hankha with the code already filled in. Nothing is typed and
+  nothing is scanned, because a machine cannot point a camera at its own screen. The button
+  appears only when the API has been told where the till lives (`POS_BASE_URL` on the server); it
+  is hidden rather than shown broken.
+
+The same hand-off works from the other side: the till's Connect wizard has a **This computer**
+path that opens the link itself, for a bridge that was installed some time ago.
+
+Either way it needs no terminal, and it cannot hit the two failure modes the command line has. Neither installer puts `hankha-print-bridge` on PATH — on
 Windows it lives under `%ProgramFiles%\Hankha\Print Bridge\` and the macOS .dmg keeps it inside
 the app bundle — and on the macOS .pkg, where the daemon runs as root, a bare `--enroll` writes
 the token into the operator's own `~/Library/Application Support/…`, reports success, and never

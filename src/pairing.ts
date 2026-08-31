@@ -47,6 +47,18 @@ export interface PairingSnapshot {
   org_name: string | null;
   branch_name: string | null;
   last_error: string | null;
+  /**
+   * Where the till lives, handed over by the API — the base only, never with a code on it.
+   *
+   * This is what makes a one-computer setup possible. When the POS runs in a browser on THIS
+   * machine there is no second device to scan the code with, so the screen offers a link into
+   * the till instead and `GET /pairing/handoff` appends the live code on the way through.
+   *
+   * Held here and nowhere else: it arrives with every announce and every poll, so there is
+   * nothing to persist, and a bridge that already holds a credential has no session to hand
+   * off anyway.
+   */
+  pos_pair_url: string | null;
 }
 
 const snapshot: PairingSnapshot = {
@@ -56,10 +68,36 @@ const snapshot: PairingSnapshot = {
   org_name: null,
   branch_name: null,
   last_error: null,
+  pos_pair_url: null,
 };
 
 export function pairingSnapshot(): PairingSnapshot {
   return { ...snapshot };
+}
+
+/**
+ * Why `GET /pairing/handoff` cannot redirect, when it cannot.
+ *
+ * `'no-url'` is a deployment that has not set `POS_BASE_URL` — permanent until someone
+ * changes it, so the page must offer written steps rather than a button. `'no-code'` is the
+ * few seconds between announcing and being answered, and resolves on its own.
+ */
+export type HandoffBlocked = 'no-url' | 'no-code';
+
+/**
+ * The link that puts this computer's pairing code into the till, on this same machine.
+ *
+ * The code is appended HERE, at the moment somebody clicks, and never stored anywhere with the
+ * URL attached — a session renews its code silently every fifteen minutes, and a link built at
+ * announce time would keep offering the one before.
+ */
+export function pairingHandoffTarget(): { url: string } | { blocked: HandoffBlocked } {
+  const base = snapshot.pos_pair_url;
+  if (!base) return { blocked: 'no-url' };
+  const code = snapshot.code;
+  if (!code) return { blocked: 'no-code' };
+  const separator = base.includes('?') ? '&' : '?';
+  return { url: `${base}${separator}pair_code=${encodeURIComponent(code)}` };
 }
 
 /**
@@ -79,6 +117,9 @@ interface SessionCreated {
   code: string;
   expires_at: string;
   poll_interval_s: number;
+  /** Absent on an API older than this field. Optional rather than nullable so that reads as
+   *  "not offered" instead of throwing on a deployment that has not been updated. */
+  pos_pair_url?: string | null;
 }
 
 interface SessionState {
@@ -86,6 +127,7 @@ interface SessionState {
   expires_at: string;
   claimed_org_name: string | null;
   claimed_branch_name: string | null;
+  pos_pair_url?: string | null;
 }
 
 function selfDescription() {
@@ -156,6 +198,7 @@ async function runPairingLoop(): Promise<void> {
       snapshot.expires_at = session.expires_at;
       snapshot.phase = 'waiting';
       snapshot.last_error = null;
+      snapshot.pos_pair_url = session.pos_pair_url ?? null;
       log.info(`pairing: showing code ${session.code}`, {
         event: 'pairing.code_shown',
         expires_at: session.expires_at,
@@ -175,6 +218,9 @@ async function runPairingLoop(): Promise<void> {
           // A poll that answers restores the screen from `offline` without waiting for a claim.
           if (snapshot.phase === 'offline') snapshot.phase = 'waiting';
           snapshot.last_error = null;
+          // Repeated on every poll, so a value that arrived blank because the API was
+          // mid-deploy starts working without waiting fifteen minutes for a fresh code.
+          if (state.pos_pair_url != null) snapshot.pos_pair_url = state.pos_pair_url;
         } catch (err) {
           // A poll failure is a network fault, not a dead code — the code on screen is very
           // probably still good, so it stays up and the phase says why nothing is happening.
