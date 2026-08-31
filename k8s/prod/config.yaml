@@ -22,7 +22,13 @@ data:
   # unqueryable. The desktop installs keep the human-readable default.
   PRINT_BRIDGE_LOG_FORMAT: "json"
   PRINT_BRIDGE_LOG_LEVEL: "info"
-  # An explicit path onto the PVC mounted at the same place in `deployment.yaml`.
+  # An explicit path onto the NFS volume mounted at the same place in `deployment.yaml`
+  # (`gfs-01:/gv0`, subPath `hankha-print-bridge/state`). This said "the PVC" until 2026-08-31;
+  # there is no PVC and there never usefully was one — the claim could not bind on this cluster,
+  # which is what took the bridge down for 2.3 days. Keep this path and the `mountPath` in
+  # `deployment.yaml` identical: nothing validates that they agree, and a mismatch is silent —
+  # the bridge writes happily to an unmounted container-local directory and only reveals it by
+  # coming back unenrolled after a restart.
   #
   # Empty here used to fall through to the container-local default, which is the same path with
   # no volume behind it — so `relay.json` died with the pod. That file IS the bridge's identity
