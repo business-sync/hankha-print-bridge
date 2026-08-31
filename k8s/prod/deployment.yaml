@@ -87,21 +87,4 @@ spec:
       - name: localtime
         hostPath:
           path: /usr/share/zoneinfo/Asia/Bangkok
-      # The cluster's real storage: an NFS export on gfs-01, mounted directly. This was a
-      # ReadWriteOnce PVC with `storageClassName` omitted "so the cluster default applies" —
-      # but this cluster has NO StorageClasses and NO PersistentVolumes at all, so there is no
-      # default and nothing to provision from. The claim sat Pending on
-      # `FailedBinding: no persistent volumes available … and no storage class is set`, the pod
-      # sat Unschedulable on `unbound immediate PersistentVolumeClaims`, and because `Recreate`
-      # deletes the old pod FIRST, the bridge was down outright for ~2.3 days across nine
-      # consecutive revisions rather than merely failing to update.
-      #
-      # Direct NFS is what every mounted volume in this namespace uses (hankha-backend's
-      # /app/uploads is the live example). Trade-off taken knowingly: NFS is RWX, so the storage
-      # layer no longer enforces single-holder — see the `strategy` comment above, which now
-      # carries that guarantee alone.
-      - name: state
-        nfs:
-          path: /gv0
-          server: gfs-01
       restartPolicy: Always
