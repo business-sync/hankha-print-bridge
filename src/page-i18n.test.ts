@@ -9,12 +9,12 @@ import {
 } from './page-i18n.js';
 
 /*
- * Parity, the way the POS checks its own bundles: a key that exists must exist in all five
- * languages. A missing column is not a crash — `t()` falls back to English — which is exactly
+ * Parity, the way the POS checks its own bundles: a key that exists must exist in every
+ * language. A missing column is not a crash — `t()` falls back to English — which is exactly
  * why nothing would ever notice it. A Lao till would simply show one English sentence among the
  * Lao ones, and only someone who reads Lao would ever report it.
  */
-test('every key is filled in all five languages', () => {
+test('every key is filled in all languages', () => {
   const missing: string[] = [];
 
   for (const [key, row] of Object.entries(PAGE_STRINGS)) {
