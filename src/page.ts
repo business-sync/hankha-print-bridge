@@ -2195,10 +2195,10 @@ export const INDEX_HTML = `<!doctype html>
   <p class="sr-only" id="live" role="status" aria-live="polite" aria-atomic="true"></p>
 
   <!--
-    The one place on this page that carries all five languages as markup rather than reading them
+    The one place on this page that carries every language as markup rather than reading them
     from the table. It is shown only when scripts are off, which is exactly when nothing can
-    translate it — so it says the same sentence five times instead of saying it once in English
-    to someone who does not read English.
+    translate it — so it says the same sentence in every language instead of saying it once in
+    English to someone who does not read English.
   -->
   <noscript>
     <div class="banner banner-warn">
@@ -2212,6 +2212,10 @@ export const INDEX_HTML = `<!doctype html>
         相同的信息可在 <code>/health</code> 和 <code>/status</code> 以 JSON 提供。</p>
       <p lang="vi">JavaScript đang tắt nên trang này không thể hiển thị trạng thái.
         Cùng thông tin đó có ở dạng JSON tại <code>/health</code> và <code>/status</code>.</p>
+      <p lang="ja">JavaScriptがオフになっているため、このページはブリッジの状態を表示できません。
+        同じ情報は <code>/health</code> と <code>/status</code> でJSON形式で確認できます。</p>
+      <p lang="ko">JavaScript가 꺼져 있어 이 페이지는 브릿지 상태를 표시할 수 없습니다.
+        동일한 정보는 <code>/health</code> 와 <code>/status</code> 에서 JSON 형식으로 확인할 수 있습니다.</p>
     </div>
   </noscript>
 
