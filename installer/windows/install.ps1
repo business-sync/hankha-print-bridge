@@ -140,7 +140,9 @@ Start-ScheduledTask -TaskName $TaskName
 
 Write-Host 'Waiting for the bridge to answer...'
 $deadline = (Get-Date).AddSeconds(25)
+$sawProcess = $false
 while ((Get-Date) -lt $deadline) {
+  if (Get-Process -Name 'hankha-print-bridge' -ErrorAction SilentlyContinue) { $sawProcess = $true }
   try {
     $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
     if ($health.ok) {
@@ -154,6 +156,32 @@ while ((Get-Date) -lt $deadline) {
 
 # An installer that reports success while nothing is listening is the failure this replaces.
 Write-Warning "Installed, but nothing answered on port $Port within 25 seconds."
-Write-Warning "Most likely another program already holds that port. Check $LogFile"
-if (Test-Path $LogFile) { Get-Content $LogFile -Tail 20 }
+if (-not $sawProcess) {
+  # hankha-print-bridge.exe is unsigned (see scripts/package.mjs), and a `bun build --compile`
+  # binary is exactly the shape antivirus heuristics distrust — a single self-extracting exe
+  # with an embedded runtime. It never showing up in the process list at all, with no Windows
+  # error surfaced anywhere, is what that looks like: something removed or blocked it the
+  # instant Task Scheduler tried to run it, before it could write even one log line.
+  Write-Warning 'hankha-print-bridge.exe never appeared in the process list -- something stopped it from starting at all.'
+  Write-Warning 'The most likely cause is antivirus or Windows Defender quarantining the new .exe (it is unsigned).'
+  Write-Warning 'Open Windows Security > Virus & threat protection > Protection history and look for an action'
+  Write-Warning "on $InstallDir\hankha-print-bridge.exe. If it's there, restore the file and add an exclusion for"
+  Write-Warning "$InstallDir, then run this installer again."
+} else {
+  Write-Warning "hankha-print-bridge.exe started and then stopped, or is hung. Check $LogFile"
+}
+if (Test-Path $LogFile) { Get-Content $LogFile -Tail 40 }
+
+# A crash this early (before the log file itself could be opened, or a missing dependency the
+# process can't recover from) lands in the Application event log, not bridge.log -- that file is
+# opened by print-bridge.cmd's own redirect, which needs the process to have started at all.
+$crashEvents = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000 } -MaxEvents 30 -ErrorAction SilentlyContinue |
+  Where-Object { $_.Message -like '*hankha-print-bridge.exe*' } | Select-Object -First 3
+if ($crashEvents) {
+  Write-Warning 'Windows Event Viewer recorded a crash for hankha-print-bridge.exe:'
+  foreach ($event in $crashEvents) {
+    $firstLine = ($event.Message -split "`r?`n")[0]
+    Write-Warning "  $($event.TimeCreated): $firstLine"
+  }
+}
 exit 1
