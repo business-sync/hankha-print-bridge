@@ -195,11 +195,33 @@ describe('what the bridge reports upstream', () => {
     });
     const [reported] = describeRegistry();
     assert.deepEqual(Object.keys(reported ?? {}).sort(), [
-      'address', 'enabled', 'id', 'name', 'port', 'role', 'transport', 'type',
+      'address', 'dots_per_line', 'enabled', 'id', 'name', 'port', 'role', 'transport', 'type',
     ]);
     // Not `device`, not `baud`, not `language`: the summary carries only what the server can
-    // act on. `role` earns its place because role-addressed jobs are resolved server-side.
+    // act on. `role` earns its place because role-addressed jobs are resolved server-side, and
+    // `dots_per_line` because the server refuses a slip too wide for the roll before queueing it.
     assert.equal('device' in (reported ?? {}), false);
+    // A label printer prints no LINES, so it has no line width to report.
+    assert.equal(reported?.dots_per_line, null);
+  });
+
+  it('reports the printable width, so a remote till can lay a slip out for this roll', () => {
+    // Saved as PARSED, the way a real `printers.json` reaches `describeRegistry` — the defaults
+    // that fill in a missing width live in `parsePrinter`, not in the file.
+    saveRegistry(
+      parseRegistry({
+        version: 1,
+        printers: [
+          { id: 'narrow', name: 'Narrow', transport: 'network', address: '192.168.18.105', type: 'receipt', dots_per_line: 384 },
+          { id: 'counter', name: 'Counter', transport: 'network', address: '192.168.18.103', type: 'receipt' },
+        ],
+      }).registry
+    );
+    const reported = describeRegistry();
+    assert.equal(reported.find((p) => p.id === 'narrow')?.dots_per_line, 384);
+    // Filled in by `parsePrinter`, so a receipt printer nobody measured still reports a width
+    // rather than leaving the server to guess.
+    assert.equal(reported.find((p) => p.id === 'counter')?.dots_per_line, 576);
   });
 
   it('accepts a role, folds its case, and refuses one that is not a role', () => {

@@ -122,6 +122,18 @@ export function describeRegistry() {
       // printer — the server has its own fallback for that and must be able to tell the two
       // apart, so this is reported explicitly rather than omitted.
       role: p.role ?? null,
+      /*
+       * The printable width, so a device that has never seen this printer can lay a slip out
+       * for it — or be told not to try.
+       *
+       * A tablet paired to a station in another room had no way to learn whether the roll was
+       * 58 mm or 80 mm, so it guessed from the venue's admin setting and the bridge rendered
+       * whatever it was sent: an 80 mm slip on a 58 mm head, every row wrapped, no error
+       * anywhere. Reporting it is what lets the server refuse that job before it is queued.
+       *
+       * Null on a label printer, which has no line width at all.
+       */
+      dots_per_line: p.dots_per_line ?? null,
     }));
 }
 

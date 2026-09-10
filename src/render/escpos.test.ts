@@ -119,6 +119,30 @@ describe('command bytes', () => {
     assert.ok(contains(bytes, [0x1b, 0x45, 0x00]), 'bold turned off again');
   });
 
+  it('underlines a line and turns it off again', () => {
+    // The POS uses this for the Lao ledger's payment method and its footer. Turning it off
+    // after the row matters as much as turning it on: a document is a list of independent
+    // rows, and a leaked underline would rule through everything below it.
+    const bytes = build([{ type: 'text', value: 'CASH', underline: true }]);
+    assert.ok(contains(bytes, [0x1b, 0x2d, 0x01]), 'ESC - 1 (underline on)');
+    assert.ok(contains(bytes, [0x1b, 0x2d, 0x00]), 'ESC - 0 (underline off)');
+  });
+
+  it('draws a rule with the character it was given', () => {
+    const bytes = build([{ type: 'rule', char: '=' }]);
+    assert.ok(bytes.includes(Buffer.from('='.repeat(charsPerLine(576)))));
+  });
+
+  it('honours an explicit left alignment on an image', () => {
+    // The parser defaults `align` to left, so a template row — which is laid out to fill the
+    // roll and must start at its edge — has to come out left, never centred.
+    const data = Buffer.alloc(rasterRowBytes(576) * 2, 0xff);
+    const bytes = build([
+      { type: 'image', align: 'left', image: { width: 576, height: 2, data_base64: data.toString('base64') } },
+    ]);
+    assert.ok(contains(bytes, [0x1b, 0x61, 0x00]), 'ESC a 0 (left)');
+  });
+
   it('emits a partial cut, not a full one', () => {
     const parsed = parseReceiptDocument({ elements: [{ type: 'text', value: 'x' }] });
     assert.ok(parsed.document);
@@ -234,6 +258,57 @@ describe('command bytes', () => {
  * document alongside them dropped both, because `jobs.ts` only tests `!parsed.document` — an
  * out-of-range value answered 200 and quietly printed at the fallback width.
  */
+describe('paper width', () => {
+  const narrow: PrinterRecord = { ...printer, id: 'narrow', dots_per_line: 384 };
+
+  /*
+   * The failure this refusal exists to prevent is silent, which is what makes it expensive: the
+   * head wraps every pre-padded row, the columns stagger, the total lands mid-line, and the job
+   * still reports success. An operator reads that as a broken printer, not a mis-set paper size.
+   */
+  it('refuses a slip laid out wider than the paper, naming both widths', () => {
+    const parsed = parseReceiptDocument({
+      elements: [{ type: 'columns', left: 'TOTAL', right: '388,000' }],
+      dots_per_line: 576,
+    });
+    assert.ok(parsed.document);
+    try {
+      renderReceiptEscPos(parsed.document, narrow);
+      assert.fail('should have thrown');
+    } catch (err) {
+      assert.ok(err instanceof RenderError);
+      const message = err.errors[0] ?? '';
+      assert.match(message, /576/);
+      assert.match(message, /384/);
+      // The remedy has to be in the sentence: the caller is a till that can rebuild the slip.
+      assert.match(message, /rebuild/);
+    }
+  });
+
+  it('still prints a slip laid out NARROWER than the paper', () => {
+    // A 58 mm slip on an 80 mm roll is merely narrow — and it is what a venue with mixed
+    // printers relies on, so this must never become an error.
+    const parsed = parseReceiptDocument({
+      elements: [{ type: 'columns', left: 'Latte', right: '25,000' }],
+      dots_per_line: 384,
+      cut: false,
+    });
+    assert.ok(parsed.document);
+    const bytes = renderReceiptEscPos(parsed.document, printer);
+    assert.ok(bytes.includes(Buffer.from(twoColumns('Latte', '25,000', charsPerLine(384)))));
+  });
+
+  it('lays out to the printer when the document pins nothing', () => {
+    const parsed = parseReceiptDocument({
+      elements: [{ type: 'columns', left: 'Latte', right: '25,000' }],
+      cut: false,
+    });
+    assert.ok(parsed.document);
+    const bytes = renderReceiptEscPos(parsed.document, narrow);
+    assert.ok(bytes.includes(Buffer.from(twoColumns('Latte', '25,000', charsPerLine(384)))));
+  });
+});
+
 describe('receipt document validation', () => {
   it('reports an out-of-range dots_per_line instead of falling back silently', () => {
     const parsed = parseReceiptDocument({

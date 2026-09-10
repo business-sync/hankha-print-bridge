@@ -445,7 +445,29 @@ function applyElement(
 
 export function renderReceiptEscPos(document: ReceiptDocument, printer: PrinterRecord): Buffer {
   const errors: string[] = [];
-  const width = document.dots_per_line ?? printer.dots_per_line ?? 576;
+  const head = printer.dots_per_line ?? 576;
+  const width = document.dots_per_line ?? head;
+
+  /*
+   * A slip pinned WIDER than the paper is refused, not printed.
+   *
+   * `dots_per_line` means "this document was already laid out for that width" — a caller sets it
+   * because it holds pre-padded rows or paper-width bitmaps that cannot be re-flowed. Honouring
+   * it on a narrower head is the one case where obeying the document is worse than failing: the
+   * head wraps every row, the columns stagger, the totals land in the middle of a line, and
+   * nothing anywhere reports a problem. Someone reads that as a broken printer.
+   *
+   * Narrower stays allowed and always will: a 58 mm slip on an 80 mm roll is merely narrow, and
+   * that is what a venue with mixed printers relies on.
+   */
+  if (width > head) {
+    throw new RenderError([
+      `this slip is laid out for ${width} dots per line but printer '${printer.id}' prints ${head}` +
+        `${head <= 384 ? ' (58 mm paper)' : ''} — rebuild it for the narrower roll, or send no ` +
+        'dots_per_line and let the bridge lay it out',
+    ]);
+  }
+
   const builder = new EscPosBuilder().init();
 
   const codepage = document.codepage ?? printer.codepage;

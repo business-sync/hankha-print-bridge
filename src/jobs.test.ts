@@ -79,6 +79,44 @@ describe('renderJobDocument', () => {
     assert.notEqual(wide.payload.toString('latin1'), narrow.payload.toString('latin1'));
   });
 
+  /*
+   * The other half of that rule: a caller MAY pin the width, and a pinned slip too wide for the
+   * roll is refused rather than wrapped.
+   *
+   * A pin means "already laid out" — pre-padded rows, paper-width bitmaps — so there is nothing
+   * left to re-flow. Printing it anyway wraps every row and reports success, which reads as a
+   * broken printer. The server refuses these before queueing, so reaching here means a job that
+   * was queued while the registry still said something else; refusing is the honest end.
+   */
+  it('refuses a pinned slip too wide for the roll, and says both widths', () => {
+    const out = renderJobDocument(
+      {
+        kind: 'receipt' as const,
+        elements: [{ type: 'columns', left: 'TOTAL', right: '388,000' }],
+        dots_per_line: 576,
+      },
+      receiptPrinter({ dots_per_line: 384 }),
+    );
+    assert.equal(out.ok, false);
+    if (out.ok) return;
+    assert.match(out.errors.join('; '), /576/);
+    assert.match(out.errors.join('; '), /384/);
+  });
+
+  it('prints a pinned slip NARROWER than the roll', () => {
+    // A 58 mm slip on an 80 mm printer is merely narrow. Refusing it would break every venue
+    // that runs mixed rolls, which is most of them.
+    const out = renderJobDocument(
+      {
+        kind: 'receipt' as const,
+        elements: [{ type: 'columns', left: 'Coffee', right: '25,000' }],
+        dots_per_line: 384,
+      },
+      receiptPrinter({ dots_per_line: 576 }),
+    );
+    assert.equal(out.ok, true);
+  });
+
   it('dispatches on the document’s own kind, and speaks the label printer’s language', () => {
     const out = renderJobDocument(
       {
