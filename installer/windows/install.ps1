@@ -116,23 +116,32 @@ $settings = New-ScheduledTaskSettingsSet `
   -ExecutionTimeLimit ([TimeSpan]::Zero) `
   -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999
 
-$trigger = New-ScheduledTaskTrigger -AtStartup
-
 # Backstop: RestartOnFailure only fires when the task ENDS in an error. A process that exits
 # cleanly, or is killed, leaves the task simply "not running" and nothing brings it back until
 # reboot. A repeating trigger re-runs it every five minutes, which IgnoreNew turns into a no-op
 # whenever it is already up — so this costs nothing and self-heals everything else.
-try {
-  $heartbeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
-  $trigger.Repetition = $heartbeat.Repetition
-} catch {
-  Write-Warning "Could not add the 5-minute self-heal trigger ($($_.Exception.Message)). The bridge will still start at boot and restart after a crash."
-}
+#
+# No -RepetitionDuration, on purpose: leaving it out is how the task XML says "indefinitely".
+# The old idiom, ([TimeSpan]::MaxValue), is serialised as P99999999DT23H59M59S, which Task
+# Scheduler on current Windows 10/11 builds rejects at registration (0x80041318, "The task XML
+# contains a value which is incorrectly formatted or out of range") — and it rejected the WHOLE
+# task, so nothing was registered and every install died right here.
+$heartbeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+$withHeartbeat = New-ScheduledTaskTrigger -AtStartup
+$withHeartbeat.Repetition = $heartbeat.Repetition
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal `
-  -Settings $settings -Trigger $trigger `
-  -Description 'Lets the POS terminal print to network printers.' -Force | Out-Null
+$description = 'Lets the POS terminal print to network printers.'
+try {
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal `
+    -Settings $settings -Trigger $withHeartbeat -Description $description -Force | Out-Null
+} catch {
+  # The heartbeat is the only part of the task that varies by Windows build. Boot + restart-
+  # on-failure alone is still a working install, so never fail the whole setup over the extra.
+  # If THIS registration fails too, the error is real and the script stops on it as before.
+  Write-Warning "Could not register the 5-minute self-heal trigger ($($_.Exception.Message)). The bridge will still start at boot and restart after a crash."
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal `
+    -Settings $settings -Trigger (New-ScheduledTaskTrigger -AtStartup) -Description $description -Force | Out-Null
+}
 
 Start-ScheduledTask -TaskName $TaskName
 
