@@ -7,20 +7,28 @@
  *
  * The resolution order is the interesting part:
  *
- *   1. `printer_id`, when given. Forward-compatible: the server does not send one today, and this
- *      is what it will use when it does.
- *   2. `ip:port` matched against the registry. THIS is what lets a cloud job reach a USB printer.
- *      A relay job carries only `target_ip`/`target_port` — there is no printer id on the wire —
- *      so giving a USB entry an `address` in `printers.json` makes it addressable by every client
- *      that already speaks the old contract, with no change on the server or in the POS.
+ *   1. `printer_id`, when given. The cloud sends one for any printer this bridge reported in its
+ *      heartbeat, and it is the only way a cloud job reaches a USB or serial printer — one wired
+ *      to this machine has no address to name. A LAN client may send one too.
+ *   2. `ip:port` matched against the registry, for clients that only know an address: a till on
+ *      the original `/print` contract, or a job the server addressed by `target_ip`. A USB entry
+ *      given an `address` in `printers.json` is reachable this way as well — the workaround from
+ *      before a job could carry an id, and still honoured.
  *   3. An ad-hoc network dial to that `ip:port`. Exactly what the bridge has always done, kept as
- *      the fallback so an unregistered printer still works.
- *   4. The registry's default for the document's kind, when no target was named at all.
+ *      the fallback so an unregistered printer still works — but only for an address NO registry
+ *      entry claims.
+ *   4. The registry's default for the document's kind, when no target was named at all. LAN only:
+ *      a cloud job names its printer or is refused.
+ *
+ * A printer the operator turned off is refused at steps 1 and 2 and must never fall through to 3.
+ * The address lookup skips disabled entries, so its "no match" cannot tell "turned off" from "never
+ * registered"; dialling anyway would print on the very printer the toggle promised was out of
+ * service, and leave it stopping only the jobs that happen to name the printer by id.
  */
 import { DEFAULT_PRINTER_PORT, isPrivateIpv4 } from './lan.js';
 import {
-  defaultPrinter, findPrinter, loadRegistry, resolveByAddress,
-  DEFAULT_DOTS_PER_LINE, type PrinterRecord,
+  defaultPrinter, disabledAtAddress, findPrinter, loadRegistry, resolveByAddress,
+  DEFAULT_DOTS_PER_LINE, type PrinterRecord, type Registry,
 } from './registry.js';
 import { parseLabelDocument, parseReceiptDocument, render, RenderError } from './render/index.js';
 
@@ -57,20 +65,43 @@ export function adHocNetworkPrinter(ip: string, port: number): PrinterRecord {
   };
 }
 
+/** The one sentence every refusal of a turned-off printer uses, so LAN and cloud callers read alike. */
+function disabledError(printer: PrinterRecord, target?: { ip: string; port: number }): string {
+  return `printer '${printer.id}'${target ? ` at ${target.ip}:${target.port}` : ''} is disabled on this bridge`;
+}
+
+/**
+ * Resolve a bare `ip:port`, for the LAN routes and the relay alike.
+ *
+ * Three answers, in this order: an enabled registry entry that claims the address; a refusal if a
+ * DISABLED entry claims it; otherwise an ad-hoc dial. The middle one is the point — see the note
+ * at the top of this file.
+ *
+ * An enabled entry wins over a disabled one at the same address, so retiring a printer and moving
+ * a new one onto its IP does not leave the new one blocked by the old entry.
+ */
+function resolveTarget(registry: Registry, ip: string, port: number): PrinterRecord | { error: string } {
+  const registered = resolveByAddress(registry, ip, port);
+  if (registered) return registered;
+  const off = disabledAtAddress(registry, ip, port);
+  if (off) return { error: disabledError(off, { ip, port }) };
+  return adHocNetworkPrinter(ip, port);
+}
+
 function resolvePrinter(request: JobRequest, wants: 'receipt' | 'label'): PrinterRecord | { error: string } {
   const registry = loadRegistry();
 
   if (request.printer_id) {
     const printer = findPrinter(registry, request.printer_id);
     if (!printer) return { error: `no printer with id '${request.printer_id}'` };
-    if (!printer.enabled) return { error: `printer '${printer.id}' is disabled` };
+    if (!printer.enabled) return { error: disabledError(printer) };
     return printer;
   }
 
   if (request.target) {
     const { ip, port } = request.target;
     if (!isPrivateIpv4(ip)) return { error: 'target.ip must be a private (RFC1918) IPv4 address' };
-    return resolveByAddress(registry, ip, port) ?? adHocNetworkPrinter(ip, port);
+    return resolveTarget(registry, ip, port);
   }
 
   const fallback = defaultPrinter(registry, wants);
