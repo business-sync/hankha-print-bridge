@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
-  defaultPrinter, findPrinter, loadRegistry, parseRegistry, registryPath,
+  defaultPrinter, disabledAtAddress, findPrinter, loadRegistry, parseRegistry, registryPath,
   resetRegistryCache, resolveByAddress, saveRegistry,
 } from './registry.js';
 import { describeRegistry } from './relay.js';
@@ -145,6 +145,18 @@ describe('resolution', () => {
 
   it('ignores a disabled printer when resolving an address', () => {
     assert.equal(resolveByAddress(registry, '192.168.18.9', 9100), null);
+  });
+
+  // `resolveByAddress` answers null both for a turned-off printer and for one nobody registered,
+  // so a caller cannot refuse the first without asking this. Without it the relay fell through to
+  // an ad-hoc dial and printed on a printer the operator had switched off.
+  it('names the disabled printer that claims an address, so a caller can refuse rather than dial', () => {
+    assert.equal(disabledAtAddress(registry, '192.168.18.9', 9100)?.id, 'off');
+    // The port is part of the address: a different socket on the same host is not this printer.
+    assert.equal(disabledAtAddress(registry, '192.168.18.9', 9101), null);
+    // An enabled printer's address is not a turned-off one, and an unclaimed address stays unclaimed.
+    assert.equal(disabledAtAddress(registry, '192.168.18.103', 9100), null);
+    assert.equal(disabledAtAddress(registry, '192.168.18.250', 9100), null);
   });
 
   it('uses the configured default', () => {

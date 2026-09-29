@@ -377,10 +377,10 @@ On macOS, always use the **call-out** device (`/dev/cu.*`), never `/dev/tty.*` �
 until carrier detect, which a printer never asserts, so the open never returns. Paths are
 rewritten automatically, but it is worth knowing which one to type.
 
-**A non-network printer may declare an `address`.** That is what lets a cloud job reach a USB
-printer: a relay job carries only `target_ip`/`target_port`, so giving a USB entry an address makes
-it addressable by every client that already speaks the old contract, with no change on the server
-or in the POS.
+**A non-network printer may declare an `address`.** That makes it reachable by a client that only
+knows an address — a till on the original `/print` contract, or a cloud job addressed by
+`target_ip`/`target_port` — with no change on the server or in the POS. It predates cloud jobs
+naming a printer by `printer_id`, which is now the normal route to a USB printer.
 
 ## Job documents
 
@@ -485,6 +485,11 @@ Everything below needs `Authorization: Bearer <PRINT_BRIDGE_TOKEN>` when a token
   document's kind.
 - `GET /jobs` → recent jobs and the queue depth. `GET /jobs/:id` → one job.
 - `POST /jobs/:id/cancel` → 200 if it had not started, 409 once it is printing.
+
+A printer turned off in the registry (`enabled: false`) is refused however a request reaches it —
+by `printer_id`, or by the `ip`/`port` it is registered at. `/print` and `/jobs` answer
+`400 unknown-printer` with the reason in `errors`. An address no registry entry claims is still
+dialled, as it always was.
 
 ### Printers
 
@@ -619,6 +624,11 @@ The second exists because a USB or serial printer wired to *this* machine has no
 so a network sweep can never find it and a remote till had nothing to name it by. The workaround
 until now was to invent a private-looking IP, put it in the USB entry's `address`, and type that
 same fake address into the POS; `resolveByAddress` still honours it, so nothing breaks.
+
+A printer turned off in `printers.json` is refused on this path too, however the job addresses it.
+The bridge reports `device-missing` with `printed_certainty: "none"` and a detail saying the printer
+is disabled on this bridge; the POS shows that as a printer that was not found, and it is safe to
+print again. An address no entry claims is still dialled ad hoc.
 
 To make that choice possible from a device with no LAN access, every heartbeat (and the enrolment
 POST) carries `registry_printers` — a summary of this bridge's configured printers, capped at 64:

@@ -921,6 +921,94 @@ describe('POST /print by printer id', () => {
   });
 })
 
+/**
+ * A printer turned off in the registry, reached by its ADDRESS rather than its id.
+ *
+ * The id form has refused it from the start (above). The address form went
+ * `resolveByAddress(...) ?? adHocNetworkPrinter(...)`, and `resolveByAddress` skips turned-off
+ * entries — so their address read as "nobody registered this" and was dialled ad hoc. A till that
+ * prints by IP kept printing on a printer the POS said was off. The relay had the same hole and
+ * both now share one rule in `jobs.ts`.
+ *
+ * The 400 is the same `unknown-printer` a turned-off id gets, which the terminal's `/print`
+ * transport already treats as a failed target and moves past to a backup printer.
+ */
+describe('a printer turned off in the registry, reached by its address', () => {
+  let previous: unknown;
+
+  before(async () => {
+    // Swapped in for this block only: the blocks after it were written against whatever was here.
+    previous = await (await fetch(`${baseUrl}/printers`)).json();
+    const saved = await put('/printers', {
+      printers: [{ id: 'retired', name: 'Retired', transport: 'network', address: '192.168.255.251', enabled: false }],
+    });
+    assert.equal(saved.status, 200);
+  });
+
+  after(async () => {
+    const restored = await put('/printers', previous);
+    assert.equal(restored.status, 200);
+  });
+
+  it('refuses /print, naming the printer and saying why', async () => {
+    const { status, json } = await post('/print', { ip: '192.168.255.251', port: 9100, payload_base64: 'AA==' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'unknown-printer');
+    assert.equal(json.errors[0], "printer 'retired' at 192.168.255.251:9100 is disabled on this bridge");
+  });
+
+  it('refuses /jobs the same way, and queues nothing for it', async () => {
+    const { status, json } = await post('/jobs', {
+      target: { ip: '192.168.255.251', port: 9100 },
+      payload_base64: 'AA==',
+    });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'unknown-printer');
+    assert.match(json.errors[0], /'retired' at 192\.168\.255\.251:9100 is disabled on this bridge/);
+
+    // `prepare()` refuses before `submit()`, so no job — for the printer OR for the ad-hoc record
+    // it used to be dialled as — can exist. Both /print and /jobs above went through it.
+    const listed = (await (await fetch(`${baseUrl}/jobs`)).json()) as { jobs: { printer_id: string }[] };
+    assert.equal(
+      listed.jobs.some((job) => job.printer_id === 'net:192.168.255.251:9100'),
+      false,
+    );
+  });
+
+  // The fallback survives for what it is for: an address the registry has no opinion about.
+  it('still prints to an address no entry claims', async (t) => {
+    const lan = localInterfaces()[0];
+    if (!lan) return t.skip('no private LAN interface on this machine');
+
+    const received: Buffer[] = [];
+    const fake = createTcpServer((socket) => {
+      socket.on('data', (chunk) => received.push(chunk));
+    });
+    const port = await new Promise<number>((resolve) => {
+      fake.listen(0, lan.address, () => {
+        const address = fake.address();
+        if (typeof address === 'string' || address === null) throw new Error('no port');
+        resolve(address.port);
+      });
+    });
+
+    try {
+      const { status, json } = await post('/print', {
+        ip: lan.address,
+        port,
+        payload_base64: Buffer.from('\x1b@BILL\n').toString('base64'),
+      });
+      assert.equal(status, 200);
+      assert.equal(json.ok, true);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(Buffer.concat(received).toString(), '\x1b@BILL\n');
+    } finally {
+      fake.close();
+    }
+  });
+})
+
 
 describe('job ids are filesystem-safe', () => {
   /*

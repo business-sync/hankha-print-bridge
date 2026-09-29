@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
-import { renderJobDocument } from './jobs.js';
-import type { PrinterRecord } from './registry.js';
+import { before, describe, it } from 'node:test';
+import { renderJobDocument, resolveRelayPrinter } from './jobs.js';
+import { parseRegistry, type PrinterRecord } from './registry.js';
 
 /**
  * Rendering a document that arrived over the RELAY.
@@ -169,5 +169,122 @@ describe('renderJobDocument', () => {
       const out = renderJobDocument(bad, receiptPrinter());
       assert.equal(out.ok, false, `expected ${String(bad)} to be refused`);
     }
+  });
+});
+
+/**
+ * Which printer a CLOUD job lands on — and, the case that mattered, which one it must NOT.
+ *
+ * The relay used to resolve `findPrinter(id) ?? resolveByAddress(...) ?? adHocNetworkPrinter(...)`.
+ * The first never looked at `enabled`. The second did, which handed the third a null it read as
+ * "nobody registered this address" and dialled — so a printer the operator had turned off in the
+ * POS still printed relay jobs. `resolveRelayPrinter` is the seam that decides, and it is pure: no
+ * disk, no socket, so every case below is a plain function call.
+ */
+describe('resolveRelayPrinter', () => {
+  const { registry, errors } = parseRegistry({
+    printers: [
+      { id: 'counter', name: 'Counter', transport: 'network', address: '192.168.18.103' },
+      // A USB printer given an address — the workaround that predates `printer_id`.
+      { id: 'kitchen', name: 'Kitchen', transport: 'usb', queue: 'SPRT_SP_EP', address: '192.168.18.200' },
+      { id: 'retired', name: 'Retired', transport: 'network', address: '192.168.18.9', enabled: false },
+      // A printer retired and replaced on the same IP. The turned-off entry comes FIRST, so a
+      // lookup that simply took the first match at the address would pick the wrong one.
+      { id: 'swap-old', name: 'Old', transport: 'network', address: '192.168.18.50', enabled: false },
+      { id: 'swap-new', name: 'New', transport: 'network', address: '192.168.18.50' },
+    ],
+  });
+
+  // A typo here would silently drop an entry and turn a refusal test into a "no match" test that
+  // still passes.
+  before(() => assert.deepEqual(errors, [], 'the fixture registry must parse cleanly'));
+
+  type Resolved = ReturnType<typeof resolveRelayPrinter>;
+  /** The printer a job landed on. Fails the test, quoting the refusal, if it was refused instead. */
+  const landed = (out: Resolved): PrinterRecord => {
+    assert.ok(!('error' in out), `expected a printer, but the job was refused: ${'error' in out ? out.error : ''}`);
+    return out;
+  };
+  /** The sentence a job was refused with. Fails the test if it landed on a printer instead. */
+  const refusal = (out: Resolved): string => {
+    assert.ok('error' in out, `expected a refusal, but the job landed on '${'id' in out ? out.id : ''}'`);
+    return out.error;
+  };
+
+  describe('a printer the operator turned off', () => {
+    it('refuses a printer_id that names it, and says which printer and why', () => {
+      const out = resolveRelayPrinter(registry, { printer_id: 'retired', target_ip: null, target_port: 9100 });
+      assert.equal(refusal(out), "printer 'retired' is disabled on this bridge");
+    });
+
+    // The id is FINAL. A server that sent both an id and an address meant the id; quietly printing
+    // on the address instead would put a slip on a printer nobody chose.
+    it('does not fall back to the address a job also carries', () => {
+      const out = resolveRelayPrinter(registry, {
+        printer_id: 'retired', target_ip: '192.168.18.103', target_port: 9100,
+      });
+      assert.match(refusal(out), /'retired' is disabled on this bridge/);
+    });
+
+    it('refuses an address it claims instead of dialling that address ad hoc', () => {
+      const out = resolveRelayPrinter(registry, { target_ip: '192.168.18.9', target_port: 9100 });
+      assert.equal(refusal(out), "printer 'retired' at 192.168.18.9:9100 is disabled on this bridge");
+    });
+
+    it('lets an enabled printer take over its address', () => {
+      // `swap-old` is listed first and is turned off; the replacement moved onto its IP must not
+      // be blocked by it.
+      const printer = landed(resolveRelayPrinter(registry, { target_ip: '192.168.18.50', target_port: 9100 }));
+      assert.equal(printer.id, 'swap-new');
+    });
+  });
+
+  describe('everything else resolves as it always did', () => {
+    it('dials an address no registry entry claims, ad hoc', () => {
+      const printer = landed(resolveRelayPrinter(registry, { target_ip: '192.168.18.77', target_port: 9100 }));
+      assert.equal(printer.id, 'net:192.168.18.77:9100');
+      assert.equal(printer.transport, 'network');
+      assert.equal(printer.enabled, true);
+    });
+
+    it('resolves an enabled printer by id', () => {
+      const printer = landed(
+        resolveRelayPrinter(registry, { printer_id: 'counter', target_ip: null, target_port: 9100 }),
+      );
+      assert.equal(printer.id, 'counter');
+    });
+
+    it('prefers the id over an address that names a different enabled printer', () => {
+      const printer = landed(
+        resolveRelayPrinter(registry, { printer_id: 'counter', target_ip: '192.168.18.200', target_port: 9100 }),
+      );
+      assert.equal(printer.id, 'counter');
+    });
+
+    it('reaches a USB printer through the address it declares', () => {
+      const printer = landed(resolveRelayPrinter(registry, { target_ip: '192.168.18.200', target_port: 9100 }));
+      assert.equal(printer.id, 'kitchen');
+      assert.equal(printer.transport, 'usb');
+    });
+
+    it('falls back to the address when the id is one this bridge has never heard of', () => {
+      // A server holding a stale registry — not a decision to print somewhere else.
+      const printer = landed(
+        resolveRelayPrinter(registry, { printer_id: 'ghost', target_ip: '192.168.18.103', target_port: 9100 }),
+      );
+      assert.equal(printer.id, 'counter');
+    });
+
+    it('reports an unknown id with no usable address as no match', () => {
+      const out = resolveRelayPrinter(registry, { printer_id: 'ghost', target_ip: null, target_port: 9100 });
+      assert.equal(refusal(out), 'no printer matches ghost');
+    });
+
+    it('refuses a public address rather than dialling it', () => {
+      // The bridge only ever dials RFC1918 space and `targetFrom` drops anything else, so this is a
+      // refusal by exhaustion rather than a printer lookup.
+      const out = resolveRelayPrinter(registry, { target_ip: '8.8.8.8', target_port: 9100 });
+      assert.equal(refusal(out), 'no printer matches 8.8.8.8:9100');
+    });
   });
 });

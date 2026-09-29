@@ -175,6 +175,31 @@ export function prepare(request: JobRequest): Prepared {
 }
 
 /**
+ * Resolve the printer a CLOUD job is addressed to.
+ *
+ * Beside `resolvePrinter` because the two must agree on what a turned-off printer means; they
+ * differ only in what a job can carry. A relay job has a `printer_id` or a `target_ip`, never a
+ * registry default, and its address arrives as raw wire values that `targetFrom` still has to vet.
+ *
+ * A `printer_id` that names an entry is FINAL. If that entry is turned off the job is refused, not
+ * re-routed by address: a server that sent both meant the id, and printing somewhere else would be
+ * worse than not printing. An id this bridge has never heard of still falls back to the address,
+ * as it always has — that is a server holding a stale registry, not a decision.
+ */
+export function resolveRelayPrinter(
+  registry: Registry,
+  job: { printer_id?: string; target_ip: string | null; target_port: number },
+): PrinterRecord | { error: string } {
+  const named = job.printer_id ? findPrinter(registry, job.printer_id) : null;
+  if (named) return named.enabled ? named : { error: disabledError(named) };
+
+  const target = targetFrom(job.target_ip, job.target_port);
+  if (target) return resolveTarget(registry, target.ip, target.port);
+
+  return { error: `no printer matches ${job.printer_id ?? `${job.target_ip}:${job.target_port}`}` };
+}
+
+/**
  * Render a document that arrived over the RELAY, for an already-resolved printer.
  *
  * Split out of `prepare()` because the relay resolves its own printer — it has to, in order to

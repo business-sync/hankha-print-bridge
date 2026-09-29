@@ -1,9 +1,9 @@
 import { loadState, saveState, type RelayState } from './identity.js';
 import { containerSuspect, DEFAULT_PRINTER_PORT, localInterfaces, runScan } from './lan.js';
-import { adHocNetworkPrinter, renderJobDocument, targetFrom } from './jobs.js';
+import { renderJobDocument, resolveRelayPrinter } from './jobs.js';
 import { log } from './log.js';
 import { queue, type JobResult } from './queue.js';
-import { findPrinter, loadRegistry, resolveByAddress } from './registry.js';
+import { loadRegistry } from './registry.js';
 import { connectWebSocket, WebSocketHandshakeError } from './relay-socket.js';
 import { BRIDGE_VERSION } from './version.js';
 import { arch, hostname, platform } from 'node:os';
@@ -260,23 +260,25 @@ async function postResult(base: string, token: string, jobId: string, result: Jo
   if (!res.ok && res.status !== 409) throw new Error(`result POST failed: HTTP ${res.status}`);
 }
 
-async function handlePrint(base: string, token: string, work: Extract<Work, { type: 'print' }>) {
+// Exported for tests only; `dispatch` is the real caller.
+export async function handlePrint(base: string, token: string, work: Extract<Work, { type: 'print' }>) {
   const { job } = work;
 
-  const target = targetFrom(job.target_ip, job.target_port);
-  const registry = loadRegistry();
   // `printer_id` wins over the address. It is how the server names a printer this machine owns
   // — including USB and serial ones, which have no IP at all and therefore cannot be addressed
-  // any other way.
-  const named = job.printer_id ? findPrinter(registry, job.printer_id) : null;
-  const printer = named ?? (target ? resolveByAddress(registry, target.ip, target.port) ?? adHocNetworkPrinter(target.ip, target.port) : null);
+  // any other way. A printer the operator turned off is refused however the job reaches it.
+  const printer = resolveRelayPrinter(loadRegistry(), job);
 
-  if (!printer) {
+  if ('error' in printer) {
+    // `device-missing` covers "unknown" and "turned off" alike, and the detail says which. It is
+    // the nearest reason the server's `JOB_FAILURE_REASONS` accepts: an unfamiliar one is 422'd,
+    // the result is lost, and the sweeper later writes UNKNOWN over a job that provably never
+    // printed. `none` is exact — nothing was sent to any printer — so the POS may offer a retry.
     await postResult(base, token, job.job_id, {
       ok: false,
       reason: 'device-missing',
       printed_certainty: 'none',
-      detail: `no printer matches ${job.printer_id ?? `${job.target_ip}:${job.target_port}`}`,
+      detail: printer.error,
     });
     return;
   }
