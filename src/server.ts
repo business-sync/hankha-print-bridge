@@ -41,7 +41,7 @@ import {
 import { describeJob, isSafeJobId, queue } from './queue.js';
 import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
 import { loadState, stateDir, statePath } from './identity.js';
-import { enroll, isRelayRunning, relayStatus, startRelay } from './relay.js';
+import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay, wakeRelay } from './relay.js';
 import { sampleLabel, sampleReceipt } from './samples.js';
 import { pairingHandoffTarget, pairingSnapshot, restartPairing } from './pairing.js';
 import { qrSvg } from './qr.js';
@@ -352,12 +352,16 @@ async function handleEnroll(res: ServerResponse, record: Record<string, unknown>
     // closure, and is the one time a restart genuinely is required. Say so instead of implying
     // success.
     const wasRunning = isRelayRunning();
+    // A loop that is only waiting out a rejected token re-reads its credential when woken, so a
+    // forced re-pair over it needs no restart either.
+    const wasRejected = wasRunning && isRelayRejected();
     if (!wasRunning) startRelay();
+    else if (wasRejected) wakeRelay();
 
     log.info(`enrolled as bridge ${bridge_id} from the local page`, {
       event: 'relay.enrolled', bridge_id, source: 'page',
     });
-    sendJson(res, 200, { ok: true, bridge_id, restart_required: wasRunning });
+    sendJson(res, 200, { ok: true, bridge_id, restart_required: wasRunning && !wasRejected });
   } catch (err) {
     // The API answers every enrolment failure identically on purpose. Pass its sentence straight
     // through rather than inventing a more specific one this side cannot actually justify.

@@ -45,6 +45,11 @@ const RECONNECT_FLOOR_MS = 1_000;
  * and accepted before the claim lapses and the sweeper writes UNKNOWN over it.
  */
 const RESULT_RESERVE_MS = 10_000;
+/** Silence on the websocket for this long means the link is dead, whatever the socket says. */
+const WS_IDLE_TIMEOUT_MS = 45_000;
+/** Longest wait between attempts once the server has rejected the token. */
+const REJECTED_RETRY_MAX_MS = 300_000;
+const TOKEN_REJECTED = 'token rejected — re-enrollment required';
 
 type Work =
   | {
@@ -422,6 +427,7 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
     client = await connectWebSocket({
       url: socketUrl(base),
       headers: { Authorization: `Bearer ${token}` },
+      idleTimeoutMs: WS_IDLE_TIMEOUT_MS,
       onMessage: (text) => {
         let work: Work;
         try {
@@ -441,7 +447,9 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
     });
   } catch (err) {
     if (err instanceof WebSocketHandshakeError) {
-      if (err.status === 401 || err.status === 403) return 'revoked';
+      // Only 401 is the API saying "this token is not valid". A 403 comes from something in front
+      // of it (proxy, WAF, captive portal) and says nothing about the credential.
+      if (err.status === 401) return 'revoked';
       // Any ordinary HTTP answer that is not an auth failure means this path does not speak
       // WebSocket. A 5xx is the exception: that is a server having a bad minute, not a missing
       // route, and it should be retried like any other transient fault.
@@ -481,6 +489,30 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** A sleep that `wakeRelay` can cut short — used only while waiting out a rejected token. */
+let wakeWait: (() => void) | null = null;
+function interruptibleSleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      wakeWait = null;
+      resolve();
+    }
+    wakeWait = done;
+  });
+}
+
+/** Retry now rather than at the end of the backoff. `POST /enroll` calls it after saving a new token. */
+export function wakeRelay(): void {
+  wakeWait?.();
+}
+
+/** The loop is alive but the server has said the token is not valid, so it is waiting to be re-paired. */
+export function isRelayRejected(): boolean {
+  return relayRunning && !status.connected && status.last_error === TOKEN_REJECTED;
+}
 
 
 
@@ -528,8 +560,8 @@ export function startRelay(): void {
 
   relayRunning = true;
 
-  const base = relayUrl(state);
-  const token = state.token;
+  let base = relayUrl(state);
+  let token = state.token;
   status.enrolled = true;
   status.bridge_id = state.bridge_id;
   log.info(`relay: enrolled as bridge ${state.bridge_id}, connecting to ${base}`, {
@@ -555,29 +587,57 @@ export function startRelay(): void {
   let wsBlockedUntil = mode === 'poll' ? Number.POSITIVE_INFINITY : 0;
   let wsUnsupportedLogged = false;
 
+  let rejections = 0;
+  /*
+   * The server said the token is not valid. This used to END the loop, which meant a single
+   * 401 — from a proxy, from replica lag right after enrolment, from anything — disconnected the
+   * bridge until someone re-paired it by hand. The bridge now only stops being connected when
+   * the user removes it: it keeps asking, slowly, and re-reads its credential each time so a new
+   * code entered on the local page takes effect without a restart. A token that really was
+   * revoked just keeps getting 401, which costs one cheap request every few minutes.
+   */
+  const waitOutRejection = async () => {
+    status.connected = false;
+    status.last_error = TOKEN_REJECTED;
+    const wait = backoffMs(6 + Math.min(rejections, 3), REJECTED_RETRY_MAX_MS);
+    rejections += 1;
+    log.error(
+      `relay: token rejected — retrying in ${Math.round(wait / 1000)}s. If it stays rejected, open http://localhost:9200 on this computer and press Get a new code`,
+      { event: 'relay.token_rejected', wait_ms: wait }
+    );
+    await interruptibleSleep(wait);
+    const fresh = loadState();
+    if (fresh.token && fresh.bridge_id) {
+      token = fresh.token;
+      base = relayUrl(fresh);
+      status.bridge_id = fresh.bridge_id;
+    }
+  };
+
   void (async () => {
     let failures = 0;
     try {
       for (;;) {
         if (Date.now() >= wsBlockedUntil) {
-          const outcome = await runSocketSession(base, token);
-          if (outcome === 'revoked') {
+          let outcome: SessionOutcome;
+          try {
+            outcome = await runSocketSession(base, token);
+          } catch (err) {
+            // Never let a throw end the loop: the only way out of it is the process stopping.
             status.connected = false;
-            status.last_error = 'token rejected — re-enrollment required';
-            // Names the route that actually exists. The CLI this used to point at is not on
-            // PATH under either installer, so following it produced "command not found" —
-            // which is what the on-screen pairing flow replaced.
-            log.error(
-              'relay: token rejected. Open http://localhost:9200 on this computer and press Get a new code',
-              { event: 'relay.token_rejected' }
-            );
-            return;
+            status.last_error = err instanceof Error ? err.message : String(err);
+            outcome = 'error';
+          }
+          if (outcome === 'revoked') {
+            await waitOutRejection();
+            continue;
           }
           if (outcome === 'served') {
             // A clean session ended: reconnect rather than falling back, because the endpoint
             // demonstrably exists. Floored all the same — a category that reconnects without
             // delay is one server-side bug away from being a spin, which is how it got here.
             failures = 0;
+            rejections = 0;
             await sleep(RECONNECT_FLOOR_MS);
             continue;
           }
@@ -611,18 +671,8 @@ export function startRelay(): void {
           );
 
           if (res.status === 401) {
-            // The token was revoked or the bridge was deleted. Stop rather than hammer: only a
-            // human with a fresh enrollment code can fix this.
-            status.connected = false;
-            status.last_error = 'token rejected — re-enrollment required';
-            // Names the route that actually exists. The CLI this used to point at is not on
-            // PATH under either installer, so following it produced "command not found" —
-            // which is what the on-screen pairing flow replaced.
-            log.error(
-              'relay: token rejected. Open http://localhost:9200 on this computer and press Get a new code',
-              { event: 'relay.token_rejected' }
-            );
-            return;
+            await waitOutRejection();
+            continue;
           }
 
           if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`);
@@ -632,6 +682,7 @@ export function startRelay(): void {
           status.last_ok_at = new Date().toISOString();
           status.last_error = null;
           failures = 0;
+          rejections = 0;
 
           if (res.status === 204) {
             // The normal, quiet path — not an error. Re-poll immediately with only enough

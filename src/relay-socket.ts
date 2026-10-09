@@ -60,6 +60,15 @@ export interface ConnectOptions {
   url: string;
   headers?: Record<string, string>;
   timeoutMs?: number;
+  /**
+   * Close the connection if nothing at all arrives for this long. 0 disables it.
+   *
+   * A link that dies without a RST (Wi-Fi drop, NAT timeout, laptop sleep) leaves the socket
+   * "open" for many minutes, and the relay hands the whole job feed to the socket — so a dead one
+   * is a silent outage. The client pings at a third of this interval, so a healthy peer always
+   * answers well inside it, whether or not the server pings on its own.
+   */
+  idleTimeoutMs?: number;
   onMessage: (text: string) => void;
 }
 
@@ -191,6 +200,8 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
       let closeCode = 1006;
       let closeReason = 'connection lost';
       let finished = false;
+      let idleTimer: NodeJS.Timeout | undefined;
+      let pingTimer: NodeJS.Timeout | undefined;
 
       let resolveClosed: (value: { code: number; reason: string }) => void = () => {};
       const closed = new Promise<{ code: number; reason: string }>((r) => {
@@ -200,6 +211,8 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
       const finish = () => {
         if (finished) return;
         finished = true;
+        clearTimeout(idleTimer);
+        clearInterval(pingTimer);
         socket.destroy();
         resolveClosed({ code: closeCode, reason: closeReason });
       };
@@ -290,7 +303,23 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
         }
       };
 
+      const idleMs = options.idleTimeoutMs ?? 0;
+      const armIdle = () => {
+        if (idleMs <= 0 || finished) return;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          closeCode = 1006;
+          closeReason = 'no traffic from server';
+          finish();
+        }, idleMs);
+      };
+      if (idleMs > 0) {
+        armIdle();
+        pingTimer = setInterval(() => write(OP_PING, Buffer.alloc(0)), Math.max(1, Math.floor(idleMs / 3)));
+      }
+
       socket.on('data', (chunk: Buffer) => {
+        armIdle();
         buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
         drain();
       });

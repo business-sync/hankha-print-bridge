@@ -75,4 +75,31 @@ describe('relay state', () => {
     assert.equal(statSync(statePath()).mode & 0o777, 0o600);
     assert.match(readFileSync(statePath(), 'utf8'), /secret-token/);
   });
+
+  /*
+   * A truncated relay.json used to read as "never paired": the bridge went silent and announced
+   * itself as a brand-new computer, which is a disconnection nobody asked for.
+   */
+  it('falls back to the previous copy when the current file is corrupt', async () => {
+    const dir = useTempDir();
+    const { loadState, saveState } = await import('./identity.js');
+    const first = loadState();
+    saveState({ ...first, bridge_id: '7', token: 'tok-1' });
+    saveState({ ...first, bridge_id: '7', token: 'tok-2' });
+    writeFileSync(join(dir, 'relay.json'), '{ "install_id": "trunc');
+    const state = loadState();
+    assert.equal(state.install_id, first.install_id);
+    assert.equal(state.bridge_id, '7');
+    assert.equal(state.token, 'tok-1');
+  });
+
+  it('leaves no temp file behind and replaces the file in one step', async () => {
+    const dir = useTempDir();
+    const { loadState, saveState } = await import('./identity.js');
+    saveState({ ...loadState(), token: 'a' });
+    saveState({ ...loadState(), token: 'b' });
+    const { readdirSync } = await import('node:fs');
+    assert.ok(!readdirSync(dir).includes('relay.json.tmp'));
+    assert.equal(loadState().token, 'b');
+  });
 });
