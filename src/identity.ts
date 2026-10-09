@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -63,6 +63,12 @@ export function statePath(): string {
  */
 export function loadState(): RelayState {
   const path = statePath();
+  // The previous copy is tried before giving up: an interrupted write or a transient read error
+  // (antivirus holding the file on Windows) must not turn a paired bridge into an unpaired one.
+  return readStateFile(path) ?? readStateFile(`${path}.bak`) ?? { install_id: randomUUID() };
+}
+
+function readStateFile(path: string): RelayState | null {
   try {
     if (existsSync(path)) {
       const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<RelayState>;
@@ -71,9 +77,9 @@ export function loadState(): RelayState {
       }
     }
   } catch {
-    // fall through to a fresh identity
+    // fall through to the caller's next candidate
   }
-  return { install_id: randomUUID() };
+  return null;
 }
 
 /**
@@ -83,5 +89,18 @@ export function loadState(): RelayState {
 export function saveState(state: RelayState): void {
   const path = statePath();
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  /*
+   * Write-then-rename, so a crash or power cut leaves either the old file or the new one — never
+   * half of one. A plain `writeFileSync` truncates first, and a truncated file used to read as
+   * "this computer was never paired": the bridge went silent and announced itself as a new machine.
+   * The outgoing file is kept as `.bak` for `loadState` to fall back on.
+   */
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  try {
+    if (existsSync(path)) copyFileSync(path, `${path}.bak`);
+  } catch {
+    // The backup is a convenience; failing to take it must not fail the save.
+  }
+  renameSync(tmp, path);
 }

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
-  defaultPrinter, findPrinter, loadRegistry, parseRegistry, registryPath,
+  defaultPrinter, disabledAtAddress, findPrinter, loadRegistry, parseRegistry, registryPath,
   resetRegistryCache, resolveByAddress, saveRegistry,
 } from './registry.js';
 import { describeRegistry } from './relay.js';
@@ -147,6 +147,18 @@ describe('resolution', () => {
     assert.equal(resolveByAddress(registry, '192.168.18.9', 9100), null);
   });
 
+  // `resolveByAddress` answers null both for a turned-off printer and for one nobody registered,
+  // so a caller cannot refuse the first without asking this. Without it the relay fell through to
+  // an ad-hoc dial and printed on a printer the operator had switched off.
+  it('names the disabled printer that claims an address, so a caller can refuse rather than dial', () => {
+    assert.equal(disabledAtAddress(registry, '192.168.18.9', 9100)?.id, 'off');
+    // The port is part of the address: a different socket on the same host is not this printer.
+    assert.equal(disabledAtAddress(registry, '192.168.18.9', 9101), null);
+    // An enabled printer's address is not a turned-off one, and an unclaimed address stays unclaimed.
+    assert.equal(disabledAtAddress(registry, '192.168.18.103', 9100), null);
+    assert.equal(disabledAtAddress(registry, '192.168.18.250', 9100), null);
+  });
+
   it('uses the configured default', () => {
     assert.equal(defaultPrinter(registry, 'receipt')?.id, 'counter');
   });
@@ -195,11 +207,33 @@ describe('what the bridge reports upstream', () => {
     });
     const [reported] = describeRegistry();
     assert.deepEqual(Object.keys(reported ?? {}).sort(), [
-      'address', 'enabled', 'id', 'name', 'port', 'role', 'transport', 'type',
+      'address', 'dots_per_line', 'enabled', 'id', 'name', 'port', 'role', 'transport', 'type',
     ]);
     // Not `device`, not `baud`, not `language`: the summary carries only what the server can
-    // act on. `role` earns its place because role-addressed jobs are resolved server-side.
+    // act on. `role` earns its place because role-addressed jobs are resolved server-side, and
+    // `dots_per_line` because the server refuses a slip too wide for the roll before queueing it.
     assert.equal('device' in (reported ?? {}), false);
+    // A label printer prints no LINES, so it has no line width to report.
+    assert.equal(reported?.dots_per_line, null);
+  });
+
+  it('reports the printable width, so a remote till can lay a slip out for this roll', () => {
+    // Saved as PARSED, the way a real `printers.json` reaches `describeRegistry` — the defaults
+    // that fill in a missing width live in `parsePrinter`, not in the file.
+    saveRegistry(
+      parseRegistry({
+        version: 1,
+        printers: [
+          { id: 'narrow', name: 'Narrow', transport: 'network', address: '192.168.18.105', type: 'receipt', dots_per_line: 384 },
+          { id: 'counter', name: 'Counter', transport: 'network', address: '192.168.18.103', type: 'receipt' },
+        ],
+      }).registry
+    );
+    const reported = describeRegistry();
+    assert.equal(reported.find((p) => p.id === 'narrow')?.dots_per_line, 384);
+    // Filled in by `parsePrinter`, so a receipt printer nobody measured still reports a width
+    // rather than leaving the server to guess.
+    assert.equal(reported.find((p) => p.id === 'counter')?.dots_per_line, 576);
   });
 
   it('accepts a role, folds its case, and refuses one that is not a role', () => {

@@ -377,10 +377,10 @@ On macOS, always use the **call-out** device (`/dev/cu.*`), never `/dev/tty.*` �
 until carrier detect, which a printer never asserts, so the open never returns. Paths are
 rewritten automatically, but it is worth knowing which one to type.
 
-**A non-network printer may declare an `address`.** That is what lets a cloud job reach a USB
-printer: a relay job carries only `target_ip`/`target_port`, so giving a USB entry an address makes
-it addressable by every client that already speaks the old contract, with no change on the server
-or in the POS.
+**A non-network printer may declare an `address`.** That makes it reachable by a client that only
+knows an address — a till on the original `/print` contract, or a cloud job addressed by
+`target_ip`/`target_port` — with no change on the server or in the POS. It predates cloud jobs
+naming a printer by `printer_id`, which is now the normal route to a USB printer.
 
 ## Job documents
 
@@ -403,6 +403,22 @@ A **receipt** is a flow — elements print in order and the paper advances:
 
 Elements: `text`, `columns`, `rule`, `feed`, `image`, `barcode`, `qr`, `cut`, `drawer`. A cut is
 appended automatically unless the document ends with one or sets `"cut": false`.
+
+### Paper width
+
+Leave `dots_per_line` off and the bridge lays the slip out at the width of the printer it is
+about to use — 576 dots on 80 mm, 384 on 58 mm. That is the point of sending a document instead
+of bytes: a tablet paired to a station in another room does not know what roll is loaded.
+
+Set it only when the slip is **already laid out** — it holds rows padded to a fixed column count,
+or bitmaps drawn to fill the roll — because then nothing can be re-flowed. A pinned slip may be
+narrower than the paper (a 58 mm slip prints fine on an 80 mm roll) but **since 1.13.0 one that is
+wider is refused**, with a `422 render-failed` on `POST /jobs` and `payload-rejected` over the
+relay, naming both widths. Printing it anyway wrapped every row and still reported success, which
+reads as a broken printer rather than a mis-set paper size.
+
+Each printer's width is reported on every heartbeat, so the API can refuse such a job before it is
+ever queued.
 
 A **label** is a canvas — every element carries `x`/`y` in dots, because ZPL, TSPL and EPL2 are all
 positional:
@@ -469,6 +485,11 @@ Everything below needs `Authorization: Bearer <PRINT_BRIDGE_TOKEN>` when a token
   document's kind.
 - `GET /jobs` → recent jobs and the queue depth. `GET /jobs/:id` → one job.
 - `POST /jobs/:id/cancel` → 200 if it had not started, 409 once it is printing.
+
+A printer turned off in the registry (`enabled: false`) is refused however a request reaches it —
+by `printer_id`, or by the `ip`/`port` it is registered at. `/print` and `/jobs` answer
+`400 unknown-printer` with the reason in `errors`. An address no registry entry claims is still
+dialled, as it always was.
 
 ### Printers
 
@@ -604,13 +625,22 @@ so a network sweep can never find it and a remote till had nothing to name it by
 until now was to invent a private-looking IP, put it in the USB entry's `address`, and type that
 same fake address into the POS; `resolveByAddress` still honours it, so nothing breaks.
 
+A printer turned off in `printers.json` is refused on this path too, however the job addresses it.
+The bridge reports `device-missing` with `printed_certainty: "none"` and a detail saying the printer
+is disabled on this bridge; the POS shows that as a printer that was not found, and it is safe to
+print again. An address no entry claims is still dialled ad hoc.
+
 To make that choice possible from a device with no LAN access, every heartbeat (and the enrolment
 POST) carries `registry_printers` — a summary of this bridge's configured printers, capped at 64:
 
 ```json
-{ "id": "kitchen-usb", "name": "Kitchen", "transport": "usb",
-  "type": "receipt", "enabled": true, "address": null, "port": null }
+{ "id": "kitchen-usb", "name": "Kitchen", "transport": "usb", "type": "receipt",
+  "enabled": true, "address": null, "port": null, "role": "kitchen", "dots_per_line": 576 }
 ```
+
+`dots_per_line` is null on a label printer, which has no line width. It is what lets the API tell
+a till that a slip it laid out for 80 mm is too wide for the roll on the station it is aimed at —
+see **Paper width** above.
 
 Additive on both sides. An older API strips the field; a bridge older than 1.5.0 does not send it,
 and the server keeps whatever it last knew rather than treating "absent" as "no printers".

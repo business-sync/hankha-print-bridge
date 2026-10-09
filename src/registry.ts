@@ -345,16 +345,36 @@ export function findPrinter(registry: Registry, id: string): PrinterRecord | nul
   return registry.printers.find((p) => p.id === id) ?? null;
 }
 
+/** Whether an entry claims this `ip:port`. The one address rule the two lookups below share. */
+function atAddress(p: PrinterRecord, ip: string, port: number): boolean {
+  return p.address === ip && (p.port ?? 9100) === port;
+}
+
 /**
- * Find the printer a bare `ip:port` refers to.
+ * Find the ENABLED printer a bare `ip:port` refers to.
  *
- * This is what lets a cloud print job reach a USB printer. A relay job carries only
- * `target_ip`/`target_port` — there is no printer id on the wire — so an operator who gives a USB
- * entry an `address` makes it addressable by everything that already speaks the old contract,
- * with no change on the server or in the POS.
+ * For callers that only know an address: a till speaking the original `/print` contract, or a
+ * cloud job the server addressed by `target_ip`/`target_port` instead of by `printer_id`. An
+ * operator who gives a USB entry an `address` makes it reachable by them too — the workaround from
+ * before a job could name a printer by id, and still honoured.
+ *
+ * Null does NOT mean "nothing is registered here": the entry may exist and be turned off. A caller
+ * about to dial the address ad hoc must ask `disabledAtAddress` first, or the toggle only stops
+ * the jobs that happen to name the printer by id.
  */
 export function resolveByAddress(registry: Registry, ip: string, port: number): PrinterRecord | null {
-  return registry.printers.find((p) => p.enabled && p.address === ip && (p.port ?? 9100) === port) ?? null;
+  return registry.printers.find((p) => p.enabled && atAddress(p, ip, port)) ?? null;
+}
+
+/**
+ * A DISABLED entry that claims this `ip:port`, if any.
+ *
+ * The other half of `resolveByAddress`, which cannot tell "turned off" from "never registered" —
+ * both come back null. Before this existed, a caller that fell back to an ad-hoc dial on null
+ * printed on exactly the printer the operator had switched off.
+ */
+export function disabledAtAddress(registry: Registry, ip: string, port: number): PrinterRecord | null {
+  return registry.printers.find((p) => !p.enabled && atAddress(p, ip, port)) ?? null;
 }
 
 export function defaultPrinter(registry: Registry, type: PrinterType): PrinterRecord | null {

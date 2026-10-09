@@ -51,6 +51,28 @@ function serverFrame(opcode: number, payload: Buffer): Buffer {
   return Buffer.concat([Buffer.from(header), payload]);
 }
 
+function upgradeServer(onSocket: (socket: Socket) => void): Promise<string> {
+  return new Promise((resolve) => {
+    const server = track(createServer((_req, res) => {
+      res.writeHead(404).end();
+    }));
+    server.on('upgrade', (req, socket: Socket) => {
+      const key = req.headers['sec-websocket-key'] as string;
+      const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+      );
+      onSocket(socket);
+    });
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (typeof address === 'string' || address === null) throw new Error('no port');
+      resolve(`ws://127.0.0.1:${address.port}/socket`);
+    });
+  });
+}
+
 describe('frame codec', () => {
   it('reads a 7-bit length', () => {
     const frame = parseFrame(serverFrame(0x1, Buffer.from('hello')));
@@ -101,28 +123,6 @@ describe('frame codec', () => {
 });
 
 describe('a live connection', () => {
-  function upgradeServer(onSocket: (socket: Socket) => void): Promise<string> {
-    return new Promise((resolve) => {
-      const server = track(createServer((_req, res) => {
-        res.writeHead(404).end();
-      }));
-      server.on('upgrade', (req, socket: Socket) => {
-        const key = req.headers['sec-websocket-key'] as string;
-        const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
-        socket.write(
-          'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
-            `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
-        );
-        onSocket(socket);
-      });
-      server.listen(0, '127.0.0.1', () => {
-        const address = server.address();
-        if (typeof address === 'string' || address === null) throw new Error('no port');
-        resolve(`ws://127.0.0.1:${address.port}/socket`);
-      });
-    });
-  }
-
   it('completes the handshake, receives, sends masked, and closes', async () => {
     const fromClient: string[] = [];
     const url = await upgradeServer((socket) => {
@@ -188,6 +188,39 @@ describe('a live connection', () => {
     const client = await connectWebSocket({ url, onMessage: () => {} });
     await new Promise((r) => setTimeout(r, 100));
     assert.equal((pong as Buffer | null)?.toString(), 'ka');
+    client.close();
+  });
+});
+
+describe('liveness', () => {
+  it('closes a connection that goes silent, so a half-open link cannot hold the job feed', async () => {
+    // Accepts the upgrade and then never sends or answers anything, like a peer behind a dead NAT.
+    const url = await upgradeServer(() => {});
+    const client = await connectWebSocket({ url, idleTimeoutMs: 150, onMessage: () => {} });
+    const closed = await client.closed;
+    assert.equal(closed.code, 1006);
+    assert.equal(closed.reason, 'no traffic from server');
+  });
+
+  it('stays open while the peer answers the client ping', async () => {
+    const url = await upgradeServer((socket) => {
+      let buffer = Buffer.alloc(0);
+      socket.on('data', (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        for (;;) {
+          const frame = parseFrame(buffer);
+          if (!frame) return;
+          buffer = buffer.subarray(frame.size);
+          if (frame.opcode === 0x9) socket.write(serverFrame(0xa, frame.payload));
+        }
+      });
+    });
+    const client = await connectWebSocket({ url, idleTimeoutMs: 150, onMessage: () => {} });
+    const outcome = await Promise.race([
+      client.closed.then(() => 'closed'),
+      new Promise((r) => setTimeout(() => r('open'), 500)),
+    ]);
+    assert.equal(outcome, 'open');
     client.close();
   });
 });
