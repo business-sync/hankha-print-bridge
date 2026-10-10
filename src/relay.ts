@@ -450,6 +450,8 @@ type SessionOutcome = 'served' | 'unsupported' | 'revoked' | 'error';
  * it saves, and it means a half-built server side cannot lose a print result.
  */
 async function runSocketSession(base: string, token: string): Promise<SessionOutcome> {
+  // Reset so a session that never opens cannot leave the previous one's duration to be read as a flap.
+  lastSessionMs = Number.POSITIVE_INFINITY;
   let client: Awaited<ReturnType<typeof connectWebSocket>>;
   let lastAckAt = Date.now();
   try {
