@@ -20,7 +20,24 @@ import { backoffMs } from './backoff.js';
 
 const DEFAULT_RELAY_URL = 'https://api.hankha.la';
 const POLL_WAIT_S = 25;
-const HEARTBEAT_INTERVAL_MS = 30_000;
+const HEARTBEAT_INTERVAL_MS = envMs('PRINT_BRIDGE_HEARTBEAT_MS', 30_000);
+/**
+ * How long a websocket may go without an application-level `ack` from the server before it is
+ * declared dead and replaced. Only enforced once this process has seen the server ack at least
+ * once, so an older backend that never acks is not reconnected in a loop.
+ *
+ * Transport pongs are NOT evidence: any proxy or the `ws` library answers them while the
+ * server-side subscription is gone, which is how a feed can die silently while `connected` stays
+ * true and the HTTP heartbeat keeps the POS showing the bridge as online.
+ */
+const ACK_TIMEOUT_MS = envMs('PRINT_BRIDGE_ACK_TIMEOUT_MS', HEARTBEAT_INTERVAL_MS * 3 + 5_000);
+/** A "served" session shorter than this is a flap, not a healthy session. */
+const FLAP_SESSION_MS = 10_000;
+
+function envMs(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 /**
  * How long to leave WebSocket alone after a server says it does not speak it.
  *
@@ -382,12 +399,18 @@ async function handleScan(base: string, token: string, work: Extract<Work, { typ
 }
 
 async function heartbeat(base: string, token: string): Promise<void> {
-  await fetch(`${base}/api/v1/modules/print/bridge/heartbeat`, {
+  const res = await fetch(`${base}/api/v1/modules/print/bridge/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(describeSelf()),
     signal: AbortSignal.timeout(15_000),
   });
+  // Release the pooled connection, and say so when the server refuses us: a heartbeat that is
+  // silently rejected leaves the POS showing this bridge offline with nothing in the log.
+  await res.body?.cancel().catch(() => undefined);
+  if (!res.ok) {
+    log.warn(`relay: heartbeat rejected (HTTP ${res.status})`, { event: 'relay.heartbeat.rejected', status: res.status });
+  }
 }
 
 async function dispatch(base: string, token: string, work: Work): Promise<void> {
@@ -406,6 +429,11 @@ function socketUrl(base: string): string {
   return `${base.replace(/^http/, 'ws')}/api/v1/modules/print/bridge/socket`;
 }
 
+/** Whether the server has ever acked a heartbeat to this process (feature-detected, never assumed). */
+let serverAcks = false;
+/** Duration of the last websocket session, read by the loop to tell a flap from a clean session. */
+let lastSessionMs = Number.POSITIVE_INFINITY;
+
 type SessionOutcome = 'served' | 'unsupported' | 'revoked' | 'error';
 
 /**
@@ -423,6 +451,7 @@ type SessionOutcome = 'served' | 'unsupported' | 'revoked' | 'error';
  */
 async function runSocketSession(base: string, token: string): Promise<SessionOutcome> {
   let client: Awaited<ReturnType<typeof connectWebSocket>>;
+  let lastAckAt = Date.now();
   try {
     client = await connectWebSocket({
       url: socketUrl(base),
@@ -433,6 +462,12 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
         try {
           work = JSON.parse(text) as Work;
         } catch {
+          return;
+        }
+        if ((work as { type?: string }).type === 'ack') {
+          serverAcks = true;
+          lastAckAt = Date.now();
+          status.last_ok_at = new Date().toISOString();
           return;
         }
         // Unknown types are ignored rather than treated as errors, so the server can add a frame
@@ -453,7 +488,9 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
       // Any ordinary HTTP answer that is not an auth failure means this path does not speak
       // WebSocket. A 5xx is the exception: that is a server having a bad minute, not a missing
       // route, and it should be retried like any other transient fault.
-      if (err.status !== null && err.status < 500) return 'unsupported';
+      // Only "no such route / cannot upgrade here" justifies a 30-minute lockout. 400/403/408/429
+      // are a proxy, a WAF or a rate limiter having a bad moment: back off and try again.
+      if (err.status === 404 || err.status === 405 || err.status === 426) return 'unsupported';
     }
     status.last_error = err instanceof Error ? err.message : String(err);
     return 'error';
@@ -466,11 +503,25 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
   log.info('relay: connected over websocket', { event: 'relay.ws.open' });
 
   client.send(JSON.stringify({ type: 'hello', ...describeSelf() }));
+  const sessionStart = Date.now();
   const beat = setInterval(() => client.send(JSON.stringify({ type: 'heartbeat', ...describeSelf() })), HEARTBEAT_INTERVAL_MS);
   beat.unref();
+  // Application-level liveness: see ACK_TIMEOUT_MS. Checked on the heartbeat cadence.
+  let ackTimedOut = false;
+  const ackWatch = setInterval(() => {
+    if (ackTimedOut || !serverAcks || Date.now() - lastAckAt <= ACK_TIMEOUT_MS) return;
+    ackTimedOut = true;
+    log.warn(`relay: no ack from server for ${Math.round((Date.now() - lastAckAt) / 1000)}s — reconnecting`, {
+      event: 'relay.ws.ack_timeout', since_ack_ms: Date.now() - lastAckAt,
+    });
+    client.close(4000, 'no ack');
+  }, Math.max(250, Math.min(HEARTBEAT_INTERVAL_MS, ACK_TIMEOUT_MS / 3)));
+  ackWatch.unref();
 
   const { code, reason } = await client.closed;
   clearInterval(beat);
+  clearInterval(ackWatch);
+  lastSessionMs = Date.now() - sessionStart;
   status.connected = false;
   status.last_error = code === 1000 ? null : `websocket closed (${code}${reason ? `: ${reason}` : ''})`;
   log.info(`relay: websocket closed (${code})`, { event: 'relay.ws.close', code, reason });
@@ -636,9 +687,20 @@ export function startRelay(): void {
             // A clean session ended: reconnect rather than falling back, because the endpoint
             // demonstrably exists. Floored all the same — a category that reconnects without
             // delay is one server-side bug away from being a spin, which is how it got here.
-            failures = 0;
             rejections = 0;
-            await sleep(RECONNECT_FLOOR_MS);
+            if (lastSessionMs < FLAP_SESSION_MS) {
+              // Accepted then closed within seconds, repeatedly: two processes sharing a token, or
+              // a proxy cycling the upstream. Back off instead of reconnecting at the floor.
+              const wait = Math.max(RECONNECT_FLOOR_MS, backoffMs(Math.min(failures, 5)));
+              failures += 1;
+              log.warn(`relay: websocket flapping — reconnecting in ${Math.round(wait / 1000)}s`, {
+                event: 'relay.ws.flap', session_ms: lastSessionMs, wait_ms: wait,
+              });
+              await sleep(wait);
+            } else {
+              failures = 0;
+              await sleep(RECONNECT_FLOOR_MS);
+            }
             continue;
           }
           if (outcome === 'unsupported') {

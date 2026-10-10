@@ -3,7 +3,8 @@ import { discoverAll } from './discovery.js';
 import { ENROLL_CODE_HINT, isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { registerStopper } from './lifecycle.js';
 import { log } from './log.js';
-import { enroll, startRelay } from './relay.js';
+import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay } from './relay.js';
+import { createWatchdog, watchdogLimitMs } from './watchdog.js';
 import { startPairing } from './pairing.js';
 import { queue } from './queue.js';
 import { findPrinter, loadRegistry, registryPath } from './registry.js';
@@ -266,6 +267,19 @@ function runService(): void {
       `  ${registry.printers.length} printer(s) configured in ${registryPath()}`,
       { event: 'registry.loaded', printers: registry.printers.length, path: registryPath() }
     );
+
+    // Started only once the port is ours: a second copy that loses `EADDRINUSE` must not have
+    // already sent a heartbeat or claimed work on its way out.
+    // The outbound half: dial the cloud API and wait for jobs, so a phone or a till on mobile data
+    // can print through this bridge without reaching the LAN itself. A no-op (with one log line)
+    // until this bridge holds a credential, so an existing LAN-only install is unaffected.
+    startRelay();
+
+    // The other outbound half, and the only one a brand-new install exercises: announce this
+    // machine to the API and put a code on screen for a tablet to scan. Returns immediately when
+    // a credential already exists, so the two are safe to call unconditionally and in this order
+    // — `startRelay` gets first refusal on an already-paired bridge.
+    startPairing();
   });
 
   // Reads the spool back and resumes anything a previous run left behind, before the first request
@@ -274,16 +288,6 @@ function runService(): void {
   // race into a double recovery.
   queue().load();
 
-  // The outbound half: dial the cloud API and wait for jobs, so a phone or a till on mobile data
-  // can print through this bridge without reaching the LAN itself. A no-op (with one log line)
-  // until this bridge holds a credential, so an existing LAN-only install is unaffected.
-  startRelay();
-
-  // The other outbound half, and the only one a brand-new install exercises: announce this
-  // machine to the API and put a code on screen for a tablet to scan. Returns immediately when
-  // a credential already exists, so the two are safe to call unconditionally and in this order
-  // — `startRelay` gets first refusal on an already-paired bridge.
-  startPairing();
 
   /*
    * Survive an unexpected throw instead of vanishing.
@@ -335,6 +339,16 @@ function runService(): void {
   };
 
   registerStopper((exitCode) => stop(exitCode, 'service-request'));
+
+  createWatchdog({
+    limitMs: watchdogLimitMs(),
+    probe: () => {
+      const st = relayStatus();
+      return { enrolled: st.enrolled, connected: st.connected, rejected: isRelayRejected(), running: isRelayRunning() };
+    },
+    // Exit code 1: a Windows scheduled task only restarts on failure (see above).
+    exit: (reason) => stop(1, `watchdog: ${reason}`),
+  });
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => stop(0, signal));
