@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import { rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { log } from '../log.js';
 import type { PrinterRecord } from '../registry.js';
 import { commandExists, runCommand } from './exec.js';
 import { failed, succeeded, type DiscoveredPrinter, type ProbeResult, type Transport } from './transport.js';
@@ -117,14 +118,64 @@ function looksMissing(text: string): boolean {
   return /does not exist|unknown destination|no such|cannot find|not found/i.test(text);
 }
 
+/**
+ * How long the paused-queue check may take. Both commands are local calls to `cupsd` and answer
+ * in milliseconds; the bound only matters when `cupsd` is wedged, and then `lp` below says so.
+ */
+const QUEUE_CHECK_TIMEOUT_MS = 2_000;
+
+/** `cupsenable` is in /usr/sbin on macOS, which a service's PATH does not always include. */
+const CUPSENABLE_FALLBACK = '/usr/sbin/cupsenable';
+
+/**
+ * Un-pause a CUPS queue before sending to it.
+ *
+ * When CUPS cannot reach a USB printer — switched off, unplugged, or the Mac slept — it DISABLES
+ * the queue, and it does not enable it again when the printer returns. `lp` goes on accepting jobs
+ * into a disabled queue and answers "request id is ...", so every bill is reported as sent and
+ * none comes out until someone runs `cupsenable` by hand. That is a printer that "disconnected and
+ * never reconnected", and it is the one disconnect this bridge can mend by itself.
+ *
+ * Best effort, and never in the job's way: a failed check or a refused `cupsenable` (it needs
+ * rights that an unprivileged login may not have) is logged and the job still goes to `lp`, which
+ * then behaves exactly as it did before this existed. Jobs CUPS accepted while the queue was
+ * paused are held by CUPS and print when it resumes — the same as pressing Resume in the macOS
+ * print queue window.
+ */
+async function resumeQueueIfPaused(queue: string): Promise<void> {
+  const status = await runCommand('lpstat', ['-p', queue], { timeoutMs: QUEUE_CHECK_TIMEOUT_MS });
+  if (!status.ok || !/\bdisabled\b/i.test(status.stdout)) return;
+
+  let resumed = await runCommand('cupsenable', [queue], { timeoutMs: QUEUE_CHECK_TIMEOUT_MS });
+  if (resumed.spawnError) {
+    resumed = await runCommand(CUPSENABLE_FALLBACK, [queue], { timeoutMs: QUEUE_CHECK_TIMEOUT_MS });
+  }
+  if (resumed.ok) {
+    log.info(`spooler: queue '${queue}' was paused — resumed it`, { event: 'spooler.queue_resumed', queue });
+    return;
+  }
+  const detail = resumed.spawnError
+    ? 'cupsenable is not available'
+    : resumed.timedOut
+      ? 'cupsenable did not answer'
+      : (resumed.stderr || resumed.stdout).trim() || `cupsenable exited ${resumed.code}`;
+  log.warn(`spooler: queue '${queue}' is paused and could not be resumed (${detail})`, {
+    event: 'spooler.queue_resume_failed',
+    queue,
+    detail,
+  });
+}
+
 async function sendViaCups(printer: PrinterRecord, bytes: Buffer, timeoutMs: number, startedAt: number) {
   const queue = printer.queue ?? '';
+  await resumeQueueIfPaused(queue);
   const result = await runCommand(
     'lp',
     // `-o raw` is load-bearing: without it CUPS runs the job through the queue's filter chain and
     // ESC/POS control codes come out as printed text. `-` reads the document from stdin.
     ['-d', queue, '-o', 'raw', '-t', `hankha-${printer.id}`, '-'],
-    { timeoutMs, input: bytes }
+    // The check above spends part of the send's budget; `lp` gets what is left, never less than a second.
+    { timeoutMs: Math.max(1_000, timeoutMs - (Date.now() - startedAt)), input: bytes }
   );
 
   if (result.spawnError) {

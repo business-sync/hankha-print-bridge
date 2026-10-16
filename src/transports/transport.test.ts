@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -135,6 +135,24 @@ describe('usb (OS spooler)', () => {
     resetCommandCache();
   }
 
+  /** Separate fakes for each CUPS command, so a test can say what `lpstat` and `cupsenable` do. */
+  function fakeCups(scripts: { lp?: string; lpstat?: string; cupsenable?: string }): string {
+    const dir = scratch();
+    for (const [name, script] of Object.entries(scripts)) {
+      const path = join(dir, name);
+      writeFileSync(path, script);
+      chmodSync(path, 0o755);
+    }
+    process.env.PATH = `${dir}:${originalPath}`;
+    resetCommandCache();
+    return dir;
+  }
+
+  const LP_ACCEPTS = '#!/bin/sh\ncat > /dev/null\necho "request id is q-1 (1 file(s))"\n';
+  const QUEUE_IDLE = '#!/bin/sh\necho "printer q is idle.  enabled since Thu Oct 16 10:00:00 2026"\n';
+  // What CUPS prints for a queue it disabled after losing the device.
+  const QUEUE_PAUSED = '#!/bin/sh\nprintf "printer q disabled since Thu Oct 16 10:00:00 2026 -\\n\\tPaused\\n"\n';
+
   it('accepts a job the spooler took', async (t) => {
     if (!posix) return t.skip('CUPS path is posix only');
     // Reads stdin to completion, then exits 0 — what a real `lp` does on success.
@@ -159,7 +177,8 @@ describe('usb (OS spooler)', () => {
 
   it('calls a spooler that hung MIGHT-have-printed', async (t) => {
     if (!posix) return t.skip('CUPS path is posix only');
-    fakeSpooler('#!/bin/sh\ncat > /dev/null\nsleep 30\n');
+    // `lpstat` answers normally: only `lp` hangs, which is the case this pins.
+    fakeCups({ lp: '#!/bin/sh\ncat > /dev/null\nsleep 30\n', lpstat: QUEUE_IDLE });
 
     const outcome = await driverFor('usb').send(printer({ transport: 'usb', queue: 'q' }), Buffer.from('x'), 300);
     assert.equal(outcome.ok, false);
@@ -167,6 +186,68 @@ describe('usb (OS spooler)', () => {
     // It read the document before we killed it, so a job may be sitting in the queue.
     assert.equal(outcome.printed_certainty, 'unknown');
     assert.equal(outcome.reason, 'write-timeout');
+  });
+
+  /*
+   * A queue CUPS disabled after the printer dropped stays disabled when it comes back, while `lp`
+   * keeps accepting jobs into it — so every bill is "sent" and none prints. The bridge resumes the
+   * queue itself before sending.
+   */
+  describe('a queue CUPS paused', () => {
+    it('is resumed before the job is handed to it', async (t) => {
+      if (!posix) return t.skip('CUPS path is posix only');
+      const dir = fakeCups({
+        lpstat: QUEUE_PAUSED,
+        cupsenable: '#!/bin/sh\necho "$@" > "$(dirname "$0")/enable.args"\ntouch "$(dirname "$0")/enabled"\n',
+        // Records whether the queue had already been resumed at the moment the job arrived.
+        lp: '#!/bin/sh\ncat > /dev/null\n[ -f "$(dirname "$0")/enabled" ] && touch "$(dirname "$0")/lp-after-enable"\necho "request id is q-1"\n',
+      });
+
+      const outcome = await driverFor('usb').send(printer({ transport: 'usb', queue: 'q' }), Buffer.from('x'), 5000);
+
+      assert.equal(outcome.ok, true);
+      assert.equal(readFileSync(join(dir, 'enable.args'), 'utf8').trim(), 'q', 'resumed the right queue');
+      assert.equal(existsSync(join(dir, 'lp-after-enable')), true, 'resumed BEFORE the job was sent');
+    });
+
+    it('is left alone when it is already enabled', async (t) => {
+      if (!posix) return t.skip('CUPS path is posix only');
+      const dir = fakeCups({
+        lpstat: QUEUE_IDLE,
+        cupsenable: '#!/bin/sh\ntouch "$(dirname "$0")/ran"\n',
+        lp: LP_ACCEPTS,
+      });
+
+      const outcome = await driverFor('usb').send(printer({ transport: 'usb', queue: 'q' }), Buffer.from('x'), 5000);
+
+      assert.equal(outcome.ok, true);
+      assert.equal(existsSync(join(dir, 'ran')), false, 'no needless cupsenable on a healthy queue');
+    });
+
+    it('still gets the job when it cannot be resumed', async (t) => {
+      if (!posix) return t.skip('CUPS path is posix only');
+      fakeCups({
+        lpstat: QUEUE_PAUSED,
+        cupsenable: '#!/bin/sh\necho "cupsenable: Operation not permitted" >&2\nexit 1\n',
+        lp: LP_ACCEPTS,
+      });
+
+      const outcome = await driverFor('usb').send(printer({ transport: 'usb', queue: 'q' }), Buffer.from('x'), 5000);
+
+      // A refused resume must not turn a sendable job into a failure: `lp` behaves as it always did.
+      assert.equal(outcome.ok, true);
+    });
+
+    it('does not let a wedged spooler hold the job for long', async (t) => {
+      if (!posix) return t.skip('CUPS path is posix only');
+      fakeCups({ lpstat: '#!/bin/sh\nsleep 30\n', lp: LP_ACCEPTS });
+
+      const started = Date.now();
+      const outcome = await driverFor('usb').send(printer({ transport: 'usb', queue: 'q' }), Buffer.from('x'), 8000);
+
+      assert.equal(outcome.ok, true);
+      assert.ok(Date.now() - started < 5000, 'the queue check is bounded to a couple of seconds');
+    });
   });
 
   it('is unavailable when the machine has no spooler, and says so instead of failing oddly', async () => {
