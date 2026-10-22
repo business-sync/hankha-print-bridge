@@ -1,6 +1,13 @@
 import { backoffMs } from './backoff.js';
 import { loadState } from './identity.js';
 import { log } from './log.js';
+
+/** `PSPN-VHP6` → `PSPN-****`. Exported for tests. */
+export function maskCode(code: string): string {
+  const cut = code.indexOf('-');
+  const keep = cut > 0 ? cut + 1 : Math.min(2, code.length);
+  return code.slice(0, keep) + '*'.repeat(Math.max(0, code.length - keep));
+}
 import { enroll, isRelayRunning, relayUrl, startRelay, wakeRelay } from './relay.js';
 import { BRIDGE_VERSION } from './version.js';
 import { arch, hostname, platform } from 'node:os';
@@ -199,7 +206,10 @@ async function runPairingLoop(): Promise<void> {
       snapshot.phase = 'waiting';
       snapshot.last_error = null;
       snapshot.pos_pair_url = session.pos_pair_url ?? null;
-      log.info(`pairing: showing code ${session.code}`, {
+      // Masked: the code is a credential for as long as it lives — whoever claims it first owns
+      // this bridge — and the screen already shows it in full to the person who needs it. The
+      // first half is kept so lines about one code can still be matched up.
+      log.info(`pairing: showing code ${maskCode(session.code)}`, {
         event: 'pairing.code_shown',
         expires_at: session.expires_at,
       });
@@ -227,6 +237,9 @@ async function runPairingLoop(): Promise<void> {
           failures++;
           snapshot.phase = 'offline';
           snapshot.last_error = err instanceof Error ? err.message : String(err);
+          log.debug(`pairing: polling the code failed (${snapshot.last_error})`, {
+            event: 'pairing.poll_failed', failures, err,
+          });
           await sleep(backoffMs(Math.min(failures, 5)));
           continue;
         }
@@ -267,9 +280,9 @@ async function runPairingLoop(): Promise<void> {
             // between the two calls), so go back and mint a new code rather than stranding the
             // screen on a code the server has now consumed.
             snapshot.last_error = err instanceof Error ? err.message : String(err);
-            log.warn('pairing: redeeming the claimed code failed', {
+            log.warn(`pairing: redeeming the claimed code failed (${snapshot.last_error})`, {
               event: 'pairing.redeem_failed',
-              error: snapshot.last_error,
+              err,
             });
             live = false;
           }
@@ -279,9 +292,10 @@ async function runPairingLoop(): Promise<void> {
       failures++;
       snapshot.phase = 'offline';
       snapshot.last_error = err instanceof Error ? err.message : String(err);
-      log.warn('pairing: could not reach the server', {
+      log.warn(`pairing: could not reach the server (${snapshot.last_error})`, {
         event: 'pairing.announce_failed',
-        error: snapshot.last_error,
+        failures,
+        err,
       });
       await sleep(backoffMs(Math.min(failures, 5)));
     }

@@ -601,7 +601,7 @@ export function clearLogs(): { cleared: string[]; bytes: number } {
       writeFileSync(file, '');
       cleared.push(file);
     } catch (err) {
-      log.warn(`service: could not clear ${file} (${describe(err)})`, { event: 'service.logs.clear_failed' });
+      log.warn(`service: could not clear ${file} (${describe(err)})`, { event: 'service.logs.clear_failed', file, err });
     }
   }
   return { cleared, bytes: info.bytes };

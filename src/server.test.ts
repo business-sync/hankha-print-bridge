@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { localInterfaces } from './lan.js';
+import { type LogRecord, setLogSink } from './log.js';
 import { loadState, type RelayState, saveState } from './identity.js';
 import { resetRegistryCache } from './registry.js';
 import { INDEX_HTML } from './page.js';
@@ -1236,5 +1237,69 @@ describe('GET /pairing/handoff', () => {
     const { status, location } = await redirect();
     assert.equal(status, 302);
     assert.equal(location, '/');
+  });
+});
+
+/*
+ * The print routes answered the POS and logged nothing of their own, so a ticket the POS reported
+ * as failed could only be pieced together from queue lines — and one refused before it reached
+ * the queue left no trace at all.
+ */
+describe('print route logging', () => {
+  it('logs a refused /print with its reason', async () => {
+    const records: LogRecord[] = [];
+    const previous = process.env.PRINT_BRIDGE_LOG_LEVEL;
+    process.env.PRINT_BRIDGE_LOG_LEVEL = 'debug';
+    const restore = setLogSink((r) => records.push(r));
+    try {
+      const { status } = await post('/print', { ip: '192.168.1.2', port: 9100, payload_base64: '' });
+      assert.equal(status, 400);
+      const line = records.find((r) => r.event === 'print.rejected');
+      assert.equal(line?.fields.route, '/print');
+      assert.equal(line?.fields.reason, 'invalid-payload');
+      assert.equal(line?.fields.status, 400);
+    } finally {
+      restore();
+      if (previous === undefined) delete process.env.PRINT_BRIDGE_LOG_LEVEL;
+      else process.env.PRINT_BRIDGE_LOG_LEVEL = previous;
+    }
+  });
+
+  it('logs a failed /print with the job, printer and what the POS was told', async (t) => {
+    const lan = localInterfaces()[0];
+    if (!lan) return t.skip('no private LAN interface on this machine');
+    const probe = createTcpServer();
+    const port = await new Promise<number>((resolve) => probe.listen(0, '0.0.0.0', () => resolve((probe.address() as { port: number }).port)));
+    await new Promise<void>((r) => probe.close(() => r()));
+
+    const records: LogRecord[] = [];
+    const previous = process.env.PRINT_BRIDGE_LOG_LEVEL;
+    process.env.PRINT_BRIDGE_LOG_LEVEL = 'debug';
+    const restore = setLogSink((r) => records.push(r));
+    try {
+      const { status } = await post('/print', {
+        ip: lan.address, port, job_id: 'logged-ticket-1', payload_base64: Buffer.from('x').toString('base64'),
+      });
+      assert.equal(status, 502);
+      const line = records.find((r) => r.event === 'print.sync.result');
+      assert.equal(line?.level, 'warn');
+      assert.equal(line?.fields.job_id, 'logged-ticket-1');
+      assert.equal(line?.fields.printed_certainty, 'none');
+      assert.ok(Number(line?.fields.attempts) >= 1);
+      assert.equal(typeof line?.fields.duration_ms, 'number');
+      // The access log narrates the request at debug.
+      assert.ok(records.some((r) => r.event === 'http.request' && r.fields.path === '/print' && r.fields.status === 502));
+    } finally {
+      restore();
+      if (previous === undefined) delete process.env.PRINT_BRIDGE_LOG_LEVEL;
+      else process.env.PRINT_BRIDGE_LOG_LEVEL = previous;
+    }
+  });
+
+  it('reports diagnostics on /status', async () => {
+    const res = await fetch(`${baseUrl}/status`);
+    const json = (await res.json()) as { diagnostics?: { rss_mb?: number; relay_connected?: boolean } };
+    assert.equal(typeof json.diagnostics?.rss_mb, 'number');
+    assert.equal(typeof json.diagnostics?.relay_connected, 'boolean');
   });
 });

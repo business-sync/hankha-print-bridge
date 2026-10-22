@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { after, describe, it } from 'node:test';
+import { createServer as createTcpServer } from 'node:net';
+import { type LogRecord, setLogSink } from './log.js';
 import { connectWebSocket, parseFrame, WebSocketHandshakeError } from './relay-socket.js';
 
 /*
@@ -200,6 +202,8 @@ describe('liveness', () => {
     const closed = await client.closed;
     assert.equal(closed.code, 1006);
     assert.equal(closed.reason, 'no traffic from server');
+    // Ours, not the network's: the same 1006 a dropped link produces, told apart here.
+    assert.equal(closed.closed_by, 'local');
   });
 
   it('stays open while the peer answers the client ping', async () => {
@@ -283,5 +287,94 @@ describe('handshake failures', () => {
       connectWebSocket({ url: `ws://127.0.0.1:${port}/socket`, onMessage: () => {}, timeoutMs: 300 }),
       /timed out/
     );
+  });
+});
+
+/*
+ * Who closed a connection is the first question about a dropped feed, and a close code alone
+ * cannot answer it: 1006 is both "we gave up on a silent link" and "the network died under us".
+ */
+describe('who closed it', () => {
+  it('marks a server close frame as remote, with its code and reason', async () => {
+    const url = await upgradeServer((socket) => {
+      const payload = Buffer.alloc(2 + 'going away'.length);
+      payload.writeUInt16BE(1001, 0);
+      payload.write('going away', 2);
+      setTimeout(() => socket.write(serverFrame(0x8, payload)), 20);
+    });
+    const client = await connectWebSocket({ url, onMessage: () => {} });
+    const closed = await client.closed;
+    assert.deepEqual(
+      { code: closed.code, reason: closed.reason, closed_by: closed.closed_by },
+      { code: 1001, reason: 'going away', closed_by: 'remote' }
+    );
+  });
+
+  it('marks our own close() as local', async () => {
+    const url = await upgradeServer(() => {});
+    const client = await connectWebSocket({ url, onMessage: () => {} });
+    client.close(4000, 'no ack');
+    const closed = await client.closed;
+    assert.equal(closed.closed_by, 'local');
+    assert.equal(closed.reason, 'no ack');
+  });
+
+  it('marks a TCP end with no close frame as network', async () => {
+    const url = await upgradeServer((socket) => setTimeout(() => socket.end(), 20));
+    const client = await connectWebSocket({ url, onMessage: () => {} });
+    const closed = await client.closed;
+    assert.equal(closed.code, 1006);
+    assert.equal(closed.closed_by, 'network');
+  });
+
+  /*
+   * The socket error used to be thrown away, so every reset, timeout and unreachable network read
+   * the same `1006 connection lost`.
+   */
+  it('keeps the socket error code behind a reset', async () => {
+    const url = await upgradeServer((socket) => setTimeout(() => socket.resetAndDestroy(), 20));
+    const client = await connectWebSocket({ url, onMessage: () => {} });
+    const closed = await client.closed;
+    assert.equal(closed.closed_by, 'network');
+    assert.equal(closed.error_code, 'ECONNRESET');
+    assert.equal(closed.reason, 'connection lost: ECONNRESET');
+  });
+
+  it('carries the socket error code on a handshake that never got an answer', async () => {
+    // A port that was free a moment ago: nothing listening, so the connect is refused.
+    const probe = createTcpServer();
+    const port = await new Promise<number>((resolve) => probe.listen(0, '127.0.0.1', () => resolve((probe.address() as { port: number }).port)));
+    await new Promise<void>((r) => probe.close(() => r()));
+    try {
+      await connectWebSocket({ url: `ws://127.0.0.1:${port}/socket`, onMessage: () => {} });
+      assert.fail('should have rejected');
+    } catch (err) {
+      assert.ok(err instanceof WebSocketHandshakeError);
+      assert.equal(err.status, null);
+      assert.equal(err.code, 'ECONNREFUSED');
+    }
+  });
+
+  it('logs a message handler that throws instead of swallowing it, and stays connected', async () => {
+    const records: LogRecord[] = [];
+    const restore = setLogSink((r) => records.push(r));
+    try {
+      const url = await upgradeServer((socket) => socket.write(serverFrame(0x1, Buffer.from('{}'))));
+      const client = await connectWebSocket({
+        url,
+        onMessage: () => {
+          throw new Error('handler bug');
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+      const line = records.find((r) => r.event === 'relay.ws.handler_error');
+      assert.ok(line, 'the throw was logged');
+      assert.equal(line.fields.error_message, 'handler bug');
+      assert.match(String(line.fields.stack), /handler bug/);
+      client.close();
+      assert.equal((await client.closed).closed_by, 'local');
+    } finally {
+      restore();
+    }
   });
 });

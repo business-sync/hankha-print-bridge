@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { type LogRecord, setLogSink } from './log.js';
 import { createWatchdog, watchdogLimitMs, type WatchdogProbe } from './watchdog.js';
 
 const base: WatchdogProbe = { enrolled: true, running: true, connected: false, rejected: false };
@@ -57,5 +58,36 @@ describe('watchdog', () => {
     assert.equal(watchdogLimitMs({ PRINT_BRIDGE_WATCHDOG_MINUTES: '0' }), 0);
     assert.equal(watchdogLimitMs({ PRINT_BRIDGE_WATCHDOG_MINUTES: '2' }), 120_000);
     assert.equal(watchdogLimitMs({ PRINT_BRIDGE_WATCHDOG_MINUTES: 'x' }), 900_000);
+  });
+});
+
+describe('watchdog logging', () => {
+  /*
+   * A restart 15 minutes after the link dropped used to arrive with no warning in the log. The
+   * clock starting, and being cancelled, are now both lines of their own.
+   */
+  it('says when the restart clock starts and when it is cancelled', () => {
+    const records: LogRecord[] = [];
+    const previous = process.env.PRINT_BRIDGE_LOG_LEVEL;
+    process.env.PRINT_BRIDGE_LOG_LEVEL = 'info';
+    const restore = setLogSink((r) => records.push(r));
+    try {
+      const r = rig();
+      r.w.tick();
+      r.at(30_000);
+      r.w.tick();
+      assert.equal(records.filter((x) => x.event === 'relay.watchdog.armed').length, 1, 'armed once per outage');
+      r.at(90_000);
+      r.set({ connected: true });
+      r.w.tick();
+      const cleared = records.find((x) => x.event === 'relay.watchdog.cleared');
+      assert.equal(cleared?.fields.down_ms, 90_000);
+      assert.equal(cleared?.fields.because, 'connected');
+      r.w.stop();
+    } finally {
+      restore();
+      if (previous === undefined) delete process.env.PRINT_BRIDGE_LOG_LEVEL;
+      else process.env.PRINT_BRIDGE_LOG_LEVEL = previous;
+    }
   });
 });

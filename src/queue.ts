@@ -271,13 +271,15 @@ export class PrintQueue {
         let job: JobRecord;
         try {
           job = JSON.parse(readFileSync(path, 'utf8')) as JobRecord;
-        } catch {
+        } catch (err) {
           // A torn file cannot be a job. Removing it is safe because a write is temp+rename, so a
           // torn file is by construction one that never became a real job.
+          log.warn(`queue: discarded an unreadable spool file ${entry}`, { event: 'queue.spool.torn', file: entry, err });
           rmSync(path, { force: true });
           continue;
         }
         if (!job.job_id || !job.printer) {
+          log.warn(`queue: discarded a spool file with no job in it ${entry}`, { event: 'queue.spool.invalid', file: entry });
           rmSync(path, { force: true });
           continue;
         }
@@ -326,10 +328,14 @@ export class PrintQueue {
           if (parsed.job_id && parsed.result) this.settledResults.set(parsed.job_id, parsed.result);
         } catch {
           /* one bad line must not cost the whole ring */
+          log.debug('queue: skipped an unreadable line in the settled-job ring', { event: 'queue.settled.bad_line' });
         }
       }
-    } catch {
+    } catch (err) {
       /* unreadable ring: the in-memory guard still covers this process's own lifetime */
+      log.warn('queue: could not read the settled-job ring — duplicates are only caught within this run', {
+        event: 'queue.settled.read_failed', err,
+      });
     }
   }
 
@@ -494,8 +500,10 @@ export class PrintQueue {
     this.persist(job);
     this.laneFor(job).push(job);
     log.info(`queue: job ${jobId} queued for ${job.printer.id} (${job.printer.transport})`, {
-      event: 'queue.submit', job_id: jobId, printer_id: job.printer.id,
+      event: 'queue.submit', job_id: jobId, printer_id: job.printer.id, source: job.source,
       transport: job.printer.transport, bytes: input.payload.length, copies: job.copies,
+      address: job.printer.address ? `${job.printer.address}:${job.printer.port ?? ''}` : undefined,
+      lane_depth: this.laneFor(job).length,
     });
     this.kick(job.printer.id);
 
@@ -621,6 +629,10 @@ export class PrintQueue {
     job.attempts += 1;
     job.updated_at = new Date().toISOString();
     this.persist(job);
+    log.debug(`queue: job ${job.job_id} sending to ${job.printer.id} (attempt ${job.attempts})`, {
+      event: 'queue.attempt', job_id: job.job_id, printer_id: job.printer.id, attempt: job.attempts,
+      wait_ms: Date.now() - Date.parse(job.created_at),
+    });
 
     const payload = Buffer.from(job.payload_base64, 'base64');
     let outcome: PrintOutcome = { ok: true, duration_ms: 0 };
@@ -636,7 +648,8 @@ export class PrintQueue {
       job.status = 'done';
       job.result = { ok: true, duration_ms: outcome.duration_ms };
       log.info(`queue: job ${job.job_id} printed on ${job.printer.id} in ${outcome.duration_ms}ms`, {
-        event: 'queue.done', job_id: job.job_id, printer_id: job.printer.id, duration_ms: outcome.duration_ms,
+        event: 'queue.done', job_id: job.job_id, printer_id: job.printer.id, source: job.source,
+        duration_ms: outcome.duration_ms, attempts: job.attempts, total_ms: Date.now() - Date.parse(job.created_at),
       });
       this.finish(job);
       return true;
@@ -685,8 +698,9 @@ export class PrintQueue {
       log.error(
         `queue: job ${job.job_id} failed on ${job.printer.id} — ${outcome.reason} (${certainty}) ${outcome.detail}`,
         {
-          event: 'queue.failed', job_id: job.job_id, printer_id: job.printer.id,
+          event: 'queue.failed', job_id: job.job_id, printer_id: job.printer.id, source: job.source,
           reason: outcome.reason, printed_certainty: certainty, detail: outcome.detail, attempts: job.attempts,
+          total_ms: Date.now() - Date.parse(job.created_at),
         }
       );
       this.finish(job);

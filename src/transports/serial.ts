@@ -21,6 +21,7 @@ import { constants, existsSync, readdirSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import type { PrinterRecord } from '../registry.js';
 import { DEFAULT_BAUD } from '../registry.js';
+import { log } from '../log.js';
 import { commandExists, runCommand } from './exec.js';
 import { failed, succeeded, type DiscoveredPrinter, type ProbeResult, type Transport } from './transport.js';
 
@@ -210,8 +211,9 @@ export const serialTransport: Transport = {
           if (entry === 'cu.Bluetooth-Incoming-Port' || entry.includes('debug-console')) continue;
           add(`/dev/${entry}`, entry.includes('.') && !entry.startsWith('cu.usb') ? 'bluetooth or usb serial' : 'usb serial');
         }
-      } catch {
+      } catch (err) {
         /* /dev is unreadable — report nothing rather than fail discovery for every transport */
+        log.debug('serial: could not list /dev', { event: 'serial.discover_failed', err });
       }
       return found;
     }

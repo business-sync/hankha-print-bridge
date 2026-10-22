@@ -1,4 +1,5 @@
 import { log } from './log.js';
+import { markTick } from './ticks.js';
 
 /**
  * Last-resort self-restart.
@@ -36,14 +37,29 @@ export function createWatchdog(opts: {
   const now = opts.now ?? Date.now;
   let downSince: number | null = null;
 
+  const intervalMs = opts.intervalMs ?? 30_000;
   const tick = () => {
     if (opts.limitMs <= 0) return;
+    markTick('watchdog', intervalMs);
     const p = opts.probe();
     if (!p.enrolled || !p.running || p.connected || p.rejected) {
+      if (downSince !== null) {
+        const because = p.connected ? 'connected' : p.rejected ? 'rejected' : !p.running ? 'not-running' : 'not-enrolled';
+        log.info(`watchdog: restart cancelled after ${Math.round((now() - downSince) / 1000)}s (${because})`, {
+          event: 'relay.watchdog.cleared', down_ms: now() - downSince, because,
+        });
+      }
       downSince = null;
       return;
     }
-    downSince ??= now();
+    if (downSince === null) {
+      downSince = now();
+      // Said when the clock STARTS, not only when it fires: a restart 15 minutes later is
+      // otherwise a surprise with no visible cause.
+      log.info(`watchdog: relay is down — the bridge restarts itself if it stays down for ${Math.round(opts.limitMs / 60_000)} min`, {
+        event: 'relay.watchdog.armed', limit_ms: opts.limitMs,
+      });
+    }
     const down = now() - downSince;
     if (down >= opts.limitMs) {
       const reason = `relay disconnected for ${Math.round(down / 1000)}s`;
@@ -54,7 +70,7 @@ export function createWatchdog(opts: {
     }
   };
 
-  const timer = setInterval(tick, opts.intervalMs ?? 30_000);
+  const timer = setInterval(tick, intervalMs);
   timer.unref();
   return { tick, stop: () => clearInterval(timer) };
 }

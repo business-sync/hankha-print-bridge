@@ -1,13 +1,15 @@
 import { loadState, saveState, type RelayState } from './identity.js';
 import { containerSuspect, DEFAULT_PRINTER_PORT, localInterfaces, runScan } from './lan.js';
 import { renderJobDocument, resolveRelayPrinter } from './jobs.js';
-import { log } from './log.js';
+import { errorCode, log, LogGate, redactUrl } from './log.js';
 import { queue, type JobResult } from './queue.js';
 import { loadRegistry } from './registry.js';
 import { connectWebSocket, WebSocketHandshakeError } from './relay-socket.js';
 import { BRIDGE_VERSION } from './version.js';
 import { arch, hostname, platform } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { backoffMs } from './backoff.js';
+import { markTick } from './ticks.js';
 
 /**
  * The outbound half of the bridge.
@@ -270,6 +272,103 @@ export function relayStatus(): RelayStatus {
   return { ...status };
 }
 
+/**
+ * What the log needs to explain a disconnect, kept beside `status` rather than in it: none of
+ * this belongs on the wire to the POS, but all of it belongs in a diagnostics snapshot.
+ */
+const diag = {
+  connection_id: null as string | null,
+  session_started_at: null as number | null,
+  last_frame_at: null as number | null,
+  frames_in: 0,
+  last_poll_ok_at: null as number | null,
+  last_heartbeat_ok_at: null as number | null,
+  heartbeat_failures: 0,
+  failures: 0,
+  rejections: 0,
+  /** When the current outage began; null while connected. */
+  down_since: null as number | null,
+  /** Websocket session starts in the last hour, for spotting a reconnect loop. */
+  session_starts: [] as number[],
+};
+
+/** One gate for every repeating relay complaint, keyed per complaint. */
+const gate = new LogGate(10 * 60_000);
+/** Reconnects per hour above which the pattern itself is worth a warning. */
+const RECONNECT_STORM_PER_HOUR = 20;
+
+export interface RelayDiagnostics {
+  connected: boolean;
+  transport: RelayStatus['transport'];
+  connection_id: string | null;
+  session_ms: number | null;
+  since_last_frame_ms: number | null;
+  since_poll_ok_ms: number | null;
+  since_heartbeat_ok_ms: number | null;
+  heartbeat_failures: number;
+  failures: number;
+  rejections: number;
+  down_ms: number | null;
+  reconnects_last_hour: number;
+}
+
+export function relayDiagnostics(now = Date.now()): RelayDiagnostics {
+  const ago = (at: number | null) => (at === null ? null : now - at);
+  return {
+    connected: status.connected,
+    transport: status.transport,
+    connection_id: diag.connection_id,
+    session_ms: ago(diag.session_started_at),
+    since_last_frame_ms: ago(diag.last_frame_at),
+    since_poll_ok_ms: ago(diag.last_poll_ok_at),
+    since_heartbeat_ok_ms: ago(diag.last_heartbeat_ok_at),
+    heartbeat_failures: diag.heartbeat_failures,
+    failures: diag.failures,
+    rejections: diag.rejections,
+    down_ms: ago(diag.down_since),
+    reconnects_last_hour: diag.session_starts.filter((at) => now - at < 3_600_000).length,
+  };
+}
+
+/** `fetch failed` says nothing; `fetch failed (ECONNRESET)` says what to check. */
+function describeError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const code = errorCode(err);
+  return code && !message.includes(code) ? `${message} (${code})` : message;
+}
+
+function seconds(ms: number): string {
+  return ms < 120_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)} min`;
+}
+
+/** The link stopped carrying work. Idempotent: an outage starts once. */
+function markDown(): void {
+  status.connected = false;
+  if (diag.down_since === null) diag.down_since = Date.now();
+}
+
+/** The link is carrying work again — log the recovery if there was an outage to recover from. */
+function markUp(transport: 'websocket' | 'long-poll'): void {
+  if (status.transport !== null && status.transport !== transport) {
+    log.info(`relay: now using ${transport}`, { event: 'relay.transport', from: status.transport, to: transport });
+  }
+  status.connected = true;
+  status.transport = transport;
+  status.last_ok_at = new Date().toISOString();
+  status.last_error = null;
+  if (diag.down_since !== null) {
+    const down = Date.now() - diag.down_since;
+    const retries = gate.clear('relay.retry');
+    gate.clear('relay.ws.handshake_failed');
+    log.info(`relay: connection restored over ${transport} after ${seconds(down)}`, {
+      event: 'relay.recovered', transport, down_ms: down, failures: diag.failures,
+      suppressed_retries: retries?.repeated || undefined,
+    });
+    diag.down_since = null;
+  }
+  diag.failures = 0;
+}
+
 async function postResult(base: string, token: string, jobId: string, result: JobResult): Promise<void> {
   const res = await fetch(`${base}/api/v1/modules/print/bridge/jobs/${jobId}/result`, {
     method: 'POST',
@@ -375,8 +474,8 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
       // The print already happened or already failed; only the report was lost. The server's own
       // sweeper moves an unreported job to UNKNOWN, and it never re-queues one, so nothing prints
       // twice as a result of this.
-      log.warn(`relay: could not report job ${job.job_id} (${err instanceof Error ? err.message : String(err)})`, {
-        event: 'relay.result.failed', job_id: job.job_id,
+      log.warn(`relay: could not report job ${job.job_id} (${describeError(err)})`, {
+        event: 'relay.result.failed', job_id: job.job_id, err,
       });
     });
 }
@@ -385,7 +484,7 @@ async function handleScan(base: string, token: string, work: Extract<Work, { typ
   // Shares `runScan`'s in-flight map with the LAN /scan route, so a cloud-requested scan and a
   // button press on the same port join one sweep instead of doubling the SYN traffic.
   const scan = await runScan(work.port || DEFAULT_PRINTER_PORT);
-  await fetch(`${base}/api/v1/modules/print/bridge/scan-result`, {
+  const res = await fetch(`${base}/api/v1/modules/print/bridge/scan-result`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({
@@ -396,20 +495,66 @@ async function handleScan(base: string, token: string, work: Extract<Work, { typ
     }),
     signal: AbortSignal.timeout(15_000),
   });
+  await res.body?.cancel().catch(() => undefined);
+  if (!res.ok) {
+    log.warn(`relay: scan result was refused (HTTP ${res.status})`, {
+      event: 'relay.scan.result_failed', command_id: work.command_id, status: res.status,
+    });
+  }
 }
 
-async function heartbeat(base: string, token: string): Promise<void> {
+/** One HTTP heartbeat. Resolves with the status; throws only when no answer came back at all. */
+async function heartbeat(base: string, token: string): Promise<number> {
   const res = await fetch(`${base}/api/v1/modules/print/bridge/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(describeSelf()),
     signal: AbortSignal.timeout(15_000),
   });
-  // Release the pooled connection, and say so when the server refuses us: a heartbeat that is
-  // silently rejected leaves the POS showing this bridge offline with nothing in the log.
+  // Release the pooled connection.
   await res.body?.cancel().catch(() => undefined);
-  if (!res.ok) {
-    log.warn(`relay: heartbeat rejected (HTTP ${res.status})`, { event: 'relay.heartbeat.rejected', status: res.status });
+  return res.status;
+}
+
+/**
+ * Say when heartbeats start failing, once per window while they keep failing, and when they
+ * recover.
+ *
+ * A heartbeat that fails silently leaves the POS showing this bridge offline with nothing in the
+ * log — that was true of network errors here until now, which were swallowed outright. A
+ * rejected one used to be logged on EVERY beat instead, and a venue with a revoked token sent in
+ * a file of hundreds of identical lines.
+ */
+function noteHeartbeat(outcome: { status?: number; err?: unknown; duration_ms: number }): void {
+  const ok = outcome.status !== undefined && outcome.status >= 200 && outcome.status < 300;
+  log.debug(`relay: heartbeat ${outcome.status ?? describeError(outcome.err)} in ${outcome.duration_ms}ms`, {
+    event: 'relay.heartbeat', status: outcome.status, duration_ms: outcome.duration_ms,
+  });
+  if (ok) {
+    if (diag.heartbeat_failures > 0) {
+      const run = gate.clear('relay.heartbeat');
+      log.info(`relay: heartbeat accepted again after ${diag.heartbeat_failures} failure(s)`, {
+        event: 'relay.heartbeat.recovered', failures: diag.heartbeat_failures, outage_ms: run?.over_ms,
+      });
+    }
+    diag.heartbeat_failures = 0;
+    diag.last_heartbeat_ok_at = Date.now();
+    return;
+  }
+  diag.heartbeat_failures += 1;
+  const pass = gate.hit('relay.heartbeat');
+  if (!pass) return;
+  const repeated = pass.repeated > 0 ? ` (repeated ${pass.repeated} times over ${seconds(pass.over_ms)})` : '';
+  if (outcome.status !== undefined) {
+    log.warn(`relay: heartbeat rejected (HTTP ${outcome.status})${repeated}`, {
+      event: 'relay.heartbeat.rejected', status: outcome.status, failures: diag.heartbeat_failures,
+      repeated: pass.repeated || undefined,
+    });
+  } else {
+    log.warn(`relay: heartbeat failed (${describeError(outcome.err)})${repeated}`, {
+      event: 'relay.heartbeat.failed', err: outcome.err, failures: diag.heartbeat_failures,
+      repeated: pass.repeated || undefined,
+    });
   }
 }
 
@@ -454,16 +599,35 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
   lastSessionMs = Number.POSITIVE_INFINITY;
   let client: Awaited<ReturnType<typeof connectWebSocket>>;
   let lastAckAt = Date.now();
+  // Ties a session's open, its frames and its close together in the log.
+  const connectionId = randomBytes(4).toString('hex');
+  const dialledAt = Date.now();
+  let framesIn = 0;
+  let lastFrameAt: number | null = null;
+  log.debug(`relay: opening websocket ${connectionId}`, {
+    event: 'relay.ws.connecting', connection_id: connectionId, url: redactUrl(socketUrl(base)),
+  });
   try {
     client = await connectWebSocket({
       url: socketUrl(base),
       headers: { Authorization: `Bearer ${token}` },
       idleTimeoutMs: WS_IDLE_TIMEOUT_MS,
       onMessage: (text) => {
+        framesIn += 1;
+        lastFrameAt = Date.now();
+        diag.frames_in = framesIn;
+        diag.last_frame_at = lastFrameAt;
         let work: Work;
         try {
           work = JSON.parse(text) as Work;
-        } catch {
+        } catch (err) {
+          const pass = gate.hit('relay.ws.bad_frame');
+          if (pass) {
+            log.warn('relay: ignored a websocket frame that is not JSON', {
+              event: 'relay.ws.bad_frame', connection_id: connectionId, bytes: text.length, err,
+              repeated: pass.repeated || undefined,
+            });
+          }
           return;
         }
         if ((work as { type?: string }).type === 'ack') {
@@ -474,10 +638,15 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
         }
         // Unknown types are ignored rather than treated as errors, so the server can add a frame
         // kind without every deployed bridge dropping its connection over it.
-        if (work.type !== 'print' && work.type !== 'scan') return;
+        if (work.type !== 'print' && work.type !== 'scan') {
+          log.debug(`relay: ignored a websocket frame of type ${String((work as { type?: unknown }).type)}`, {
+            event: 'relay.ws.unknown_frame', connection_id: connectionId,
+          });
+          return;
+        }
         void dispatch(base, token, work).catch((err: unknown) => {
-          log.error(`relay: failed to handle ${work.type} (${err instanceof Error ? err.message : String(err)})`, {
-            event: 'relay.dispatch.failed', kind: work.type,
+          log.error(`relay: failed to handle ${work.type} (${describeError(err)})`, {
+            event: 'relay.dispatch.failed', kind: work.type, connection_id: connectionId, err,
           });
         });
       },
@@ -494,18 +663,41 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
       // are a proxy, a WAF or a rate limiter having a bad moment: back off and try again.
       if (err.status === 404 || err.status === 405 || err.status === 426) return 'unsupported';
     }
-    status.last_error = err instanceof Error ? err.message : String(err);
+    status.last_error = describeError(err);
+    // Used to set `last_error` and nothing else: a bridge whose socket could never connect left no
+    // line saying so, or why.
+    const pass = gate.hit('relay.ws.handshake_failed');
+    if (pass) {
+      log.warn(`relay: websocket could not connect (${status.last_error})`, {
+        event: 'relay.ws.handshake_failed', connection_id: connectionId,
+        status: err instanceof WebSocketHandshakeError ? err.status ?? undefined : undefined,
+        duration_ms: Date.now() - dialledAt, err, repeated: pass.repeated || undefined,
+      });
+    }
     return 'error';
   }
 
-  status.connected = true;
-  status.transport = 'websocket';
-  status.last_ok_at = new Date().toISOString();
-  status.last_error = null;
-  log.info('relay: connected over websocket', { event: 'relay.ws.open' });
+  markUp('websocket');
+  const sessionStart = Date.now();
+  diag.connection_id = connectionId;
+  diag.session_started_at = sessionStart;
+  diag.frames_in = 0;
+  diag.last_frame_at = null;
+  diag.session_starts = [...diag.session_starts.filter((at) => sessionStart - at < 3_600_000), sessionStart];
+  log.info('relay: connected over websocket', {
+    event: 'relay.ws.open', connection_id: connectionId, handshake_ms: sessionStart - dialledAt,
+  });
+  if (diag.session_starts.length > RECONNECT_STORM_PER_HOUR) {
+    const pass = gate.hit('relay.reconnect_storm');
+    if (pass) {
+      log.warn(`relay: ${diag.session_starts.length} websocket connections in the last hour — the link keeps dropping`, {
+        event: 'relay.reconnect_storm', reconnects_last_hour: diag.session_starts.length,
+        repeated: pass.repeated || undefined,
+      });
+    }
+  }
 
   client.send(JSON.stringify({ type: 'hello', ...describeSelf() }));
-  const sessionStart = Date.now();
   const beat = setInterval(() => client.send(JSON.stringify({ type: 'heartbeat', ...describeSelf() })), HEARTBEAT_INTERVAL_MS);
   beat.unref();
   // Application-level liveness: see ACK_TIMEOUT_MS. Checked on the heartbeat cadence.
@@ -520,13 +712,23 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
   }, Math.max(250, Math.min(HEARTBEAT_INTERVAL_MS, ACK_TIMEOUT_MS / 3)));
   ackWatch.unref();
 
-  const { code, reason } = await client.closed;
+  const { code, reason, closed_by, error_code } = await client.closed;
   clearInterval(beat);
   clearInterval(ackWatch);
   lastSessionMs = Date.now() - sessionStart;
-  status.connected = false;
+  const clean = code === 1000 || code === 1001;
+  if (clean) status.connected = false;
+  else markDown();
   status.last_error = code === 1000 ? null : `websocket closed (${code}${reason ? `: ${reason}` : ''})`;
-  log.info(`relay: websocket closed (${code})`, { event: 'relay.ws.close', code, reason });
+  diag.connection_id = null;
+  diag.session_started_at = null;
+  const closeLine = `relay: websocket closed (${code}${reason ? `: ${reason}` : ''}) by ${closed_by} after ${seconds(lastSessionMs)}`;
+  (clean ? log.info : log.warn)(closeLine, {
+    event: 'relay.ws.close', connection_id: connectionId, code, reason, closed_by, error_code,
+    session_ms: lastSessionMs, frames_in: framesIn,
+    last_frame_ago_ms: lastFrameAt === null ? undefined : Date.now() - lastFrameAt,
+    since_ack_ms: serverAcks ? Date.now() - lastAckAt : undefined,
+  });
   if (code === 1008 || code === 4401) return 'revoked';
   /*
    * Only a DELIBERATE close counts as served.
@@ -617,14 +819,50 @@ export function startRelay(): void {
   let token = state.token;
   status.enrolled = true;
   status.bridge_id = state.bridge_id;
-  log.info(`relay: enrolled as bridge ${state.bridge_id}, connecting to ${base}`, {
-    event: 'relay.start', bridge_id: state.bridge_id, relay_url: base,
+  log.info(`relay: enrolled as bridge ${state.bridge_id}, connecting to ${redactUrl(base)}`, {
+    event: 'relay.start', bridge_id: state.bridge_id, relay_url: base, transport_mode: relayMode(),
+    heartbeat_ms: HEARTBEAT_INTERVAL_MS, ack_timeout_ms: ACK_TIMEOUT_MS,
   });
 
-  const beatOnce = () =>
-    heartbeat(base, token).catch(() => {
-      /* the poll loop is the real liveness signal; a missed beat is not worth logging */
-    });
+  const beatOnce = async () => {
+    markTick('relay.heartbeat', HEARTBEAT_INTERVAL_MS);
+    checkStale();
+    const startedAt = Date.now();
+    try {
+      const code = await heartbeat(base, token);
+      noteHeartbeat({ status: code, duration_ms: Date.now() - startedAt });
+    } catch (err) {
+      noteHeartbeat({ err, duration_ms: Date.now() - startedAt });
+    }
+  };
+
+  /*
+   * `connected` that has stopped meaning anything. The watchdog only acts on `connected ===
+   * false`, so a websocket the server stopped acking, or a long-poll stuck inside a dispatch,
+   * would hold the bridge "online" and unwatched. This does not act on it — it says so, so a
+   * venue's log can show whether that is what happened.
+   */
+  const checkStale = () => {
+    if (!status.connected) return;
+    const now = Date.now();
+    const last =
+      status.transport === 'long-poll'
+        ? diag.last_poll_ok_at
+        : serverAcks
+          ? Math.max(diag.last_frame_at ?? 0, diag.session_started_at ?? 0)
+          : null;
+    if (last === null || now - last <= HEARTBEAT_INTERVAL_MS * 3) {
+      gate.clear('relay.stale');
+      return;
+    }
+    const pass = gate.hit('relay.stale');
+    if (pass) {
+      log.warn(`relay: marked connected, but nothing has come over ${status.transport} for ${seconds(now - last)}`, {
+        event: 'relay.stale', transport: status.transport, silent_ms: now - last,
+        connection_id: diag.connection_id ?? undefined, repeated: pass.repeated || undefined,
+      });
+    }
+  };
 
   // Beat IMMEDIATELY, not at the first interval. `online` upstream is derived from
   // `last_seen_at`, so waiting a full interval leaves a freshly-restarted bridge showing as
@@ -660,7 +898,7 @@ export function startRelay(): void {
   };
 
   const waitOutRejection = async () => {
-    status.connected = false;
+    markDown();
     /*
      * Re-pairing (Replace) is what revokes the old row, and the new token is saved before the
      * server cuts the live session — so by the time this loop hears the 401, the answer is
@@ -670,6 +908,7 @@ export function startRelay(): void {
      */
     if (adoptSavedCredential()) {
       rejections = 0;
+      diag.rejections = 0;
       log.info(`relay: switched to the new pairing (bridge ${status.bridge_id})`, {
         event: 'relay.token_switched', bridge_id: status.bridge_id,
       });
@@ -678,9 +917,10 @@ export function startRelay(): void {
     status.last_error = TOKEN_REJECTED;
     const wait = backoffMs(6 + Math.min(rejections, 3), REJECTED_RETRY_MAX_MS);
     rejections += 1;
+    diag.rejections = rejections;
     log.error(
       `relay: token rejected — retrying in ${Math.round(wait / 1000)}s. If it stays rejected, open http://localhost:9200 on this computer and press Get a new code`,
-      { event: 'relay.token_rejected', wait_ms: wait }
+      { event: 'relay.token_rejected', wait_ms: wait, rejections, bridge_id: status.bridge_id }
     );
     await interruptibleSleep(wait);
     adoptSavedCredential();
@@ -696,8 +936,11 @@ export function startRelay(): void {
             outcome = await runSocketSession(base, token);
           } catch (err) {
             // Never let a throw end the loop: the only way out of it is the process stopping.
-            status.connected = false;
-            status.last_error = err instanceof Error ? err.message : String(err);
+            markDown();
+            status.last_error = describeError(err);
+            log.error(`relay: websocket session failed unexpectedly (${status.last_error})`, {
+              event: 'relay.ws.session_error', err, expected: false,
+            });
             outcome = 'error';
           }
           if (outcome === 'revoked') {
@@ -709,11 +952,13 @@ export function startRelay(): void {
             // demonstrably exists. Floored all the same — a category that reconnects without
             // delay is one server-side bug away from being a spin, which is how it got here.
             rejections = 0;
+            diag.rejections = 0;
             if (lastSessionMs < FLAP_SESSION_MS) {
               // Accepted then closed within seconds, repeatedly: two processes sharing a token, or
               // a proxy cycling the upstream. Back off instead of reconnecting at the floor.
               const wait = Math.max(RECONNECT_FLOOR_MS, backoffMs(Math.min(failures, 5)));
               failures += 1;
+              diag.failures = failures;
               log.warn(`relay: websocket flapping — reconnecting in ${Math.round(wait / 1000)}s`, {
                 event: 'relay.ws.flap', session_ms: lastSessionMs, wait_ms: wait,
               });
@@ -726,6 +971,9 @@ export function startRelay(): void {
           }
           if (outcome === 'unsupported') {
             wsBlockedUntil = Date.now() + WS_UNSUPPORTED_RETRY_MS;
+            log.debug('relay: websocket not offered — long-polling, asking again in 30 min', {
+              event: 'relay.ws.blocked', retry_in_ms: WS_UNSUPPORTED_RETRY_MS,
+            });
             if (!wsUnsupportedLogged) {
               wsUnsupportedLogged = true;
               log.info('relay: this server does not offer a websocket endpoint — using long-polling', {
@@ -737,12 +985,18 @@ export function startRelay(): void {
             // Explicitly pinned to websocket: never silently start polling instead.
             const wait = backoffMs(Math.min(failures, 5));
             failures += 1;
+            diag.failures = failures;
+            markDown();
+            log.debug(`relay: websocket retry in ${Math.round(wait / 1000)}s`, {
+              event: 'relay.ws.retry', wait_ms: wait, failures,
+            });
             await sleep(wait);
             continue;
           }
         }
 
         try {
+          const pollStartedAt = Date.now();
           const res = await fetch(
             `${base}/api/v1/modules/print/bridge/work?wait=${POLL_WAIT_S}`,
             {
@@ -753,19 +1007,25 @@ export function startRelay(): void {
             }
           );
 
+          log.debug(`relay: poll answered ${res.status} in ${Date.now() - pollStartedAt}ms`, {
+            event: 'relay.poll', status: res.status, duration_ms: Date.now() - pollStartedAt,
+          });
+
           if (res.status === 401) {
             await waitOutRejection();
             continue;
           }
 
-          if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok && res.status !== 204) {
+            await res.body?.cancel().catch(() => undefined);
+            throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+          }
 
-          status.connected = true;
-          status.transport = 'long-poll';
-          status.last_ok_at = new Date().toISOString();
-          status.last_error = null;
+          diag.last_poll_ok_at = Date.now();
+          markUp('long-poll');
           failures = 0;
           rejections = 0;
+          diag.rejections = 0;
 
           if (res.status === 204) {
             // The normal, quiet path — not an error. Re-poll immediately with only enough
@@ -776,18 +1036,29 @@ export function startRelay(): void {
 
           await dispatch(base, token, (await res.json()) as Work);
         } catch (err) {
-          status.connected = false;
-          status.last_error = err instanceof Error ? err.message : String(err);
+          markDown();
+          status.last_error = describeError(err);
           const wait = backoffMs(Math.min(failures, 5));
           failures += 1;
-          // Logged at most every few seconds by the backoff itself, so a venue that loses its
-          // uplink overnight does not fill the log file.
-          log.error(`relay: ${status.last_error} — retrying in ${Math.round(wait / 1000)}s`, {
-            event: 'relay.retry', detail: status.last_error, wait_ms: wait,
-          });
+          diag.failures = failures;
+          // The first failure of an outage is always logged, then once per window with a count,
+          // so a venue that loses its uplink overnight does not fill the log file. The recovery
+          // line closes the run. Warn, not error: this is the bridge riding out a fault.
+          const pass = gate.hit('relay.retry');
+          if (pass) {
+            const repeated = pass.repeated > 0 ? ` (repeated ${pass.repeated} times over ${seconds(pass.over_ms)})` : '';
+            log.warn(`relay: ${status.last_error} — retrying in ${Math.round(wait / 1000)}s${repeated}`, {
+              event: 'relay.retry', detail: status.last_error, wait_ms: wait, failures, err,
+              status: (err as { status?: number }).status, repeated: pass.repeated || undefined,
+            });
+          }
           await sleep(wait);
         }
       }
+    } catch (err) {
+      // Unreachable by design — every path inside the loop catches. If it ever happens, the
+      // bridge has stopped talking to the cloud for good, and this line is the only evidence.
+      log.error('relay: the relay loop failed and stopped', { event: 'relay.loop.failed', err, expected: false });
     } finally {
       // Every way out of the loop lands here: a rejected token, a revoked bridge, or an
       // unexpected throw from `runSocketSession`, which is awaited outside the inner try/catch.
@@ -800,6 +1071,10 @@ export function startRelay(): void {
       // state an operator cannot diagnose from the POS.
       clearInterval(beat);
       relayRunning = false;
+      markDown();
+      log.error('relay: the relay loop has exited — the bridge is offline until it is restarted', {
+        event: 'relay.loop.exited',
+      });
     }
   })();
 }
