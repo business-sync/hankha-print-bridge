@@ -146,6 +146,21 @@ export type PrintOutcome =
       duration_ms: number;
     };
 
+const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+
+/**
+ * How long a printer gets to accept the TCP connection, separately from the send as a whole.
+ *
+ * A printer on the LAN answers a SYN in milliseconds or not at all. Sharing the send's 15-second
+ * budget meant a switched-off printer was reported at 15 s — long after the synchronous `/print`
+ * route had given up at 8 s and told the POS `unknown`, which withholds the retry button for a
+ * ticket that provably never printed.
+ */
+function connectTimeoutMs(): number {
+  const raw = Number(process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS);
+  return Number.isInteger(raw) && raw >= 250 && raw <= 60_000 ? raw : DEFAULT_CONNECT_TIMEOUT_MS;
+}
+
 /**
  * The one thing a browser can't do itself: open a raw TCP socket to the printer's LAN IP and
  * write the raw ESC/POS bytes. Everything else (building the receipt, base64-encoding it) already
@@ -154,12 +169,20 @@ export type PrintOutcome =
  * Resolves with an OUTCOME rather than throwing, because "it failed" is not enough information
  * for the caller: it has to know whether the failure happened before or after the socket opened.
  * Collapsing both into one error is what would make a receipt print twice.
+ *
+ * ⚠ Both limits are DEADLINES, never `socket.setTimeout`. That is an idle timer, and any byte the
+ * printer sends back resets it. A printer that stops taking data (roll out, cover open) but keeps
+ * answering with status bytes therefore held a send open forever — and because a printer's lane
+ * is sequential, every later job to it queued behind one that would never settle, until the
+ * service was restarted.
  */
 export function sendToPrinter(
   ip: string,
   port: number,
   payload: Buffer,
-  timeoutMs: number
+  timeoutMs: number,
+  /** A tighter connect limit for this one send. Never loosens the configured one. */
+  connectLimitMs?: number
 ): Promise<PrintOutcome> {
   return new Promise((resolve) => {
     const socket = new Socket();
@@ -168,10 +191,12 @@ export function sendToPrinter(
     // that fails before it ran provably never reached the printer.
     let connected = false;
     let settled = false;
+    let deadline: NodeJS.Timeout | undefined;
 
     const finish = (outcome: PrintOutcome) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       socket.destroy();
       resolve(outcome);
     };
@@ -185,10 +210,8 @@ export function sendToPrinter(
         duration_ms: Date.now() - startedAt,
       });
 
-    socket.setTimeout(timeoutMs);
-    socket.once('timeout', () =>
-      fail(connected ? 'write-timeout' : 'connect-timeout', `timed out after ${timeoutMs}ms`)
-    );
+    const connectMs = Math.min(timeoutMs, connectTimeoutMs(), connectLimitMs ?? Number.POSITIVE_INFINITY);
+    deadline = setTimeout(() => fail('connect-timeout', `no connection after ${connectMs}ms`), connectMs);
     socket.once('error', (err: NodeJS.ErrnoException) => {
       const reason: PrintFailureReason =
         err.code === 'ECONNREFUSED' ? 'connect-refused' : connected ? 'write-timeout' : 'unreachable';
@@ -196,6 +219,11 @@ export function sendToPrinter(
     });
     socket.connect(port, ip, () => {
       connected = true;
+      clearTimeout(deadline);
+      deadline = setTimeout(
+        () => fail('write-timeout', `the printer had not taken the job after ${timeoutMs}ms`),
+        timeoutMs
+      );
       socket.write(payload, (err) =>
         err
           ? fail('write-timeout', err.message)

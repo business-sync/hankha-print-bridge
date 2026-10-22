@@ -58,6 +58,21 @@ function plain(value: unknown): unknown {
   return value;
 }
 
+/**
+ * `2026-10-22 13:46:57` in the computer's own clock — the time the shop owner reading the file
+ * lives in, and the time on the launcher's `==== started ====` banner beside it.
+ *
+ * Without one, a log sent in by a venue could say WHAT happened but never WHEN: whether two
+ * tickets went out a second apart or an hour apart, or which failure lined up with a complaint.
+ */
+export function localStamp(at: Date): string {
+  const two = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${at.getFullYear()}-${two(at.getMonth() + 1)}-${two(at.getDate())} ` +
+    `${two(at.getHours())}:${two(at.getMinutes())}:${two(at.getSeconds())}`
+  );
+}
+
 function emit(level: LogLevel, message: string, fields?: LogFields): void {
   if (LEVEL_ORDER[level] < LEVEL_ORDER[configuredLevel()]) return;
 
@@ -66,7 +81,7 @@ function emit(level: LogLevel, message: string, fields?: LogFields): void {
   const stream = level === 'warn' || level === 'error' ? process.stderr : process.stdout;
 
   if (!jsonFormat()) {
-    stream.write(`${message}\n`);
+    stream.write(`${localStamp(new Date())} ${message}\n`);
     return;
   }
 

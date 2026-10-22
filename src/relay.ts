@@ -649,8 +649,32 @@ export function startRelay(): void {
    * code entered on the local page takes effect without a restart. A token that really was
    * revoked just keeps getting 401, which costs one cheap request every few minutes.
    */
+  const adoptSavedCredential = (): boolean => {
+    const fresh = loadState();
+    if (!fresh.token || !fresh.bridge_id) return false;
+    const changed = fresh.token !== token;
+    token = fresh.token;
+    base = relayUrl(fresh);
+    status.bridge_id = fresh.bridge_id;
+    return changed;
+  };
+
   const waitOutRejection = async () => {
     status.connected = false;
+    /*
+     * Re-pairing (Replace) is what revokes the old row, and the new token is saved before the
+     * server cuts the live session — so by the time this loop hears the 401, the answer is
+     * usually already on disk. `wakeRelay` cannot help there: it only wakes a loop that is
+     * already waiting. Without this check a freshly paired bridge sat out a 30–60 s backoff
+     * with the dead token, its heartbeat rejected and the POS showing it offline.
+     */
+    if (adoptSavedCredential()) {
+      rejections = 0;
+      log.info(`relay: switched to the new pairing (bridge ${status.bridge_id})`, {
+        event: 'relay.token_switched', bridge_id: status.bridge_id,
+      });
+      return;
+    }
     status.last_error = TOKEN_REJECTED;
     const wait = backoffMs(6 + Math.min(rejections, 3), REJECTED_RETRY_MAX_MS);
     rejections += 1;
@@ -659,12 +683,7 @@ export function startRelay(): void {
       { event: 'relay.token_rejected', wait_ms: wait }
     );
     await interruptibleSleep(wait);
-    const fresh = loadState();
-    if (fresh.token && fresh.bridge_id) {
-      token = fresh.token;
-      base = relayUrl(fresh);
-      status.bridge_id = fresh.bridge_id;
-    }
+    adoptSavedCredential();
   };
 
   void (async () => {
