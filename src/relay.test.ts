@@ -148,6 +148,20 @@ describe('sendToPrinter', () => {
       else process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS = previous;
     }
   });
+
+  /*
+   * The synchronous route's per-attempt limit. Tighter than the configured one, so two attempts
+   * fit inside the POS's 8 s wait.
+   */
+  it('honours a per-send connect limit tighter than the configured one', async () => {
+    const startedAt = Date.now();
+    const outcome = await sendToPrinter('10.255.255.1', 9100, Buffer.from('x'), 10_000, 300);
+    assert.equal(outcome.ok, false);
+    if (outcome.ok) return;
+    assert.equal(outcome.printed_certainty, 'none');
+    if (outcome.reason === 'connect-timeout') assert.match(outcome.detail, /after 300ms/);
+    assert.ok(Date.now() - startedAt < 2000, `took ${Date.now() - startedAt}ms`);
+  });
 });
 
 describe('containerSuspect', () => {

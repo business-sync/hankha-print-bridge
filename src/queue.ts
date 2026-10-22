@@ -32,6 +32,7 @@ import type { PrintOutcome, PrintedCertainty } from './lan.js';
 import { log } from './log.js';
 import type { PrinterRecord } from './registry.js';
 import { driverFor } from './transports/index.js';
+import type { SendOptions } from './transports/transport.js';
 
 export type JobStatus = 'queued' | 'printing' | 'done' | 'failed' | 'expired';
 
@@ -58,8 +59,19 @@ export interface JobRecord {
   created_at: string;
   updated_at: string;
   expires_at: string | null;
-  /** False for the legacy synchronous `/print`, which owns its own retry policy. */
+  /** False for a job whose caller owns the retry policy. */
   retryable: boolean;
+  /**
+   * The last moment a retry may START, for a caller that is waiting on the answer.
+   *
+   * Unlike `expires_at` it never drops a job, it only stops scheduling retries: a retry whose
+   * backoff would end past it is not attempted, and the job fails with the transport's own
+   * reason. That way the last attempt finishes while the caller is still listening, rather than
+   * being cut off mid-connect and reported as `unknown`.
+   */
+  retry_until?: string;
+  /** Overrides the connect limit for this job's sends. See `SendOptions`. */
+  connect_timeout_ms?: number;
   /** False keeps the job out of the spool directory entirely. */
   persistent: boolean;
   /**
@@ -93,6 +105,9 @@ export interface SubmitInput {
   ttl_s?: number;
   persistent?: boolean;
   retryable?: boolean;
+  /** Sets `retry_until` this many ms from now. */
+  retry_window_ms?: number;
+  connect_timeout_ms?: number;
 }
 
 export interface Submission {
@@ -132,7 +147,7 @@ export interface PurgeReport {
 
 export interface QueueOptions {
   /** Overridden in tests so a fake transport can drive the state machine without hardware. */
-  send?: (printer: PrinterRecord, bytes: Buffer, timeoutMs: number) => Promise<PrintOutcome>;
+  send?: (printer: PrinterRecord, bytes: Buffer, timeoutMs: number, options?: SendOptions) => Promise<PrintOutcome>;
   dir?: string;
   maxAttempts?: number;
   sendTimeoutMs?: number;
@@ -182,7 +197,12 @@ export class PrintQueue {
   private readonly maxAttempts: number;
   private readonly sendTimeoutMs: number;
   private readonly watchdogGraceMs: number;
-  private readonly sender: (printer: PrinterRecord, bytes: Buffer, timeoutMs: number) => Promise<PrintOutcome>;
+  private readonly sender: (
+    printer: PrinterRecord,
+    bytes: Buffer,
+    timeoutMs: number,
+    options?: SendOptions
+  ) => Promise<PrintOutcome>;
 
   /** Everything not yet settled, by id. */
   private readonly active = new Map<string, JobRecord>();
@@ -204,7 +224,9 @@ export class PrintQueue {
     this.sendTimeoutMs = options.sendTimeoutMs ?? envInt('PRINT_BRIDGE_SEND_TIMEOUT_MS', DEFAULT_SEND_TIMEOUT_MS, 1000, 120_000);
     this.watchdogGraceMs = options.watchdogGraceMs ?? DEFAULT_WATCHDOG_GRACE_MS;
     this.sender =
-      options.send ?? ((printer, bytes, timeoutMs) => driverFor(printer.transport).send(printer, bytes, timeoutMs));
+      options.send ??
+      ((printer, bytes, timeoutMs, sendOptions) =>
+        driverFor(printer.transport).send(printer, bytes, timeoutMs, sendOptions));
   }
 
   private spoolDir(): string {
@@ -462,6 +484,10 @@ export class PrintQueue {
       retryable: input.retryable ?? persistent,
       persistent,
       keyed: Boolean(supplied),
+      ...(input.retry_window_ms && input.retry_window_ms > 0
+        ? { retry_until: new Date(now + input.retry_window_ms).toISOString() }
+        : {}),
+      ...(input.connect_timeout_ms ? { connect_timeout_ms: input.connect_timeout_ms } : {}),
     };
 
     this.active.set(jobId, job);
@@ -569,7 +595,8 @@ export class PrintQueue {
       }, limitMs);
     });
     try {
-      return await Promise.race([this.sender(job.printer, payload, this.sendTimeoutMs), stalled]);
+      const sendOptions = job.connect_timeout_ms ? { connectTimeoutMs: job.connect_timeout_ms } : undefined;
+      return await Promise.race([this.sender(job.printer, payload, this.sendTimeoutMs, sendOptions), stalled]);
     } finally {
       clearTimeout(timer);
     }
@@ -639,12 +666,18 @@ export class PrintQueue {
      * rest.
      */
     const withinDeadline = job.expires_at !== null && !expired;
+    const wait = backoffMs(job.attempts - 1, 10_000);
+    // A caller-held window replaces the attempt count: it already says how long retrying is
+    // worth it, and the window is short enough that the count would never bind first.
+    const retryUntil = job.retry_until ? Date.parse(job.retry_until) : null;
     const mayRetry =
       job.retryable &&
       certainty === 'none' &&
       !expired &&
       !this.draining &&
-      (job.attempts < this.maxAttempts || withinDeadline);
+      (retryUntil !== null
+        ? Date.now() + wait <= retryUntil
+        : job.attempts < this.maxAttempts || withinDeadline);
 
     if (!mayRetry) {
       job.status = 'failed';
@@ -660,14 +693,17 @@ export class PrintQueue {
       return true;
     }
 
-    const wait = backoffMs(job.attempts - 1, 10_000);
     job.status = 'queued';
     job.result = result;
     job.updated_at = new Date().toISOString();
     this.persist(job);
     log.warn(
       `queue: job ${job.job_id} failed (${outcome.reason}) but nothing printed — retrying in ${Math.round(wait / 1000)}s ` +
-        (withinDeadline ? `(attempt ${job.attempts}, until ${job.expires_at})` : `(attempt ${job.attempts} of ${this.maxAttempts})`),
+        (retryUntil !== null
+          ? `(attempt ${job.attempts}, until ${job.retry_until})`
+          : withinDeadline
+            ? `(attempt ${job.attempts}, until ${job.expires_at})`
+            : `(attempt ${job.attempts} of ${this.maxAttempts})`),
       { event: 'queue.retry', job_id: job.job_id, printer_id: job.printer.id, reason: outcome.reason, attempt: job.attempts, wait_ms: wait }
     );
     await this.sleep(wait);

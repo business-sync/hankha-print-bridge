@@ -293,6 +293,49 @@ describe('POST /print', () => {
     }
   });
 
+  /*
+   * A printer that does not take the first connection must still get the ticket. Kitchen tickets
+   * from the POS used to be tried exactly once, and were lost to a printer that accepted a fresh
+   * connection a second later.
+   */
+  it('prints a ticket when the printer only accepts a moment after the first attempt', async (t) => {
+    const lan = localInterfaces()[0];
+    if (!lan) return t.skip('no private LAN interface on this machine');
+
+    const received: Buffer[] = [];
+    const fake = createTcpServer((socket) => {
+      socket.on('data', (chunk) => received.push(chunk));
+    });
+    const listen = (port: number) =>
+      new Promise<number>((resolve) => {
+        fake.listen(port, '0.0.0.0', () => {
+          const address = fake.address();
+          if (typeof address === 'string' || address === null) throw new Error('no port');
+          resolve(address.port);
+        });
+      });
+    // Reserve a port, then go away: the first attempt is refused, so provably printed nothing.
+    const port = await listen(0);
+    await new Promise<void>((r) => fake.close(() => r()));
+    const back = setTimeout(() => void listen(port), 200);
+
+    try {
+      const { status, json } = await post('/print', {
+        ip: lan.address,
+        port,
+        job_id: 'kitchen-ticket-late-printer',
+        payload_base64: Buffer.from('\x1b@KITCHEN\n').toString('base64'),
+      });
+      assert.equal(status, 200, JSON.stringify(json));
+      assert.equal(json.ok, true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(Buffer.concat(received).toString(), '\x1b@KITCHEN\n', 'printed exactly once');
+    } finally {
+      clearTimeout(back);
+      fake.close();
+    }
+  });
+
   it('rejects a job aimed at a public address', async () => {
     const { status } = await post('/print', {
       ip: '8.8.8.8',

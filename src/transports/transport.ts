@@ -39,6 +39,14 @@ export interface DiscoveredPrinter {
   detail?: string;
 }
 
+export interface SendOptions {
+  /**
+   * The most a network printer gets to accept this one connection. Only the network driver has a
+   * connect phase; the others ignore it.
+   */
+  connectTimeoutMs?: number;
+}
+
 export interface Transport {
   readonly kind: TransportKind;
 
@@ -51,7 +59,7 @@ export interface Transport {
 
   probe(printer: PrinterRecord, timeoutMs: number): Promise<ProbeResult>;
 
-  send(printer: PrinterRecord, bytes: Buffer, timeoutMs: number): Promise<PrintOutcome>;
+  send(printer: PrinterRecord, bytes: Buffer, timeoutMs: number, options?: SendOptions): Promise<PrintOutcome>;
 
   /** Printers this host can see. Absent where enumeration is impossible. */
   discover?(timeoutMs: number): Promise<DiscoveredPrinter[]>;

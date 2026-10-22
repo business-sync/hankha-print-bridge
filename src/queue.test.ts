@@ -164,7 +164,7 @@ describe('retry safety', () => {
     assert.equal(calls, 2, 'must not retry once a copy has printed');
   });
 
-  it('honours retryable: false, which is what the synchronous /print route submits', async () => {
+  it('honours retryable: false, for a caller that owns its own retries', async () => {
     let calls = 0;
     const queue = new PrintQueue({
       dir: scratch(), maxAttempts: 5,
@@ -179,6 +179,94 @@ describe('retry safety', () => {
     }).settled;
     assert.equal(job.status, 'failed');
     assert.equal(calls, 1);
+  });
+});
+
+/*
+ * The synchronous /print route holds the POS's request open for 8 s. A printer that has sat idle
+ * sometimes ignores the first connection while a fresh one a second later is accepted at once —
+ * relay jobs printed on their retry every time, while kitchen tickets from the POS, submitted
+ * with no retry at all, were lost. These pin the window that route now retries in.
+ */
+describe('a caller waiting on the answer (retry window)', () => {
+  const connectTimeout = (): PrintOutcome => ({
+    ok: false, reason: 'connect-timeout', printed_certainty: 'none', detail: 'no connection after 2000ms', duration_ms: 2000,
+  });
+
+  it('retries a ticket the printer never accepted, and prints it on the fresh connection', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(), maxAttempts: 1,
+      send: async () => (++calls === 1 ? connectTimeout() : ok()),
+    });
+
+    const job = await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload,
+      persistent: false, retryable: true, retry_window_ms: 5000,
+    }).settled;
+    assert.equal(job.status, 'done');
+    // maxAttempts: 1 would have stopped at one — the window, not the count, governs.
+    assert.equal(calls, 2);
+  });
+
+  it('does not start a retry that would end after the window, and keeps the real reason', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(), maxAttempts: 5,
+      send: async () => {
+        calls += 1;
+        return connectTimeout();
+      },
+    });
+
+    const startedAt = Date.now();
+    const job = await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload,
+      // Shorter than the first backoff (at least 500 ms), so no retry fits.
+      persistent: false, retryable: true, retry_window_ms: 100,
+    }).settled;
+    assert.equal(calls, 1);
+    assert.equal(job.status, 'failed');
+    // Not 'expired': the caller is told what the printer did, and that nothing printed.
+    assert.equal(job.result?.reason, 'connect-timeout');
+    assert.equal(job.result?.printed_certainty, 'none');
+    assert.ok(Date.now() - startedAt < 400, 'settled at once rather than after sleeping out a backoff');
+  });
+
+  it('never retries a ticket that might have printed, however much window is left', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(), maxAttempts: 5,
+      send: async () => {
+        calls += 1;
+        return stalled();
+      },
+    });
+
+    const job = await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload,
+      persistent: false, retryable: true, retry_window_ms: 60_000,
+    }).settled;
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result?.printed_certainty, 'unknown');
+    assert.equal(calls, 1);
+  });
+
+  it("hands the job's connect limit to the driver, and none when the job has no limit", async () => {
+    const seen: (number | undefined)[] = [];
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async (_printer, _bytes, _timeoutMs, options) => {
+        seen.push(options?.connectTimeoutMs);
+        return ok();
+      },
+    });
+
+    await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload, persistent: false, connect_timeout_ms: 2000,
+    }).settled;
+    await queue.submit({ source: 'relay', printer: printer('kitchen'), payload }).settled;
+    assert.deepEqual(seen, [2000, undefined]);
   });
 });
 

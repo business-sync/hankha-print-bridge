@@ -180,7 +180,9 @@ export function sendToPrinter(
   ip: string,
   port: number,
   payload: Buffer,
-  timeoutMs: number
+  timeoutMs: number,
+  /** A tighter connect limit for this one send. Never loosens the configured one. */
+  connectLimitMs?: number
 ): Promise<PrintOutcome> {
   return new Promise((resolve) => {
     const socket = new Socket();
@@ -208,7 +210,7 @@ export function sendToPrinter(
         duration_ms: Date.now() - startedAt,
       });
 
-    const connectMs = Math.min(timeoutMs, connectTimeoutMs());
+    const connectMs = Math.min(timeoutMs, connectTimeoutMs(), connectLimitMs ?? Number.POSITIVE_INFINITY);
     deadline = setTimeout(() => fail('connect-timeout', `no connection after ${connectMs}ms`), connectMs);
     socket.once('error', (err: NodeJS.ErrnoException) => {
       const reason: PrintFailureReason =
