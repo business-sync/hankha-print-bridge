@@ -98,6 +98,56 @@ describe('sendToPrinter', () => {
       server.close();
     }
   });
+
+  /*
+   * The stall that took a venue's bill printer down for an afternoon. The printer stops taking
+   * bytes but keeps sending status bytes back, and every one of them reset `socket.setTimeout`,
+   * which is an IDLE timer. The send never settled, and the jobs queued behind it never ran.
+   */
+  it('gives up on a printer that stops reading but keeps talking', async () => {
+    const { server, port } = await listenOnEphemeralPort();
+    const chatter: NodeJS.Timeout[] = [];
+    server.on('connection', (socket) => {
+      socket.on('error', () => undefined);
+      chatter.push(setInterval(() => socket.write(Buffer.from([0x14])), 50));
+    });
+    try {
+      const startedAt = Date.now();
+      const outcome = await sendToPrinter('127.0.0.1', port, Buffer.alloc(64 * 1024 * 1024, 0x41), 400);
+      assert.equal(outcome.ok, false);
+      if (outcome.ok) return;
+      assert.equal(outcome.reason, 'write-timeout');
+      assert.equal(outcome.printed_certainty, 'unknown');
+      assert.ok(Date.now() - startedAt < 2000, `took ${Date.now() - startedAt}ms`);
+    } finally {
+      for (const timer of chatter) clearInterval(timer);
+      server.close();
+    }
+  });
+
+  /*
+   * A printer that is off has to be reported as such INSIDE the sync route's 8 s window. Waiting
+   * out the whole send budget answered after the POS had already been told `unknown`.
+   */
+  it('reports a connect timeout within the connect window, not the send budget', async () => {
+    const previous = process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS;
+    process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS = '300';
+    try {
+      const startedAt = Date.now();
+      const outcome = await sendToPrinter('10.255.255.1', 9100, Buffer.from('x'), 10_000);
+      assert.equal(outcome.ok, false);
+      if (outcome.ok) return;
+      assert.equal(outcome.printed_certainty, 'none');
+      assert.ok(
+        outcome.reason === 'connect-timeout' || outcome.reason === 'unreachable',
+        `expected a pre-connect failure, got ${outcome.reason}`
+      );
+      assert.ok(Date.now() - startedAt < 2000, `took ${Date.now() - startedAt}ms`);
+    } finally {
+      if (previous === undefined) delete process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS;
+      else process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS = previous;
+    }
+  });
 });
 
 describe('containerSuspect', () => {
