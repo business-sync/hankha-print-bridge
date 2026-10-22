@@ -66,6 +66,8 @@ Environment:
   PRINT_BRIDGE_LOG_FORMAT       text | json                 (default text)
   PRINT_BRIDGE_LOG_LEVEL        debug | info | warn | error (default info)
   PRINT_BRIDGE_MAX_ATTEMPTS     Retries per job, when nothing printed   (default 3)
+  PRINT_BRIDGE_CONNECT_TIMEOUT_MS  Time a network printer gets to accept a connection
+                                (default 5000)
   PRINT_BRIDGE_SERVICE_CONTROL  on | off. 'off' removes the /service routes and the
                                 "This computer" card from the page.       (default on)
   PRINT_BRIDGE_MANAGED          What supervises this process, stamped by the installer:

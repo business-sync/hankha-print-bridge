@@ -62,11 +62,11 @@ export const networkTransport: Transport = {
     return { reachable: result.reachable, latency_ms: result.latency_ms, detail: result.reason };
   },
 
-  async send(printer, bytes, timeoutMs) {
+  async send(printer, bytes, timeoutMs, options) {
     const startedAt = Date.now();
     const target = targetOf(printer);
     if (!target) return failed('device-missing', 'none', 'no address configured', startedAt);
-    return sendToPrinter(target.ip, target.port, bytes, timeoutMs);
+    return sendToPrinter(target.ip, target.port, bytes, timeoutMs, options?.connectTimeoutMs);
   },
 
   async query(printer, probe, timeoutMs): Promise<Buffer | null> {

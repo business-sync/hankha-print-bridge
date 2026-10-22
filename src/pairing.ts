@@ -1,7 +1,7 @@
 import { backoffMs } from './backoff.js';
 import { loadState } from './identity.js';
 import { log } from './log.js';
-import { enroll, isRelayRunning, relayUrl, startRelay } from './relay.js';
+import { enroll, isRelayRunning, relayUrl, startRelay, wakeRelay } from './relay.js';
 import { BRIDGE_VERSION } from './version.js';
 import { arch, hostname, platform } from 'node:os';
 
@@ -254,7 +254,13 @@ async function runPairingLoop(): Promise<void> {
             // The relay loop is the point of all this. It is only started here when one is not
             // already live — a re-pair performed while a rejected loop is still unwinding must
             // not put a second loop on `/work`.
+            //
+            // A loop that IS live is almost always one waiting out the rejected token this pairing
+            // replaces, asleep for up to five minutes before it re-reads the credential. Wake it,
+            // as `POST /enroll` does — until then its heartbeat keeps sending the dead token, and
+            // the POS shows a freshly paired bridge as offline.
             if (!isRelayRunning()) startRelay();
+            else wakeRelay();
             return;
           } catch (err) {
             // The claim happened but redemption failed. Almost always transient (the API blipped

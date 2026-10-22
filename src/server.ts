@@ -65,6 +65,23 @@ const IDENTIFY_TIMEOUT_MS = 1500;
  */
 const SYNC_PRINT_TIMEOUT_MS = Number(process.env.PRINT_BRIDGE_SYNC_TIMEOUT_MS) || 8000;
 /**
+ * Each connect attempt inside that wait, and the window retries may start in.
+ *
+ * A printer that has sat idle sometimes ignores the first connection — every retransmitted SYN
+ * on that socket included, for as long as it is held open — while a NEW connection a second
+ * later is accepted in a millisecond. One attempt with the general 5 s connect limit therefore
+ * lost the ticket: relay jobs, which retry, printed on their second try every time, and kitchen
+ * tickets from the POS, which did not, were simply gone unless someone pressed Retry.
+ *
+ * So the wait is spent on short attempts instead of one long one: two worst-case 2 s connects
+ * with a backoff between them, and more when the failures come back fast. The window ends one
+ * connect plus a margin before the deadline, so the last attempt is over before the POS stops
+ * listening — a send cut off mid-connect would be reported as `unknown` and withhold its retry.
+ * Only `printed_certainty: 'none'` is ever retried, so this cannot print anything twice.
+ */
+const SYNC_CONNECT_TIMEOUT_MS = Math.min(2000, Math.floor(SYNC_PRINT_TIMEOUT_MS / 3));
+const SYNC_RETRY_WINDOW_MS = Math.max(0, SYNC_PRINT_TIMEOUT_MS - SYNC_CONNECT_TIMEOUT_MS - 1000);
+/**
  * How long `POST /printers/:id/test` waits.
  *
  * Longer than the synchronous print above, because a test slip is worth a little more patience
@@ -424,12 +441,16 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
     return;
   }
 
-  // Not persisted and never retried: this caller is holding a socket open and owns its own retry
-  // policy. Spooling it would mean a job the client already gave up on printing later anyway.
+  // Not persisted, and retried only while this caller is still waiting: it holds a socket open
+  // and owns the retry policy beyond that. Spooling it would mean a job the client already gave
+  // up on printing later anyway.
   const submission = queue().submit({
     ...(jobId ? { job_id: jobId } : {}),
     source: 'local', printer: prepared.printer, payload: prepared.payload,
-    persistent: false, retryable: false,
+    persistent: false,
+    retryable: SYNC_RETRY_WINDOW_MS > 0,
+    retry_window_ms: SYNC_RETRY_WINDOW_MS,
+    connect_timeout_ms: SYNC_CONNECT_TIMEOUT_MS,
   });
 
   // A replay: this id has printed (or provably failed) before. Answer with the FIRST outcome and

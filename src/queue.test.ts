@@ -164,7 +164,7 @@ describe('retry safety', () => {
     assert.equal(calls, 2, 'must not retry once a copy has printed');
   });
 
-  it('honours retryable: false, which is what the synchronous /print route submits', async () => {
+  it('honours retryable: false, for a caller that owns its own retries', async () => {
     let calls = 0;
     const queue = new PrintQueue({
       dir: scratch(), maxAttempts: 5,
@@ -179,6 +179,94 @@ describe('retry safety', () => {
     }).settled;
     assert.equal(job.status, 'failed');
     assert.equal(calls, 1);
+  });
+});
+
+/*
+ * The synchronous /print route holds the POS's request open for 8 s. A printer that has sat idle
+ * sometimes ignores the first connection while a fresh one a second later is accepted at once —
+ * relay jobs printed on their retry every time, while kitchen tickets from the POS, submitted
+ * with no retry at all, were lost. These pin the window that route now retries in.
+ */
+describe('a caller waiting on the answer (retry window)', () => {
+  const connectTimeout = (): PrintOutcome => ({
+    ok: false, reason: 'connect-timeout', printed_certainty: 'none', detail: 'no connection after 2000ms', duration_ms: 2000,
+  });
+
+  it('retries a ticket the printer never accepted, and prints it on the fresh connection', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(), maxAttempts: 1,
+      send: async () => (++calls === 1 ? connectTimeout() : ok()),
+    });
+
+    const job = await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload,
+      persistent: false, retryable: true, retry_window_ms: 5000,
+    }).settled;
+    assert.equal(job.status, 'done');
+    // maxAttempts: 1 would have stopped at one — the window, not the count, governs.
+    assert.equal(calls, 2);
+  });
+
+  it('does not start a retry that would end after the window, and keeps the real reason', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(), maxAttempts: 5,
+      send: async () => {
+        calls += 1;
+        return connectTimeout();
+      },
+    });
+
+    const startedAt = Date.now();
+    const job = await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload,
+      // Shorter than the first backoff (at least 500 ms), so no retry fits.
+      persistent: false, retryable: true, retry_window_ms: 100,
+    }).settled;
+    assert.equal(calls, 1);
+    assert.equal(job.status, 'failed');
+    // Not 'expired': the caller is told what the printer did, and that nothing printed.
+    assert.equal(job.result?.reason, 'connect-timeout');
+    assert.equal(job.result?.printed_certainty, 'none');
+    assert.ok(Date.now() - startedAt < 400, 'settled at once rather than after sleeping out a backoff');
+  });
+
+  it('never retries a ticket that might have printed, however much window is left', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(), maxAttempts: 5,
+      send: async () => {
+        calls += 1;
+        return stalled();
+      },
+    });
+
+    const job = await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload,
+      persistent: false, retryable: true, retry_window_ms: 60_000,
+    }).settled;
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result?.printed_certainty, 'unknown');
+    assert.equal(calls, 1);
+  });
+
+  it("hands the job's connect limit to the driver, and none when the job has no limit", async () => {
+    const seen: (number | undefined)[] = [];
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async (_printer, _bytes, _timeoutMs, options) => {
+        seen.push(options?.connectTimeoutMs);
+        return ok();
+      },
+    });
+
+    await queue.submit({
+      source: 'local', printer: printer('kitchen'), payload, persistent: false, connect_timeout_ms: 2000,
+    }).settled;
+    await queue.submit({ source: 'relay', printer: printer('kitchen'), payload }).settled;
+    assert.deepEqual(seen, [2000, undefined]);
   });
 });
 
@@ -278,6 +366,117 @@ describe('idempotency', () => {
     assert.equal(replay.deduplicated, true);
     assert.equal(job.status, 'done');
     assert.equal(calls, 1);
+  });
+});
+
+describe('a driver that never answers', () => {
+  /*
+   * A lane is sequential, so one send that never settles used to stop that printer for good:
+   * nothing behind it was attempted, so nothing behind it could even expire.
+   */
+  it('gives up on the stuck job as might-have-printed, and the lane moves on', async () => {
+    let calls = 0;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      sendTimeoutMs: 40,
+      watchdogGraceMs: 40,
+      send: async () => {
+        calls += 1;
+        if (calls === 1) return new Promise<PrintOutcome>(() => undefined);
+        return ok();
+      },
+    });
+
+    const stuck = queue.submit({ job_id: 'stuck-1', source: 'relay', printer: printer('bill'), payload });
+    const behind = queue.submit({ job_id: 'behind-1', source: 'relay', printer: printer('bill'), payload });
+
+    const first = await stuck.settled;
+    assert.equal(first.status, 'failed');
+    assert.equal(first.result?.reason, 'write-timeout');
+    // Never `none`: the driver may have delivered the bytes after we stopped listening.
+    assert.equal(first.result?.printed_certainty, 'unknown');
+    assert.equal(first.attempts, 1, 'a might-have-printed job must not be retried');
+
+    const second = await behind.settled;
+    assert.equal(second.status, 'done');
+  });
+});
+
+describe('server-driven retries of relay jobs', () => {
+  /*
+   * The backend answers `printed_certainty: 'none'` by putting the job back to QUEUED under the
+   * same id. If the bridge remembers that failure, the redelivery is replayed instead of tried,
+   * and the server's whole retry budget is spent without the printer ever being dialled again.
+   */
+  it('really retries a redelivered job that provably did not print', async () => {
+    let sends = 0;
+    let failing = true;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      maxAttempts: 1,
+      send: async () => {
+        sends += 1;
+        return failing ? refused() : ok();
+      },
+    });
+
+    const first = await queue.submit({ job_id: '513', source: 'relay', printer: printer('bill'), payload }).settled;
+    assert.equal(first.result?.printed_certainty, 'none');
+
+    failing = false;
+    const redelivery = queue.submit({ job_id: '513', source: 'relay', printer: printer('bill'), payload });
+    assert.equal(redelivery.deduplicated, false);
+    const second = await redelivery.settled;
+    assert.equal(second.status, 'done');
+    assert.equal(sends, 2);
+  });
+
+  it('still replays a relay job that may have printed', async () => {
+    let sends = 0;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async () => {
+        sends += 1;
+        return stalled();
+      },
+    });
+
+    await queue.submit({ job_id: '514', source: 'relay', printer: printer('bill'), payload }).settled;
+    const redelivery = queue.submit({ job_id: '514', source: 'relay', printer: printer('bill'), payload });
+    assert.equal(redelivery.deduplicated, true);
+    await redelivery.settled;
+    assert.equal(sends, 1, 'a write that broke mid-stream must never be sent again');
+  });
+
+  it('still replays a relay job somebody cancelled', async () => {
+    let release: (() => void) | null = null;
+    let sends = 0;
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async () => {
+        sends += 1;
+        if (sends === 1) {
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        }
+        return ok();
+      },
+    });
+
+    const head = queue.submit({ job_id: 'head', source: 'relay', printer: printer('bill'), payload });
+    const waiting = queue.submit({ job_id: '516', source: 'relay', printer: printer('bill'), payload });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(queue.cancel('516'), true);
+    await waiting.settled;
+
+    const redelivery = queue.submit({ job_id: '516', source: 'relay', printer: printer('bill'), payload });
+    assert.equal(redelivery.deduplicated, true);
+    assert.equal((await redelivery.settled).result?.reason, 'cancelled');
+
+    release?.();
+    await head.settled;
+    assert.equal(sends, 1);
   });
 });
 
@@ -517,11 +716,11 @@ describe('idempotency for the synchronous /print path', () => {
   });
 
   /*
-   * The relay's jobs are persistent, and their retries belong to the server's state machine.
-   * A redelivery must never reprint one behind its back, so the blanket rule still applies
-   * there even for a provably-failed job.
+   * A persistent job submitted LOCALLY keeps the blanket rule, failures included. Relay jobs are
+   * the one exception, and a deliberate one: the server only ever redelivers a `none` failure
+   * because its own state machine chose to retry it (see 'server-driven retries of relay jobs').
    */
-  it('still remembers every settled PERSISTENT job, failures included', async () => {
+  it('still remembers every settled persistent LOCAL job, failures included', async () => {
     let sends = 0;
     const queue = new PrintQueue({
       dir: scratch(),
@@ -531,10 +730,10 @@ describe('idempotency for the synchronous /print path', () => {
       },
     });
 
-    await queue.submit({ source: 'relay', printer: printer('counter'), payload, job_id: 'relay-1' }).settled;
+    await queue.submit({ source: 'local', printer: printer('counter'), payload, job_id: 'local-1' }).settled;
     const after = sends;
 
-    const again = queue.submit({ source: 'relay', printer: printer('counter'), payload, job_id: 'relay-1' });
+    const again = queue.submit({ source: 'local', printer: printer('counter'), payload, job_id: 'local-1' });
     assert.equal(again.deduplicated, true);
     await again.settled;
     assert.equal(sends, after);
