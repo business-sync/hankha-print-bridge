@@ -5,7 +5,13 @@ import type { Socket } from 'node:net';
 import { after, describe, it } from 'node:test';
 import { createServer as createTcpServer } from 'node:net';
 import { type LogRecord, setLogSink } from './log.js';
-import { connectWebSocket, parseFrame, WebSocketHandshakeError } from './relay-socket.js';
+import {
+  connectNativeWebSocket,
+  connectWebSocket,
+  type NativeWebSocketCtor,
+  parseFrame,
+  WebSocketHandshakeError,
+} from './relay-socket.js';
 
 /*
  * Framing is the part of a hand-written WebSocket that fails silently: an off-by-one in a length
@@ -376,5 +382,110 @@ describe('who closed it', () => {
     } finally {
       restore();
     }
+  });
+});
+
+/*
+ * The runtime's own WebSocket, which is what the compiled (Bun) binary uses: Bun's `node:http`
+ * reports a 101 as an ordinary response, so the hand-written client above never connected there.
+ * A fake stands in for Bun's class; what is pinned is the mapping onto `WebSocketClient`.
+ */
+describe('the native client', () => {
+  class FakeSocket {
+    static last: FakeSocket | null = null;
+    readyState = 0;
+    sent: string[] = [];
+    pings = 0;
+    closedWith: [number?, string?] | null = null;
+    private listeners = new Map<string, ((event: Record<string, unknown>) => void)[]>();
+    constructor(readonly url: string, readonly init: { headers?: Record<string, string> }) {
+      FakeSocket.last = this;
+    }
+    addEventListener(type: string, fn: (event: Record<string, unknown>) => void) {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
+    }
+    emit(type: string, event: Record<string, unknown> = {}) {
+      if (type === 'open') this.readyState = 1;
+      if (type === 'close') this.readyState = 3;
+      for (const fn of this.listeners.get(type) ?? []) fn(event);
+    }
+    send(text: string) {
+      this.sent.push(text);
+    }
+    close(code?: number, reason?: string) {
+      this.closedWith = [code, reason];
+    }
+    ping() {
+      this.pings += 1;
+    }
+  }
+  const Fake = FakeSocket as unknown as NativeWebSocketCtor;
+
+  it('sends the token on the handshake, delivers text frames, and closes locally', async () => {
+    const messages: string[] = [];
+    const connecting = connectNativeWebSocket(
+      { url: 'ws://127.0.0.1:1/socket', headers: { Authorization: 'Bearer t' }, onMessage: (t) => messages.push(t) },
+      Fake
+    );
+    const ws = FakeSocket.last!;
+    assert.deepEqual(ws.init.headers, { Authorization: 'Bearer t' });
+    ws.emit('open');
+    const client = await connecting;
+    ws.emit('message', { data: '{"type":"ack"}' });
+    ws.emit('message', { data: new ArrayBuffer(4) });
+    client.send('hello');
+    assert.deepEqual(messages, ['{"type":"ack"}']);
+    assert.deepEqual(ws.sent, ['hello']);
+
+    client.close(1000, 'bye');
+    assert.deepEqual(ws.closedWith, [1000, 'bye']);
+    ws.emit('close', { code: 1000, reason: 'bye' });
+    assert.deepEqual(await client.closed, { code: 1000, reason: 'bye', closed_by: 'local' });
+  });
+
+  it('tells a server close from the network dropping out', async () => {
+    const remote = connectNativeWebSocket({ url: 'ws://127.0.0.1:1/', onMessage: () => {} }, Fake);
+    FakeSocket.last!.emit('open');
+    const a = await remote;
+    FakeSocket.last!.emit('close', { code: 1000, reason: 'superseded by a newer connection' });
+    assert.equal((await a.closed).closed_by, 'remote');
+
+    const dropped = connectNativeWebSocket({ url: 'ws://127.0.0.1:1/', onMessage: () => {} }, Fake);
+    FakeSocket.last!.emit('open');
+    const b = await dropped;
+    FakeSocket.last!.emit('error', { message: 'ECONNRESET' });
+    FakeSocket.last!.emit('close', { code: 1006, reason: '' });
+    const info = await b.closed;
+    assert.equal(info.closed_by, 'network');
+    assert.match(info.reason, /ECONNRESET/);
+  });
+
+  it('pings, and closes a link that goes silent', async () => {
+    const connecting = connectNativeWebSocket({ url: 'ws://127.0.0.1:1/', idleTimeoutMs: 90, onMessage: () => {} }, Fake);
+    const ws = FakeSocket.last!;
+    ws.emit('open');
+    const client = await connecting;
+    // A server ping keeps it alive past one idle period.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    ws.emit('ping');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(ws.closedWith, null);
+    const info = await client.closed;
+    assert.equal(info.closed_by, 'local');
+    assert.equal(info.reason, 'no traffic from server');
+    assert.ok(ws.pings >= 1, 'pinged the server');
+  });
+
+  it('reads the status of a refused handshake, which the native socket does not report', async () => {
+    const server = track(createServer((_req, res) => {
+      res.writeHead(401).end();
+    }));
+    const port = await new Promise<number>((resolve) =>
+      server.listen(0, '127.0.0.1', () => resolve((server.address() as { port: number }).port))
+    );
+    const connecting = connectNativeWebSocket({ url: `ws://127.0.0.1:${port}/socket`, onMessage: () => {} }, Fake);
+    FakeSocket.last!.emit('error', { message: 'Expected 101 status code' });
+    FakeSocket.last!.emit('close', { code: 1002, reason: 'Expected 101 status code' });
+    await assert.rejects(connecting, (err: unknown) => err instanceof WebSocketHandshakeError && err.status === 401);
   });
 });

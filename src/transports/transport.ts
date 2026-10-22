@@ -45,6 +45,12 @@ export interface SendOptions {
    * connect phase; the others ignore it.
    */
   connectTimeoutMs?: number;
+  /**
+   * Open another connection this often while the earlier ones are still unanswered, and print on
+   * whichever is accepted first. `connectTimeoutMs` is then the whole connect window. See
+   * `sendToPrinter`.
+   */
+  connectStaggerMs?: number;
 }
 
 export interface Transport {

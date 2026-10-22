@@ -66,7 +66,7 @@ export const networkTransport: Transport = {
     const startedAt = Date.now();
     const target = targetOf(printer);
     if (!target) return failed('device-missing', 'none', 'no address configured', startedAt);
-    return sendToPrinter(target.ip, target.port, bytes, timeoutMs, options?.connectTimeoutMs);
+    return sendToPrinter(target.ip, target.port, bytes, timeoutMs, options?.connectTimeoutMs, options?.connectStaggerMs);
   },
 
   async query(printer, probe, timeoutMs): Promise<Buffer | null> {

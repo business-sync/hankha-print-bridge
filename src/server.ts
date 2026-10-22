@@ -66,22 +66,28 @@ const IDENTIFY_TIMEOUT_MS = 1500;
  */
 const SYNC_PRINT_TIMEOUT_MS = Number(process.env.PRINT_BRIDGE_SYNC_TIMEOUT_MS) || 8000;
 /**
- * Each connect attempt inside that wait, and the window retries may start in.
+ * How the wait is spent on a network printer.
  *
- * A printer that has sat idle sometimes ignores the first connection — every retransmitted SYN
- * on that socket included, for as long as it is held open — while a NEW connection a second
- * later is accepted in a millisecond. One attempt with the general 5 s connect limit therefore
- * lost the ticket: relay jobs, which retry, printed on their second try every time, and kitchen
- * tickets from the POS, which did not, were simply gone unless someone pressed Retry.
+ * A printer that has sat idle for a few minutes can take several seconds to answer again. A venue
+ * on 1.14.3 lost kitchen and pizza tickets this way all evening: each attempt was cut at 2 s, two
+ * fitted in a 5 s retry window, and the route gave up at 4.8 s of the POS's 8 s — while the
+ * printer took the very next ticket in a millisecond. Relay jobs to the same printers, which
+ * retry for longer, connected on their second try after exactly 3020 ms: Windows' first SYN
+ * retransmit, which a 2 s attempt never lives to see.
  *
- * So the wait is spent on short attempts instead of one long one: two worst-case 2 s connects
- * with a backoff between them, and more when the failures come back fast. The window ends one
- * connect plus a margin before the deadline, so the last attempt is over before the POS stops
- * listening — a send cut off mid-connect would be reported as `unknown` and withhold its retry.
- * Only `printed_certainty: 'none'` is ever retried, so this cannot print anything twice.
+ * So connects are STAGGERED instead (`sendToPrinter`): a fresh connection every second, the
+ * earlier ones left open for their own retransmits, the first one accepted takes the ticket. They
+ * run until one connect window before the deadline less a margin, so a send is never cut off
+ * mid-connect and reported as `unknown`, which would withhold the POS's retry. Nothing is written
+ * until one socket is accepted, so this cannot print anything twice.
+ *
+ * The retry window still applies to the other transports (a busy USB queue), and to a network
+ * send that failed fast enough to leave room for another.
  */
-const SYNC_CONNECT_TIMEOUT_MS = Math.min(2000, Math.floor(SYNC_PRINT_TIMEOUT_MS / 3));
-const SYNC_RETRY_WINDOW_MS = Math.max(0, SYNC_PRINT_TIMEOUT_MS - SYNC_CONNECT_TIMEOUT_MS - 1000);
+const SYNC_MARGIN_MS = 1000;
+const SYNC_CONNECT_WINDOW_MS = Math.max(250, SYNC_PRINT_TIMEOUT_MS - SYNC_MARGIN_MS);
+const SYNC_CONNECT_STAGGER_MS = 1000;
+const SYNC_RETRY_WINDOW_MS = Math.max(0, SYNC_PRINT_TIMEOUT_MS - 2000 - SYNC_MARGIN_MS);
 /**
  * How long `POST /printers/:id/test` waits.
  *
@@ -507,7 +513,8 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
     persistent: false,
     retryable: SYNC_RETRY_WINDOW_MS > 0,
     retry_window_ms: SYNC_RETRY_WINDOW_MS,
-    connect_timeout_ms: SYNC_CONNECT_TIMEOUT_MS,
+    connect_window_ms: SYNC_CONNECT_WINDOW_MS,
+    connect_stagger_ms: SYNC_CONNECT_STAGGER_MS,
   });
   ctx.job = submission.job;
 

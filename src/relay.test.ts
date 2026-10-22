@@ -164,6 +164,73 @@ describe('sendToPrinter', () => {
   });
 });
 
+/*
+ * Staggered connects: how the synchronous route reaches a printer that is slow to wake.
+ */
+describe('sendToPrinter, staggered', () => {
+  it('opens a fresh connection while the printer is not taking them, and prints once on the first accepted', async () => {
+    const port = await closedPort();
+    const connections: Buffer[][] = [];
+    const server = createServer((socket) => {
+      const chunks: Buffer[] = [];
+      connections.push(chunks);
+      socket.on('data', (chunk) => chunks.push(chunk));
+    });
+    // Refuses until it comes up 600 ms in, like a printer whose network side is still waking.
+    const up = setTimeout(() => server.listen(port, '127.0.0.1'), 600);
+    try {
+      const outcome = await sendToPrinter('127.0.0.1', port, Buffer.from('\x1b@WOKE\n'), 5000, 4000, 250);
+      assert.equal(outcome.ok, true, JSON.stringify(outcome));
+      if (!outcome.ok) return;
+      assert.ok((outcome.connect_attempts ?? 0) >= 2, `attempts ${outcome.connect_attempts}`);
+      assert.ok((outcome.connected_after_ms ?? 0) >= 500, `connected after ${outcome.connected_after_ms}ms`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const written = connections.filter((c) => c.length > 0);
+      assert.equal(written.length, 1, 'exactly one connection carried the ticket');
+      assert.equal(Buffer.concat(written[0] ?? []).toString(), '\x1b@WOKE\n');
+    } finally {
+      clearTimeout(up);
+      server.close();
+    }
+  });
+
+  it('keeps trying for the whole window, then reports nothing printed', async () => {
+    const startedAt = Date.now();
+    const outcome = await sendToPrinter('10.255.255.1', 9100, Buffer.from('x'), 10_000, 1200, 300);
+    const took = Date.now() - startedAt;
+    assert.equal(outcome.ok, false);
+    if (outcome.ok) return;
+    assert.equal(outcome.printed_certainty, 'none');
+    assert.ok(took >= 1100 && took < 2500, `took ${took}ms`);
+    assert.ok((outcome.connect_attempts ?? 0) >= 2, `attempts ${outcome.connect_attempts}`);
+  });
+
+  it('names the refusal when every connection was refused', async () => {
+    const port = await closedPort();
+    const outcome = await sendToPrinter('127.0.0.1', port, Buffer.from('x'), 5000, 700, 200);
+    assert.equal(outcome.ok, false);
+    if (outcome.ok) return;
+    assert.equal(outcome.reason, 'connect-refused');
+    assert.equal(outcome.printed_certainty, 'none');
+    assert.match(outcome.detail, /attempts in 700ms/);
+  });
+
+  it('still reports unknown when the accepted connection drops mid-send', async () => {
+    const server = createServer((socket) => socket.destroy());
+    const port = await new Promise<number>((resolve) =>
+      server.listen(0, '127.0.0.1', () => resolve((server.address() as { port: number }).port))
+    );
+    try {
+      const outcome = await sendToPrinter('127.0.0.1', port, Buffer.alloc(8 * 1024 * 1024, 0x41), 2000, 1000, 200);
+      assert.equal(outcome.ok, false);
+      if (outcome.ok) return;
+      assert.equal(outcome.printed_certainty, 'unknown');
+    } finally {
+      server.close();
+    }
+  });
+});
+
 describe('containerSuspect', () => {
   /*
    * Detecting this matters because the symptom lies: printing still works through NAT, but the

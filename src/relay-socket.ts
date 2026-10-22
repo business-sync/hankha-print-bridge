@@ -166,7 +166,239 @@ export function parseFrame(buffer: Buffer): ParsedFrame | null {
   return { fin, opcode, payload, size: offset + length };
 }
 
+/**
+ * Connect, with whichever client actually works on this runtime.
+ *
+ * The shipped binary is compiled by Bun, and Bun's `node:http` never emits `'upgrade'`: it hands
+ * the server's `101 Switching Protocols` to `'response'`, like any other answer. The hand-written
+ * client below therefore read every successful handshake as a refusal ("server answered HTTP 101
+ * instead of upgrading") on every installed bridge, and the relay quietly ran on long-polling
+ * forever. Under Bun the runtime's own WebSocket is used instead; under Node (the tests, `npm run
+ * dev`) the hand-written one, which is what Node supports.
+ */
 export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClient> {
+  const Native = nativeWebSocket();
+  return Native ? connectNativeWebSocket(options, Native) : connectRawWebSocket(options);
+}
+
+/**
+ * The slice of a WHATWG WebSocket this needs, plus the two non-standard parts Bun adds: headers on
+ * the handshake (the bearer token) and `ping()`. Declared here because the project compiles
+ * against Node's types only.
+ */
+interface NativeSocket {
+  readonly readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  ping?(): void;
+  terminate?(): void;
+  addEventListener(type: string, listener: (event: NativeEvent) => void): void;
+}
+interface NativeEvent {
+  data?: unknown;
+  code?: number;
+  reason?: string;
+  message?: string;
+}
+export type NativeWebSocketCtor = new (url: string, init: { headers?: Record<string, string> }) => NativeSocket;
+
+function nativeWebSocket(): NativeWebSocketCtor | null {
+  if (!process.versions.bun) return null;
+  const Ctor = (globalThis as { WebSocket?: unknown }).WebSocket;
+  return typeof Ctor === 'function' ? (Ctor as NativeWebSocketCtor) : null;
+}
+
+/**
+ * What the server answers to the upgrade request, when a native handshake failed.
+ *
+ * A native WebSocket reports every refusal as the same "Expected 101 status code", and the
+ * status is what the relay acts on: 401 means the token was revoked, 404/426 that this server has
+ * no socket route. So the request is repeated over `node:http` to read it. A 101 here (the server
+ * changed its mind between the two) is closed at once and reported as transient.
+ */
+function handshakeStatus(options: ConnectOptions): Promise<WebSocketHandshakeError> {
+  return new Promise((resolve) => {
+    const url = new URL(options.url);
+    const secure = url.protocol === 'wss:' || url.protocol === 'https:';
+    const req = (secure ? httpsRequest : httpRequest)({
+      protocol: secure ? 'https:' : 'http:',
+      hostname: url.hostname,
+      port: url.port || (secure ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      method: 'GET',
+      headers: {
+        ...options.headers,
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Key': randomBytes(16).toString('base64'),
+        'Sec-WebSocket-Version': '13',
+      },
+    });
+    let done = false;
+    const answer = (err: WebSocketHandshakeError) => {
+      if (done) return;
+      done = true;
+      req.destroy();
+      resolve(err);
+    };
+    const upgraded = () => answer(new WebSocketHandshakeError('the server accepted the upgrade only on a second try', null));
+    req.setTimeout(options.timeoutMs ?? 15_000, () => answer(new WebSocketHandshakeError('the handshake timed out', null, 'ETIMEDOUT')));
+    req.on('error', (err: NodeJS.ErrnoException) => answer(new WebSocketHandshakeError(err.message, null, err.code)));
+    req.on('upgrade', (_res, socket: Socket) => {
+      socket.destroy();
+      upgraded();
+    });
+    req.on('response', (res) => {
+      res.resume();
+      if (res.statusCode === 101) {
+        res.socket?.destroy();
+        upgraded();
+        return;
+      }
+      answer(new WebSocketHandshakeError(`server answered HTTP ${res.statusCode} instead of upgrading`, res.statusCode ?? null));
+    });
+    req.end();
+  });
+}
+
+/** The runtime's own WebSocket behind the same `WebSocketClient` shape. Exported for the tests. */
+export function connectNativeWebSocket(options: ConnectOptions, Native: NativeWebSocketCtor): Promise<WebSocketClient> {
+  return new Promise((resolve, reject) => {
+    let ws: NativeSocket;
+    try {
+      ws = new Native(options.url, { headers: options.headers });
+    } catch (err) {
+      reject(new WebSocketHandshakeError(err instanceof Error ? err.message : String(err), null));
+      return;
+    }
+
+    let opened = false;
+    let finished = false;
+    let closedBy: ClosedBy = 'network';
+    let closeCode = 1006;
+    let closeReason = 'connection lost';
+    let errorMessage: string | undefined;
+    let idleTimer: NodeJS.Timeout | undefined;
+    let pingTimer: NodeJS.Timeout | undefined;
+    let resolveClosed: (value: CloseInfo) => void = () => {};
+    const closed = new Promise<CloseInfo>((r) => {
+      resolveClosed = r;
+    });
+
+    /** Drop the connection without a close handshake, where the runtime can. */
+    const terminate = () => {
+      if (typeof ws.terminate === 'function') ws.terminate();
+      else ws.close();
+    };
+
+    const handshakeTimer = setTimeout(() => {
+      if (opened) return;
+      finished = true;
+      terminate();
+      reject(new WebSocketHandshakeError('the handshake timed out', null, 'ETIMEDOUT'));
+    }, options.timeoutMs ?? 15_000);
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(idleTimer);
+      clearInterval(pingTimer);
+      resolveClosed({ code: closeCode, reason: closeReason, closed_by: closedBy });
+    };
+    /** A close this process decided on. */
+    const closeLocally = (code: number, reason: string) => {
+      if (finished) return;
+      closedBy = 'local';
+      closeCode = code;
+      closeReason = reason;
+      try {
+        // 1006 cannot be sent on the wire; a dead link is simply dropped.
+        if (code === 1006) terminate();
+        else ws.close(code, reason);
+      } catch {
+        terminate();
+      }
+      // Do not wait for the server's close frame forever: a half-open connection is exactly what a
+      // shutdown must not hang on.
+      setTimeout(finish, 1000).unref();
+    };
+
+    const idleMs = options.idleTimeoutMs ?? 0;
+    const armIdle = () => {
+      if (idleMs <= 0 || finished) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => closeLocally(1006, 'no traffic from server'), idleMs);
+    };
+
+    ws.addEventListener('open', () => {
+      opened = true;
+      clearTimeout(handshakeTimer);
+      if (idleMs > 0) {
+        armIdle();
+        // Without `ping()` the server's own pings (which also reset the timer) carry the liveness.
+        if (typeof ws.ping === 'function') {
+          pingTimer = setInterval(() => {
+            try {
+              ws.ping?.();
+            } catch {
+              // A socket closing under us; its close event finishes the session.
+            }
+          }, Math.max(1, Math.floor(idleMs / 3)));
+        }
+      }
+      resolve({
+        send: (text: string) => {
+          if (!finished && ws.readyState === 1) ws.send(text);
+        },
+        close: (code = 1000, reason = '') => closeLocally(code, reason),
+        closed,
+      });
+    });
+
+    ws.addEventListener('message', (event) => {
+      armIdle();
+      // Binary frames are accepted and dropped, as in the hand-written client.
+      if (typeof event.data !== 'string') return;
+      if (Buffer.byteLength(event.data) > MAX_MESSAGE_BYTES) {
+        closeLocally(1009, 'message too large');
+        return;
+      }
+      try {
+        options.onMessage(event.data);
+      } catch (err) {
+        log.error('relay: a websocket message handler threw', {
+          event: 'relay.ws.handler_error', bytes: event.data.length, err, expected: false,
+        });
+      }
+    });
+    ws.addEventListener('ping', armIdle);
+    ws.addEventListener('pong', armIdle);
+
+    ws.addEventListener('error', (event) => {
+      errorMessage = event.message;
+    });
+
+    ws.addEventListener('close', (event) => {
+      if (!opened) {
+        if (finished) return;
+        finished = true;
+        clearTimeout(handshakeTimer);
+        void handshakeStatus(options).then(reject);
+        return;
+      }
+      if (closedBy !== 'local') {
+        closeCode = event.code ?? 1006;
+        closeReason = event.reason || (closeCode === 1006 && errorMessage ? `connection lost: ${errorMessage}` : event.reason ?? '');
+        // A close frame from the server arrives as a real code; an abnormal 1006 never crossed the
+        // wire and is the network dropping out from under us.
+        closedBy = closeCode === 1006 ? 'network' : 'remote';
+      }
+      finish();
+    });
+  });
+}
+
+function connectRawWebSocket(options: ConnectOptions): Promise<WebSocketClient> {
   return new Promise((resolve, reject) => {
     const url = new URL(options.url);
     const secure = url.protocol === 'wss:' || url.protocol === 'https:';

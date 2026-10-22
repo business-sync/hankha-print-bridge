@@ -137,13 +137,21 @@ export type PrintFailureReason =
   | 'cancelled';
 
 export type PrintOutcome =
-  | { ok: true; duration_ms: number }
+  | {
+      ok: true;
+      duration_ms: number;
+      /** Connections opened to get one accepted. Set only by a staggered send that needed more than one. */
+      connect_attempts?: number;
+      /** How long the accepted connection took to open. Set alongside `connect_attempts`. */
+      connected_after_ms?: number;
+    }
   | {
       ok: false;
       reason: PrintFailureReason;
       printed_certainty: PrintedCertainty;
       detail: string;
       duration_ms: number;
+      connect_attempts?: number;
     };
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
@@ -162,6 +170,12 @@ function connectTimeoutMs(): number {
 }
 
 /**
+ * The most connections a staggered send keeps unanswered at once. Each one is a SYN the printer
+ * may answer late; past a handful they only add load to a device that is still waking up.
+ */
+const MAX_PENDING_CONNECTS = 4;
+
+/**
  * The one thing a browser can't do itself: open a raw TCP socket to the printer's LAN IP and
  * write the raw ESC/POS bytes. Everything else (building the receipt, base64-encoding it) already
  * happens in the POS terminal — this is a pure forwarder.
@@ -175,29 +189,54 @@ function connectTimeoutMs(): number {
  * answering with status bytes therefore held a send open forever — and because a printer's lane
  * is sequential, every later job to it queued behind one that would never settle, until the
  * service was restarted.
+ *
+ * **Staggered connects** (`staggerMs`). A printer that has sat idle for a few minutes can take
+ * several seconds to answer again, and how it fails varies: sometimes a FRESH connection a moment
+ * later is accepted at once while the first is never answered, and sometimes only the OS's own
+ * SYN retransmit — about 3 s in on Windows — gets through (a venue's relay jobs connected after
+ * exactly 3020 ms on their retry). One short attempt after another covers the first case and
+ * cuts every attempt off before the retransmit fires; one long attempt covers only the second.
+ * So a staggered send opens another connection every `staggerMs` while the earlier ones are still
+ * unanswered, writes to whichever is accepted first, and destroys the rest before a byte is
+ * written to them. Nothing is ever written to more than one socket, and a socket that never
+ * connected never received anything, so every failure before the winner stays `none`.
+ *
+ * In that mode `connectLimitMs` is the whole connect window — it may be longer than the configured
+ * per-connection limit, which then bounds each connection on its own.
  */
 export function sendToPrinter(
   ip: string,
   port: number,
   payload: Buffer,
   timeoutMs: number,
-  /** A tighter connect limit for this one send. Never loosens the configured one. */
-  connectLimitMs?: number
+  /** A tighter connect limit for this one send. Never loosens the configured one, unless staggered. */
+  connectLimitMs?: number,
+  /** Open another connection this often while the earlier ones are unanswered. Off when unset. */
+  staggerMs?: number
 ): Promise<PrintOutcome> {
   return new Promise((resolve) => {
-    const socket = new Socket();
     const startedAt = Date.now();
+    const staggered = staggerMs !== undefined && staggerMs > 0;
+    const pending = new Set<Socket>();
     // The single fact that decides retry safety. Set inside the connect callback, so anything
     // that fails before it ran provably never reached the printer.
-    let connected = false;
+    let winner: Socket | null = null;
+    let opened = 0;
+    let lastError: { reason: PrintFailureReason; detail: string } | null = null;
     let settled = false;
     let deadline: NodeJS.Timeout | undefined;
+    let staggerTimer: NodeJS.Timeout | undefined;
+
+    const attempts = () => (opened > 1 ? { connect_attempts: opened } : {});
 
     const finish = (outcome: PrintOutcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
-      socket.destroy();
+      clearInterval(staggerTimer);
+      for (const socket of pending) socket.destroy();
+      pending.clear();
+      winner?.destroy();
       resolve(outcome);
     };
 
@@ -205,31 +244,84 @@ export function sendToPrinter(
       finish({
         ok: false,
         reason,
-        printed_certainty: connected ? 'unknown' : 'none',
+        printed_certainty: winner ? 'unknown' : 'none',
         detail,
         duration_ms: Date.now() - startedAt,
+        ...attempts(),
       });
 
-    const connectMs = Math.min(timeoutMs, connectTimeoutMs(), connectLimitMs ?? Number.POSITIVE_INFINITY);
-    deadline = setTimeout(() => fail('connect-timeout', `no connection after ${connectMs}ms`), connectMs);
-    socket.once('error', (err: NodeJS.ErrnoException) => {
-      const reason: PrintFailureReason =
-        err.code === 'ECONNREFUSED' ? 'connect-refused' : connected ? 'write-timeout' : 'unreachable';
-      fail(reason, err.code ? `${err.code} ${ip}:${port}` : err.message);
-    });
-    socket.connect(port, ip, () => {
-      connected = true;
-      clearTimeout(deadline);
-      deadline = setTimeout(
-        () => fail('write-timeout', `the printer had not taken the job after ${timeoutMs}ms`),
-        timeoutMs
-      );
-      socket.write(payload, (err) =>
-        err
-          ? fail('write-timeout', err.message)
-          : finish({ ok: true, duration_ms: Date.now() - startedAt })
-      );
-    });
+    const connectMs = staggered
+      ? Math.min(timeoutMs, connectLimitMs ?? connectTimeoutMs())
+      : Math.min(timeoutMs, connectTimeoutMs(), connectLimitMs ?? Number.POSITIVE_INFINITY);
+    const socketLimitMs = Math.min(connectMs, connectTimeoutMs());
+
+    /** One connection gave up before it was accepted. Alone, that is the send's failure. */
+    const drop = (socket: Socket, reason: PrintFailureReason, detail: string) => {
+      if (!pending.delete(socket)) return;
+      socket.destroy();
+      lastError = { reason, detail };
+      if (!staggered) fail(reason, detail);
+    };
+
+    const open = () => {
+      if (settled || winner || pending.size >= MAX_PENDING_CONNECTS) return;
+      const socket = new Socket();
+      opened += 1;
+      pending.add(socket);
+      const limit = staggered
+        ? setTimeout(() => drop(socket, 'connect-timeout', `no connection after ${socketLimitMs}ms`), socketLimitMs)
+        : undefined;
+
+      socket.once('error', (err: NodeJS.ErrnoException) => {
+        clearTimeout(limit);
+        const detail = err.code ? `${err.code} ${ip}:${port}` : err.message;
+        if (socket === winner) {
+          fail(err.code === 'ECONNREFUSED' ? 'connect-refused' : 'write-timeout', detail);
+          return;
+        }
+        drop(socket, err.code === 'ECONNREFUSED' ? 'connect-refused' : 'unreachable', detail);
+      });
+      socket.connect(port, ip, () => {
+        clearTimeout(limit);
+        if (settled || winner || !pending.delete(socket)) {
+          socket.destroy();
+          return;
+        }
+        winner = socket;
+        // The losers go BEFORE the write, so no byte can ever reach a second socket.
+        for (const other of pending) other.destroy();
+        pending.clear();
+        clearInterval(staggerTimer);
+        clearTimeout(deadline);
+        const connectedAfterMs = Date.now() - startedAt;
+        deadline = setTimeout(
+          () => fail('write-timeout', `the printer had not taken the job after ${timeoutMs}ms`),
+          timeoutMs
+        );
+        socket.write(payload, (err) =>
+          err
+            ? fail('write-timeout', err.message)
+            : finish({
+                ok: true,
+                duration_ms: Date.now() - startedAt,
+                ...(opened > 1 ? { connect_attempts: opened, connected_after_ms: connectedAfterMs } : {}),
+              })
+        );
+      });
+    };
+
+    deadline = setTimeout(() => {
+      if (pending.size > 0 || !lastError) {
+        fail(
+          'connect-timeout',
+          staggered ? `no connection after ${connectMs}ms (${opened} attempts)` : `no connection after ${connectMs}ms`
+        );
+      } else {
+        fail(lastError.reason, `${lastError.detail} (${opened} attempts in ${connectMs}ms)`);
+      }
+    }, connectMs);
+    open();
+    if (staggered) staggerTimer = setInterval(open, staggerMs);
   });
 }
 

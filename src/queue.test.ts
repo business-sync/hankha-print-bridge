@@ -271,6 +271,57 @@ describe('a caller waiting on the answer (retry window)', () => {
   });
 });
 
+describe('a caller waiting on the answer (connect window)', () => {
+  it("cuts a late attempt's connect limit to what is left of the window, and passes the stagger", async () => {
+    const seen: { connectTimeoutMs?: number; connectStaggerMs?: number }[] = [];
+    let release: () => void = () => {};
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async (_printer, _bytes, _timeoutMs, options) => {
+        seen.push({ ...options });
+        // The first job holds the lane, so the second starts late.
+        if (seen.length === 1) await new Promise<void>((r) => (release = r));
+        return ok();
+      },
+    });
+
+    const first = queue.submit({ source: 'relay', printer: printer('kitchen'), payload });
+    const second = queue.submit({
+      source: 'local', printer: printer('kitchen'), payload, persistent: false,
+      connect_window_ms: 1000, connect_stagger_ms: 300,
+    });
+    assert.equal(queue.isBusy('kitchen'), true);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    release();
+    await Promise.all([first.settled, second.settled]);
+
+    assert.deepEqual(seen[0], {});
+    const limit = seen[1]?.connectTimeoutMs ?? 0;
+    assert.ok(limit >= 250 && limit <= 450, `limit ${limit}`);
+    assert.equal(seen[1]?.connectStaggerMs, 300);
+    assert.equal(queue.isBusy('kitchen'), false);
+  });
+
+  it('never gives an attempt less than the minimum connect, even past the window', async () => {
+    const seen: (number | undefined)[] = [];
+    const queue = new PrintQueue({
+      dir: scratch(),
+      send: async (_printer, _bytes, _timeoutMs, options) => {
+        seen.push(options?.connectTimeoutMs);
+        return ok();
+      },
+    });
+    const job = queue.submit({ source: 'local', printer: printer('kitchen'), payload, persistent: false });
+    await job.settled;
+    // A window that already ended.
+    const late = queue.submit({ source: 'local', printer: printer('kitchen'), payload, persistent: false, connect_window_ms: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await late.settled;
+    assert.equal(seen[0], undefined);
+    assert.ok((seen[1] ?? 0) >= 250);
+  });
+});
+
 describe('expiry', () => {
   it('drops a job whose deadline passes while it waits in the lane', async () => {
     const printed: string[] = [];

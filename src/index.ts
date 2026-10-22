@@ -4,6 +4,7 @@ import { ENROLL_CODE_HINT, isValidEnrollCode, normalizeEnrollCode } from './enro
 import { registerStopper } from './lifecycle.js';
 import { log } from './log.js';
 import { diagIntervalMs, startDiagnostics } from './diagnostics.js';
+import { keepWarmMs, startKeepWarm } from './keepwarm.js';
 import { enroll, isRelayRejected, isRelayRunning, relayDiagnostics, relayStatus, startRelay } from './relay.js';
 import { createWatchdog, watchdogLimitMs } from './watchdog.js';
 import { startPairing } from './pairing.js';
@@ -69,6 +70,9 @@ Environment:
   PRINT_BRIDGE_MAX_ATTEMPTS     Retries per job, when nothing printed   (default 3)
   PRINT_BRIDGE_CONNECT_TIMEOUT_MS  Time a network printer gets to accept a connection
                                 (default 5000)
+  PRINT_BRIDGE_KEEPWARM_MS      Connect to each network printer this often, without printing,
+                                so it never falls asleep between tickets. 0 turns it off.
+                                (default 60000)
   PRINT_BRIDGE_SERVICE_CONTROL  on | off. 'off' removes the /service routes and the
                                 "This computer" card from the page.       (default on)
   PRINT_BRIDGE_MANAGED          What supervises this process, stamped by the installer:
@@ -235,6 +239,7 @@ function runService(): void {
     connect_timeout_ms: process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS?.trim() || undefined,
     sync_timeout_ms: process.env.PRINT_BRIDGE_SYNC_TIMEOUT_MS?.trim() || undefined,
     diag_interval_ms: diagIntervalMs(),
+    keepwarm_ms: keepWarmMs(),
     managed: process.env.PRINT_BRIDGE_MANAGED?.trim() || undefined,
     auth_required: Boolean(process.env.PRINT_BRIDGE_TOKEN?.trim()),
     tls: isTlsEnabled(),
@@ -262,6 +267,7 @@ function runService(): void {
 
   // Started once the port is ours, alongside the relay; stopped by `stop()`.
   let diagnostics: ReturnType<typeof startDiagnostics> | null = null;
+  let keepWarm: ReturnType<typeof startKeepWarm> | null = null;
 
   server.listen(PORT, HOST, () => {
     const scheme = isTlsEnabled() ? 'https' : 'http';
@@ -315,6 +321,7 @@ function runService(): void {
     startPairing();
 
     diagnostics = startDiagnostics();
+    keepWarm = startKeepWarm();
     log.info(`ready in ${Math.round(process.uptime() * 1000)}ms`, {
       event: 'app.ready', startup_ms: Math.round(process.uptime() * 1000),
     });
@@ -377,6 +384,7 @@ function runService(): void {
       queue_pending: queue().pending(),
     });
     diagnostics?.stop();
+    keepWarm?.stop();
 
     server.close();
     // Let the write already on the wire finish. Jobs still WAITING are left on disk on purpose:

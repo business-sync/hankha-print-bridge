@@ -100,6 +100,7 @@ Before 1.14.3 a revoked token wrote the same 401 line every 30 seconds.
 | `PRINT_BRIDGE_LOG_FORMAT` | `text` | `text` or `json` |
 | `PRINT_BRIDGE_DIAG_INTERVAL_MIN` | `15` | Minutes between `diag.snapshot` lines; fractions allowed; `0` turns them off. The lag sampler keeps running for `/status` |
 | `PRINT_BRIDGE_DIAG_LAG_WARN_MS` | `1000` | Event-loop stall that logs `diag.event_loop_lag` |
+| `PRINT_BRIDGE_KEEPWARM_MS` | `60000` | How often each network printer is probed (connect and close, nothing printed) so it never sleeps between tickets; `0` turns it off |
 | `PRINT_BRIDGE_ENV` | `k8s` in a pod, else `venue` | The `env` field in JSON logs |
 
 The relay, watchdog and queue settings (`PRINT_BRIDGE_HEARTBEAT_MS`, `_ACK_TIMEOUT_MS`,
@@ -221,8 +222,11 @@ The events most useful for a disconnect or a missing ticket. Levels are the defa
 | `queue.submit` | info | job_id, printer_id, source (`local` / `relay`), transport, address, bytes, copies, lane_depth |
 | `queue.attempt` | debug | job_id, attempt, wait_ms |
 | `queue.retry` | warn | job_id, reason, attempt, wait_ms |
-| `queue.done` | info | job_id, printer_id, source, duration_ms, attempts, total_ms |
-| `queue.failed` | error | job_id, reason, printed_certainty, detail, attempts, total_ms |
+| `queue.done` | info | job_id, printer_id, source, duration_ms, attempts, total_ms; connect_attempts and connected_after_ms when a staggered send needed more than one connection (a printer that was slow to wake) |
+| `queue.failed` | error | job_id, reason, printed_certainty, detail, attempts, connect_attempts, total_ms |
+| `printer.unreachable` / `printer.reachable` | warn / info | printer_id, address, detail; down_ms on recovery. From the keep-warm probe, once per transition |
+| `printer.slow` | info, gated | printer_id, address, latency_ms. The probe took over 1 s: the printer was asleep |
+| `printer.keepwarm` | debug | printers, skipped (lane busy), unreachable, max_latency_ms |
 | `queue.stalled` / `queue.expired` / `queue.cancelled` / `queue.duplicate` | error / warn / info / warn | job_id |
 | `print.sync.result` | debug (ok) or warn (failed) | route, status, job_id, printer_id, attempts, reason, printed_certainty, duration_ms |
 | `print.rejected` | info | route, status, reason, errors |

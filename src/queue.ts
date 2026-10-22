@@ -72,6 +72,14 @@ export interface JobRecord {
   retry_until?: string;
   /** Overrides the connect limit for this job's sends. See `SendOptions`. */
   connect_timeout_ms?: number;
+  /**
+   * The moment every connect for this job must have given up by — the caller's deadline less a
+   * margin. Each attempt's connect limit is cut to what is left of it, so an attempt that started
+   * late (behind another job in the lane, or as a retry) still ends while the caller is listening.
+   */
+  connect_until?: string;
+  /** Staggered connects for this job's sends. See `SendOptions.connectStaggerMs`. */
+  connect_stagger_ms?: number;
   /** False keeps the job out of the spool directory entirely. */
   persistent: boolean;
   /**
@@ -108,6 +116,9 @@ export interface SubmitInput {
   /** Sets `retry_until` this many ms from now. */
   retry_window_ms?: number;
   connect_timeout_ms?: number;
+  /** Sets `connect_until` this many ms from now. */
+  connect_window_ms?: number;
+  connect_stagger_ms?: number;
 }
 
 export interface Submission {
@@ -190,6 +201,22 @@ const DEFAULT_WATCHDOG_GRACE_MS = 10_000;
 function envInt(name: string, fallback: number, min: number, max: number): number {
   const raw = Number(process.env[name]);
   return Number.isInteger(raw) && raw >= min && raw <= max ? raw : fallback;
+}
+
+/** The shortest connect a job is ever given, even once its window has run out. */
+const MIN_CONNECT_MS = 250;
+
+function sendOptionsFor(job: JobRecord): SendOptions | undefined {
+  let limit = job.connect_timeout_ms;
+  if (job.connect_until) {
+    const left = Date.parse(job.connect_until) - Date.now();
+    limit = Math.max(MIN_CONNECT_MS, Math.min(limit ?? Number.POSITIVE_INFINITY, left));
+  }
+  if (limit === undefined && !job.connect_stagger_ms) return undefined;
+  return {
+    ...(limit !== undefined ? { connectTimeoutMs: limit } : {}),
+    ...(job.connect_stagger_ms ? { connectStaggerMs: job.connect_stagger_ms } : {}),
+  };
 }
 
 export class PrintQueue {
@@ -494,6 +521,10 @@ export class PrintQueue {
         ? { retry_until: new Date(now + input.retry_window_ms).toISOString() }
         : {}),
       ...(input.connect_timeout_ms ? { connect_timeout_ms: input.connect_timeout_ms } : {}),
+      ...(input.connect_window_ms && input.connect_window_ms > 0
+        ? { connect_until: new Date(now + input.connect_window_ms).toISOString() }
+        : {}),
+      ...(input.connect_stagger_ms ? { connect_stagger_ms: input.connect_stagger_ms } : {}),
     };
 
     this.active.set(jobId, job);
@@ -603,8 +634,7 @@ export class PrintQueue {
       }, limitMs);
     });
     try {
-      const sendOptions = job.connect_timeout_ms ? { connectTimeoutMs: job.connect_timeout_ms } : undefined;
-      return await Promise.race([this.sender(job.printer, payload, this.sendTimeoutMs, sendOptions), stalled]);
+      return await Promise.race([this.sender(job.printer, payload, this.sendTimeoutMs, sendOptionsFor(job)), stalled]);
     } finally {
       clearTimeout(timer);
     }
@@ -647,9 +677,14 @@ export class PrintQueue {
     if (outcome.ok) {
       job.status = 'done';
       job.result = { ok: true, duration_ms: outcome.duration_ms };
-      log.info(`queue: job ${job.job_id} printed on ${job.printer.id} in ${outcome.duration_ms}ms`, {
+      // The extra connections are the evidence of a printer that was slow to wake.
+      const woke = outcome.connect_attempts
+        ? ` (accepted connection ${outcome.connect_attempts} after ${outcome.connected_after_ms}ms)`
+        : '';
+      log.info(`queue: job ${job.job_id} printed on ${job.printer.id} in ${outcome.duration_ms}ms${woke}`, {
         event: 'queue.done', job_id: job.job_id, printer_id: job.printer.id, source: job.source,
         duration_ms: outcome.duration_ms, attempts: job.attempts, total_ms: Date.now() - Date.parse(job.created_at),
+        connect_attempts: outcome.connect_attempts, connected_after_ms: outcome.connected_after_ms,
       });
       this.finish(job);
       return true;
@@ -700,7 +735,7 @@ export class PrintQueue {
         {
           event: 'queue.failed', job_id: job.job_id, printer_id: job.printer.id, source: job.source,
           reason: outcome.reason, printed_certainty: certainty, detail: outcome.detail, attempts: job.attempts,
-          total_ms: Date.now() - Date.parse(job.created_at),
+          connect_attempts: outcome.connect_attempts, total_ms: Date.now() - Date.parse(job.created_at),
         }
       );
       this.finish(job);
@@ -785,6 +820,11 @@ export class PrintQueue {
   /** Jobs waiting or in flight, which is what "queue depth" means to an operator. */
   pending(): number {
     return this.active.size;
+  }
+
+  /** True while this printer's lane is sending or has jobs waiting. The keep-warm probe stays off it. */
+  isBusy(printerId: string): boolean {
+    return this.running.has(printerId) || (this.lanes.get(printerId)?.length ?? 0) > 0;
   }
 
   /**
