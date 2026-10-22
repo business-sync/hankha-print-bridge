@@ -122,6 +122,11 @@ function compile(target, outfile) {
   const flags = [
     'build',
     '--compile',
+    // A compiled Bun binary loads `.env` from whatever directory it is started in, by default.
+    // An installed bridge takes its settings from the plist or `bridge.env` only (see
+    // `src/env.ts`), so one started from a folder that happens to hold a `.env` — a dev checkout,
+    // someone's Downloads — must not quietly pick up a different host, log level or relay URL.
+    '--no-compile-autoload-dotenv',
     '--minify',
     ...DEFINE_VERSION,
     '--target',
