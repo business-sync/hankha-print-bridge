@@ -3,7 +3,8 @@ import { discoverAll } from './discovery.js';
 import { ENROLL_CODE_HINT, isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { registerStopper } from './lifecycle.js';
 import { log } from './log.js';
-import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay } from './relay.js';
+import { diagIntervalMs, startDiagnostics } from './diagnostics.js';
+import { enroll, isRelayRejected, isRelayRunning, relayDiagnostics, relayStatus, startRelay } from './relay.js';
 import { createWatchdog, watchdogLimitMs } from './watchdog.js';
 import { startPairing } from './pairing.js';
 import { queue } from './queue.js';
@@ -214,23 +215,53 @@ function runService(): void {
     process.exit(2);
   }
 
+  log.info(`starting ${BRIDGE_SERVICE} v${BRIDGE_VERSION}`, {
+    event: 'app.starting', version: BRIDGE_VERSION, pid: process.pid, platform: process.platform,
+    arch: process.arch,
+    runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`,
+  });
+  // The settings that shape connection and printing behaviour, as this process actually resolved
+  // them. Support otherwise has to guess what a venue's bridge.env said. Nothing secret: the
+  // token is reported only as whether one is set.
+  log.info('config: effective settings', {
+    event: 'app.config', host: HOST, port: PORT,
+    log_level: process.env.PRINT_BRIDGE_LOG_LEVEL?.trim() || 'info',
+    log_format: process.env.PRINT_BRIDGE_LOG_FORMAT?.trim() || 'text',
+    relay_transport: process.env.PRINT_BRIDGE_RELAY_TRANSPORT?.trim() || 'auto',
+    heartbeat_ms: process.env.PRINT_BRIDGE_HEARTBEAT_MS?.trim() || undefined,
+    ack_timeout_ms: process.env.PRINT_BRIDGE_ACK_TIMEOUT_MS?.trim() || undefined,
+    watchdog_ms: watchdogLimitMs(),
+    send_timeout_ms: process.env.PRINT_BRIDGE_SEND_TIMEOUT_MS?.trim() || undefined,
+    connect_timeout_ms: process.env.PRINT_BRIDGE_CONNECT_TIMEOUT_MS?.trim() || undefined,
+    sync_timeout_ms: process.env.PRINT_BRIDGE_SYNC_TIMEOUT_MS?.trim() || undefined,
+    diag_interval_ms: diagIntervalMs(),
+    managed: process.env.PRINT_BRIDGE_MANAGED?.trim() || undefined,
+    auth_required: Boolean(process.env.PRINT_BRIDGE_TOKEN?.trim()),
+    tls: isTlsEnabled(),
+  });
+
   const server = createBridgeServer();
 
   // Installed as a service, the only trace of a failed start is this line in the log file — so
   // say which address was refused rather than dumping a bare stack trace.
   server.on('error', (err: NodeJS.ErrnoException) => {
+    const fields = { event: 'server.listen_failed', host: HOST, port: PORT, err };
     if (err.code === 'EADDRINUSE') {
-      console.error(
+      log.error(
         `Port ${PORT} is already in use — another copy of the print bridge (or some other app) ` +
-          `is running. Stop it, or set PRINT_BRIDGE_PORT to a free port.`
+          `is running. Stop it, or set PRINT_BRIDGE_PORT to a free port.`,
+        fields
       );
     } else if (err.code === 'EADDRNOTAVAIL' || err.code === 'EACCES') {
-      console.error(`Cannot bind ${HOST}:${PORT} — ${err.code}. Check PRINT_BRIDGE_HOST.`);
+      log.error(`Cannot bind ${HOST}:${PORT} — ${err.code}. Check PRINT_BRIDGE_HOST.`, fields);
     } else {
-      console.error(`Print bridge failed to start: ${err.message}`);
+      log.error(`Print bridge failed to start: ${err.message}`, { ...fields, expected: false });
     }
     process.exit(1);
   });
+
+  // Started once the port is ours, alongside the relay; stopped by `stop()`.
+  let diagnostics: ReturnType<typeof startDiagnostics> | null = null;
 
   server.listen(PORT, HOST, () => {
     const scheme = isTlsEnabled() ? 'https' : 'http';
@@ -282,6 +313,11 @@ function runService(): void {
     // a credential already exists, so the two are safe to call unconditionally and in this order
     // — `startRelay` gets first refusal on an already-paired bridge.
     startPairing();
+
+    diagnostics = startDiagnostics();
+    log.info(`ready in ${Math.round(process.uptime() * 1000)}ms`, {
+      event: 'app.ready', startup_ms: Math.round(process.uptime() * 1000),
+    });
   });
 
   // Reads the spool back and resumes anything a previous run left behind, before the first request
@@ -302,12 +338,19 @@ function runService(): void {
    * loudly and keep taking print jobs rather than take the venue down over one bad frame.
    */
   process.on('unhandledRejection', (reason) => {
-    log.error(`unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`, {
-      event: 'process.unhandled_rejection',
+    log.error(`unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}`, {
+      event: 'process.unhandled_rejection', err: reason, expected: false,
     });
   });
   process.on('uncaughtException', (err) => {
-    log.error(`uncaught exception: ${err.stack ?? err.message}`, { event: 'process.uncaught_exception' });
+    log.error(`uncaught exception: ${err.message}`, { event: 'process.uncaught_exception', err, expected: false });
+  });
+  // The last line any process writes. Paired with `server.shutdown`, it tells a clean stop from a
+  // crash (no shutdown line) and a watchdog restart (exit 1) apart from a service stop (exit 0).
+  process.on('exit', (code) => {
+    log.info(`exiting with code ${code} after ${Math.round(process.uptime())}s`, {
+      event: 'process.exit', code, uptime_s: Math.round(process.uptime()),
+    });
   });
 
   /*
@@ -325,19 +368,41 @@ function runService(): void {
   const stop = (exitCode: number, why: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    log.info(`${BRIDGE_SERVICE} shutting down`, { event: 'server.shutdown', signal: why, exitCode });
+    // The relay is not closed here — the process exit ends it — so the server sees this as an
+    // abnormal close. Recording the session that was open is what lets the two logs be matched.
+    const relay = relayDiagnostics();
+    log.info(`${BRIDGE_SERVICE} shutting down`, {
+      event: 'server.shutdown', signal: why, exitCode, uptime_s: Math.round(process.uptime()),
+      relay_connected: relay.connected, connection_id: relay.connection_id ?? undefined,
+      queue_pending: queue().pending(),
+    });
+    diagnostics?.stop();
 
     server.close();
     // Let the write already on the wire finish. Jobs still WAITING are left on disk on purpose:
     // they resume next start, and printing a backlog during a restart is how a service bounce
     // turns into a paper jam.
+    const drainStartedAt = Date.now();
     void queue()
       .drain(DRAIN_TIMEOUT_MS)
-      .then(() => process.exit(exitCode))
-      .catch(() => process.exit(exitCode));
+      .then(() => {
+        log.info(`queue drained in ${Date.now() - drainStartedAt}ms`, {
+          event: 'server.drain', duration_ms: Date.now() - drainStartedAt, pending_left: queue().pending(),
+        });
+        process.exit(exitCode);
+      })
+      .catch((err: unknown) => {
+        log.error('draining the queue failed during shutdown', { event: 'server.drain_failed', err, expected: false });
+        process.exit(exitCode);
+      });
 
     // Backstop, in case a socket or an in-flight scan refuses to settle.
-    setTimeout(() => process.exit(exitCode), DRAIN_TIMEOUT_MS + 4000).unref();
+    setTimeout(() => {
+      log.warn(`shutdown did not finish within ${(DRAIN_TIMEOUT_MS + 4000) / 1000}s — forcing exit`, {
+        event: 'server.shutdown_timeout', timeout_ms: DRAIN_TIMEOUT_MS + 4000, pending_left: queue().pending(),
+      });
+      process.exit(exitCode);
+    }, DRAIN_TIMEOUT_MS + 4000).unref();
   };
 
   registerStopper((exitCode) => stop(exitCode, 'service-request'));

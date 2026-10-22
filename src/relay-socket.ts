@@ -20,6 +20,7 @@ import { request as httpsRequest } from 'node:https';
 // not a bare Duplex — which is what makes setNoDelay available, and it matters: without it Nagle
 // delays a small job frame by up to 40 ms behind the previous write.
 import type { Socket } from 'node:net';
+import { log } from './log.js';
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -33,11 +34,31 @@ const OP_PONG = 0xa;
 /** Refuse a frame large enough to be an attack rather than a print job. */
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 
+/**
+ * Who ended a connection. The first question anyone asks about a dropped feed, and the one a
+ * close code alone cannot answer — 1006 is both "we gave up on a silent link" and "the network
+ * died under us".
+ *
+ *  - `local`: this process closed it (idle timeout, ack timeout, a frame it refused, shutdown).
+ *  - `remote`: the server sent a close frame.
+ *  - `network`: the TCP connection ended or errored with no close frame — a reset, a dropped
+ *    route, a proxy cutting it.
+ */
+export type ClosedBy = 'local' | 'remote' | 'network';
+
+export interface CloseInfo {
+  code: number;
+  reason: string;
+  closed_by: ClosedBy;
+  /** The socket error behind a `network` close (ECONNRESET, ETIMEDOUT…), when there was one. */
+  error_code?: string;
+}
+
 export interface WebSocketClient {
   send(text: string): void;
   close(code?: number, reason?: string): void;
   /** Resolves once the connection is fully closed, for whatever reason. Never rejects. */
-  readonly closed: Promise<{ code: number; reason: string }>;
+  readonly closed: Promise<CloseInfo>;
 }
 
 /**
@@ -49,10 +70,13 @@ export interface WebSocketClient {
  */
 export class WebSocketHandshakeError extends Error {
   readonly status: number | null;
-  constructor(message: string, status: number | null) {
+  /** The socket error code when the handshake never got an HTTP answer at all. */
+  readonly code: string | undefined;
+  constructor(message: string, status: number | null, code?: string) {
     super(message);
     this.name = 'WebSocketHandshakeError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -172,8 +196,8 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
       reject(err);
     };
 
-    req.setTimeout(timeoutMs, () => fail(new WebSocketHandshakeError('the handshake timed out', null)));
-    req.on('error', (err) => fail(new WebSocketHandshakeError(err.message, null)));
+    req.setTimeout(timeoutMs, () => fail(new WebSocketHandshakeError('the handshake timed out', null, 'ETIMEDOUT')));
+    req.on('error', (err: NodeJS.ErrnoException) => fail(new WebSocketHandshakeError(err.message, null, err.code)));
 
     // An ordinary response means the server declined to upgrade. 404 and 426 are the two that mean
     // "this endpoint does not exist", which the relay remembers rather than retrying.
@@ -199,12 +223,14 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
       let fragmentOpcode = 0;
       let closeCode = 1006;
       let closeReason = 'connection lost';
+      let closedBy: ClosedBy = 'network';
+      let errorCode: string | undefined;
       let finished = false;
       let idleTimer: NodeJS.Timeout | undefined;
       let pingTimer: NodeJS.Timeout | undefined;
 
-      let resolveClosed: (value: { code: number; reason: string }) => void = () => {};
-      const closed = new Promise<{ code: number; reason: string }>((r) => {
+      let resolveClosed: (value: CloseInfo) => void = () => {};
+      const closed = new Promise<CloseInfo>((r) => {
         resolveClosed = r;
       });
 
@@ -214,7 +240,19 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
         clearTimeout(idleTimer);
         clearInterval(pingTimer);
         socket.destroy();
-        resolveClosed({ code: closeCode, reason: closeReason });
+        resolveClosed({
+          code: closeCode,
+          reason: closeReason,
+          closed_by: closedBy,
+          ...(errorCode ? { error_code: errorCode } : {}),
+        });
+      };
+      /** A close this process decided on. */
+      const closeLocally = (code: number, reason: string) => {
+        closeCode = code;
+        closeReason = reason;
+        closedBy = 'local';
+        finish();
       };
 
       const write = (opcode: number, payload: Buffer) => {
@@ -233,9 +271,7 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
        */
       const drain = () => {
         if (buffer.length > MAX_MESSAGE_BYTES) {
-          closeCode = 1009;
-          closeReason = 'message too large';
-          finish();
+          closeLocally(1009, 'message too large');
           return;
         }
 
@@ -244,9 +280,7 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
           try {
             frame = parseFrame(buffer);
           } catch (err) {
-            closeCode = 1002;
-            closeReason = err instanceof Error ? err.message : 'protocol error';
-            finish();
+            closeLocally(1002, err instanceof Error ? err.message : 'protocol error');
             return;
           }
           if (!frame) return;
@@ -263,8 +297,12 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
               break;
 
             case OP_CLOSE: {
-              closeCode = frame.payload.length >= 2 ? frame.payload.readUInt16BE(0) : 1005;
-              closeReason = frame.payload.subarray(2).toString('utf8');
+              // Our own close() also ends here when the server echoes it; that stays local.
+              if (closedBy !== 'local') {
+                closeCode = frame.payload.length >= 2 ? frame.payload.readUInt16BE(0) : 1005;
+                closeReason = frame.payload.subarray(2).toString('utf8');
+                closedBy = 'remote';
+              }
               write(OP_CLOSE, frame.payload.subarray(0, 2));
               finish();
               return;
@@ -287,17 +325,19 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
               if (fragmentOpcode === OP_TEXT) {
                 try {
                   options.onMessage(message.toString('utf8'));
-                } catch {
-                  /* a bad message must not take the connection down */
+                } catch (err) {
+                  // A bad message must not take the connection down — but a handler that throws
+                  // is a bug, and it used to vanish without a trace.
+                  log.error('relay: a websocket message handler threw', {
+                    event: 'relay.ws.handler_error', bytes: message.length, err, expected: false,
+                  });
                 }
               }
               break;
             }
 
             default:
-              closeCode = 1002;
-              closeReason = `unknown opcode ${frame.opcode}`;
-              finish();
+              closeLocally(1002, `unknown opcode ${frame.opcode}`);
               return;
           }
         }
@@ -307,11 +347,7 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
       const armIdle = () => {
         if (idleMs <= 0 || finished) return;
         clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-          closeCode = 1006;
-          closeReason = 'no traffic from server';
-          finish();
-        }, idleMs);
+        idleTimer = setTimeout(() => closeLocally(1006, 'no traffic from server'), idleMs);
       };
       if (idleMs > 0) {
         armIdle();
@@ -324,7 +360,15 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
         drain();
       });
 
-      socket.on('error', () => finish());
+      socket.on('error', (err: NodeJS.ErrnoException) => {
+        // Keep what actually happened. This used to be dropped, and every reset, timeout and
+        // unreachable network was reported as the same `1006 connection lost`.
+        if (!finished && closedBy === 'network') {
+          errorCode = err.code;
+          closeReason = `connection lost${err.code ? `: ${err.code}` : ''}`;
+        }
+        finish();
+      });
       socket.on('close', () => finish());
       socket.on('end', () => finish());
 
@@ -337,6 +381,7 @@ export function connectWebSocket(options: ConnectOptions): Promise<WebSocketClie
           write(OP_CLOSE, payload);
           closeCode = code;
           closeReason = reason;
+          closedBy = 'local';
           // Do not wait for the server's close frame forever: a half-open connection is exactly
           // what a shutdown must not hang on.
           setTimeout(finish, 1000).unref();

@@ -310,7 +310,8 @@ export const spoolerTransport: Transport = {
             queue: row.Name,
             detail: [row.DriverName, row.PortName].filter(Boolean).join(' · ') || undefined,
           }));
-      } catch {
+      } catch (err) {
+        log.debug('spooler: could not read the Windows printer list', { event: 'spooler.discover_failed', err });
         return [];
       }
     }

@@ -15,6 +15,7 @@ import { discoverAll, transportAvailability } from './discovery.js';
 import { isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
 import { prepare, targetFrom, type JobRequest } from './jobs.js';
 import { log } from './log.js';
+import { collectSnapshot } from './diagnostics.js';
 import { INDEX_CSP, INDEX_HTML } from './page.js';
 import {
   beginAction,
@@ -38,7 +39,7 @@ import {
   type ActionOutcome,
   type UninstallScope,
 } from './service-actions.js';
-import { describeJob, isSafeJobId, queue } from './queue.js';
+import { describeJob, isSafeJobId, queue, type JobRecord } from './queue.js';
 import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
 import { loadState, stateDir, statePath } from './identity.js';
 import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay, wakeRelay } from './relay.js';
@@ -136,11 +137,15 @@ function readJsonBody(req: IncomingMessage): Promise<BodyOutcome> {
       }
       try {
         finish({ ok: true, value: JSON.parse(raw) });
-      } catch {
+      } catch (err) {
+        log.warn(`request body is not valid JSON (${size} bytes)`, { event: 'http.bad_body', bytes: size, err });
         finish({ ok: false, reason: 'invalid-json' });
       }
     });
-    req.on('error', () => finish({ ok: false, reason: 'invalid-json' }));
+    req.on('error', (err) => {
+      log.warn('request body could not be read', { event: 'http.body_error', err });
+      finish({ ok: false, reason: 'invalid-json' });
+    });
   });
 }
 
@@ -244,7 +249,7 @@ function isLoopbackRequest(req: IncomingMessage): boolean {
 function runRoute(res: ServerResponse, body: () => Promise<void>): void {
   void body().catch((err: unknown) => {
     const detail = err instanceof Error ? err.message : String(err);
-    log.error(`request failed: ${detail}`, { event: 'request.failed' });
+    log.error(`request failed: ${detail}`, { event: 'request.failed', err, expected: false });
     if (res.headersSent) {
       res.end();
       return;
@@ -383,15 +388,65 @@ async function handleEnroll(res: ServerResponse, record: Record<string, unknown>
     // The API answers every enrolment failure identically on purpose. Pass its sentence straight
     // through rather than inventing a more specific one this side cannot actually justify.
     const message = err instanceof Error ? err.message : 'Enrollment failed.';
-    log.warn(`enrolment from the local page failed: ${message}`, { event: 'relay.enroll_failed' });
+    log.warn(`enrolment from the local page failed: ${message}`, { event: 'relay.enroll_failed', err });
     sendJson(res, 502, { ok: false, reason: 'enroll-failed', message });
   }
 }
 
+/** What a print route knows about its job by the time it answers. Filled in as it goes. */
+interface PrintAnswerContext {
+  job_id?: string;
+  printer_id?: string;
+  job?: JobRecord;
+}
+
+/**
+ * `sendJson`, plus one line saying how a print request ended.
+ *
+ * These routes answered the POS and logged nothing of their own, so a ticket the POS reported as
+ * failed could only be matched up through the queue's lines — and a request refused before it
+ * reached the queue (a bad body, an unknown printer) left no trace at all.
+ *
+ * Successes are debug: the queue already logs every print, and a busy venue does not need two
+ * lines per ticket. Refusals are info, failures warn.
+ */
+function printResponder(res: ServerResponse, route: string, ctx: PrintAnswerContext) {
+  const startedAt = Date.now();
+  return (status: number, payload: Record<string, unknown>): void => {
+    const job = ctx.job;
+    const fields = {
+      route, status,
+      job_id: job?.job_id ?? ctx.job_id,
+      printer_id: job?.printer.id ?? ctx.printer_id,
+      attempts: job?.attempts,
+      reason: payload.reason,
+      printed_certainty: payload.printed_certainty,
+      deduplicated: payload.deduplicated,
+      duration_ms: Date.now() - startedAt,
+    };
+    if (status >= 400 && status < 500) {
+      log.info(`print: ${route} refused (${String(payload.reason)})`, {
+        event: 'print.rejected', ...fields, errors: payload.errors,
+      });
+    } else if (status >= 500) {
+      log.warn(`print: ${route} failed — ${String(payload.reason)}${fields.job_id ? ` (job ${fields.job_id})` : ''}`, {
+        event: route === '/printers/:id/test' ? 'print.test.result' : 'print.sync.result', ...fields,
+      });
+    } else {
+      log.debug(`print: ${route} answered ${status}`, {
+        event: route === '/printers/:id/test' ? 'print.test.result' : 'print.sync.result', ...fields,
+      });
+    }
+    sendJson(res, status, payload);
+  };
+}
+
 async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<void> {
+  const ctx: PrintAnswerContext = {};
+  const answer = printResponder(res, '/print', ctx);
   const raw = (body ?? {}) as Record<string, unknown>;
   if (typeof raw.payload_base64 !== 'string') {
-    sendJson(res, 400, { ok: false, reason: 'invalid-body' });
+    answer(400, { ok: false, reason: 'invalid-body' });
     return;
   }
 
@@ -407,7 +462,7 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
    */
   const printerId = typeof raw.printer_id === 'string' ? raw.printer_id.trim() : '';
   if (!printerId && (!isDialableTarget(raw.ip) || !isValidPort(raw.port))) {
-    sendJson(res, 400, { ok: false, reason: 'invalid-body' });
+    answer(400, { ok: false, reason: 'invalid-body' });
     return;
   }
 
@@ -426,8 +481,9 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
    * a client typo is a plain 400 instead of a 500.
    */
   const jobId = typeof raw.job_id === 'string' ? raw.job_id.trim() : '';
+  if (jobId) ctx.job_id = jobId;
   if (jobId && !isSafeJobId(jobId)) {
-    sendJson(res, 400, { ok: false, reason: 'invalid-job-id' });
+    answer(400, { ok: false, reason: 'invalid-job-id' });
     return;
   }
 
@@ -437,13 +493,14 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
       : { target: { ip: raw.ip as string, port: raw.port as number }, payload_base64: raw.payload_base64 }
   );
   if (!prepared.ok) {
-    sendJson(res, prepared.status === 413 ? 413 : 400, { ok: false, reason: prepared.reason, errors: prepared.errors });
+    answer(prepared.status === 413 ? 413 : 400, { ok: false, reason: prepared.reason, errors: prepared.errors });
     return;
   }
 
   // Not persisted, and retried only while this caller is still waiting: it holds a socket open
   // and owns the retry policy beyond that. Spooling it would mean a job the client already gave
   // up on printing later anyway.
+  ctx.printer_id = prepared.printer.id;
   const submission = queue().submit({
     ...(jobId ? { job_id: jobId } : {}),
     source: 'local', printer: prepared.printer, payload: prepared.payload,
@@ -452,6 +509,7 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
     retry_window_ms: SYNC_RETRY_WINDOW_MS,
     connect_timeout_ms: SYNC_CONNECT_TIMEOUT_MS,
   });
+  ctx.job = submission.job;
 
   // A replay: this id has printed (or provably failed) before. Answer with the FIRST outcome and
   // print nothing. Returning the recorded result rather than a fresh `{ok:true}` matters — a
@@ -459,9 +517,9 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
   if (submission.deduplicated && submission.job.result) {
     const prior = submission.job.result;
     if (prior.ok) {
-      sendJson(res, 200, { ok: true, deduplicated: true });
+      answer(200, { ok: true, deduplicated: true });
     } else {
-      sendJson(res, 502, {
+      answer(502, {
         ok: false,
         reason: prior.reason === 'connect-timeout' ? 'timeout' : prior.reason,
         printed_certainty: prior.printed_certainty,
@@ -484,7 +542,7 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
     // Cancel tells us whether it ever started. That is the difference between an honest "nothing
     // printed" and a claim that could hand the customer a second receipt on the client's retry.
     const neverStarted = queue().cancel(submission.job.job_id);
-    sendJson(res, 502, {
+    answer(502, {
       ok: false,
       reason: 'timeout',
       printed_certainty: neverStarted ? 'none' : 'unknown',
@@ -496,13 +554,13 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
   }
 
   if (outcome.result?.ok) {
-    sendJson(res, 200, { ok: true });
+    answer(200, { ok: true });
     return;
   }
 
   // `timeout` is kept as an alias for the connect case so terminals older than 1.3 keep
   // reading the reason they were written against; the richer classification is additive.
-  sendJson(res, 502, {
+  answer(502, {
     ok: false,
     reason: outcome.result?.reason === 'connect-timeout' ? 'timeout' : outcome.result?.reason,
     printed_certainty: outcome.result?.printed_certainty,
@@ -512,6 +570,8 @@ async function handleLegacyPrint(res: ServerResponse, body: unknown): Promise<vo
 
 async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void> {
   const raw = (body ?? {}) as Record<string, unknown>;
+  const ctx: PrintAnswerContext = { job_id: typeof raw.job_id === 'string' ? raw.job_id : undefined };
+  const answer = printResponder(res, '/jobs', ctx);
 
   // `target` accepts the same `{ip, port}` the legacy route takes, so a client can move to /jobs
   // without also having to learn the registry.
@@ -519,7 +579,7 @@ async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void
   if (raw.target !== undefined) {
     const parsed = targetFrom((raw.target as Record<string, unknown>)?.ip, (raw.target as Record<string, unknown>)?.port);
     if (!parsed) {
-      sendJson(res, 400, { ok: false, reason: 'invalid-body', errors: ['target must be { ip, port? } with a private IPv4 address'] });
+      answer(400, { ok: false, reason: 'invalid-body', errors: ['target must be { ip, port? } with a private IPv4 address'] });
       return;
     }
     target = parsed;
@@ -528,7 +588,7 @@ async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void
   // Checked here so the caller gets a plain 400 naming the field, rather than the queue's throw.
   // The id ends up as a spool filename, which is why it is constrained at all.
   if (typeof raw.job_id === 'string' && raw.job_id.trim() && !isSafeJobId(raw.job_id.trim())) {
-    sendJson(res, 400, {
+    answer(400, {
       ok: false,
       reason: 'invalid-body',
       errors: ['job_id may contain only letters, digits, dot, dash and underscore, and cannot start with a dot'],
@@ -549,7 +609,7 @@ async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void
 
   const prepared = prepare(request);
   if (!prepared.ok) {
-    sendJson(res, prepared.status, { ok: false, reason: prepared.reason, errors: prepared.errors });
+    answer(prepared.status, { ok: false, reason: prepared.reason, errors: prepared.errors });
     return;
   }
 
@@ -572,9 +632,11 @@ async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void
 }
 
 async function handleTestPrint(res: ServerResponse, printerId: string): Promise<void> {
+  const ctx: PrintAnswerContext = { printer_id: printerId };
+  const answer = printResponder(res, '/printers/:id/test', ctx);
   const printer = findPrinter(loadRegistry(), printerId);
   if (!printer) {
-    sendJson(res, 404, { ok: false, reason: 'unknown-printer' });
+    answer(404, { ok: false, reason: 'unknown-printer' });
     return;
   }
 
@@ -583,7 +645,7 @@ async function handleTestPrint(res: ServerResponse, printerId: string): Promise<
   try {
     payload = render(document, printer);
   } catch (err) {
-    sendJson(res, 422, {
+    answer(422, {
       ok: false,
       reason: 'render-failed',
       errors: err instanceof Error && 'errors' in err ? (err as { errors: string[] }).errors : [String(err)],
@@ -602,6 +664,7 @@ async function handleTestPrint(res: ServerResponse, printerId: string): Promise<
    * cancels afterwards so the answer about whether anything printed is an honest one.
    */
   const submission = queue().submit({ source: 'local', printer, payload, ttl_s: TEST_PRINT_TIMEOUT_MS / 1000 });
+  ctx.job = submission.job;
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<'timeout'>((resolve) => {
     timer = setTimeout(() => resolve('timeout'), TEST_PRINT_TIMEOUT_MS);
@@ -612,7 +675,7 @@ async function handleTestPrint(res: ServerResponse, printerId: string): Promise<
 
   if (outcome === 'timeout') {
     const neverStarted = queue().cancel(submission.job.job_id);
-    sendJson(res, 502, {
+    answer(502, {
       ok: false,
       reason: 'timeout',
       job: describeJob(queue().get(submission.job.job_id) ?? submission.job),
@@ -624,7 +687,7 @@ async function handleTestPrint(res: ServerResponse, printerId: string): Promise<
     return;
   }
 
-  sendJson(res, outcome.result?.ok ? 200 : 502, { ok: outcome.result?.ok === true, job: describeJob(outcome) });
+  answer(outcome.result?.ok ? 200 : 502, { ok: outcome.result?.ok === true, job: describeJob(outcome) });
 }
 
 /**
@@ -771,9 +834,31 @@ function uninstallScope(value: unknown): UninstallScope | null {
 
 /* ------------------------------------------------------------------------------ the server */
 
+/**
+ * One debug line per request: method, path (never the query), status and time taken.
+ *
+ * Off at the default level, so it costs a venue nothing until someone turns debug on to find out
+ * what the POS is actually sending. `/health` and `/status` are left out: the POS and the status
+ * page poll them every few seconds, and they would drown everything else.
+ */
+function accessLog(req: IncomingMessage, res: ServerResponse): void {
+  const path = (req.url ?? '/').split('?')[0] ?? '/';
+  if (req.method === 'GET' && (path === '/health' || path === '/status')) return;
+  const startedAt = Date.now();
+  res.once('finish', () => {
+    const remote = req.socket.remoteAddress ?? '';
+    log.debug(`http: ${req.method} ${path} ${res.statusCode} in ${Date.now() - startedAt}ms`, {
+      event: 'http.request', method: req.method, path, status: res.statusCode,
+      duration_ms: Date.now() - startedAt,
+      remote: /^(::1|127\.|::ffff:127\.)/.test(remote) ? 'loopback' : 'lan',
+    });
+  });
+}
+
 export function createBridgeServer(): Server {
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     withCors(res);
+    accessLog(req, res);
 
     /*
      * `req.url` is a request target — always a path — but `new URL(target, base)` does not know
@@ -1015,6 +1100,9 @@ export function createBridgeServer(): Server {
           registry_path: registryPath(),
           printers: await printerStatuses(url.searchParams.get('probe') === '1'),
           queue: { pending: queue().pending(), ...queue().depth() },
+          // Memory, loop lag, relay timings and stalled timers, as the periodic `diag.snapshot`
+          // log line reports them — readable here without anyone opening the log file.
+          diagnostics: collectSnapshot(),
         });
       });
       return;

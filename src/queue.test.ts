@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import type { PrintOutcome } from './lan.js';
+import { type LogRecord, setLogSink } from './log.js';
 import { PrintQueue, type JobRecord } from './queue.js';
 import type { PrinterRecord } from './registry.js';
 
@@ -737,5 +738,30 @@ describe('idempotency for the synchronous /print path', () => {
     assert.equal(again.deduplicated, true);
     await again.settled;
     assert.equal(sends, after);
+  });
+});
+
+describe('queue logging', () => {
+  it('says where a job came from and how long it took end to end', async () => {
+    const records: LogRecord[] = [];
+    const previous = process.env.PRINT_BRIDGE_LOG_LEVEL;
+    process.env.PRINT_BRIDGE_LOG_LEVEL = 'debug';
+    const restore = setLogSink((r) => records.push(r));
+    try {
+      const queue = new PrintQueue({ dir: scratch(), send: async () => ok() });
+      await queue.submit({ job_id: 'logged-1', source: 'relay', printer: printer('kitchen'), payload }).settled;
+      const submit = records.find((r) => r.event === 'queue.submit');
+      const attempt = records.find((r) => r.event === 'queue.attempt');
+      const done = records.find((r) => r.event === 'queue.done');
+      assert.equal(submit?.fields.source, 'relay');
+      assert.equal(submit?.fields.address, '192.168.1.50:9100');
+      assert.equal(attempt?.fields.attempt, 1);
+      assert.equal(done?.fields.source, 'relay');
+      assert.equal(typeof done?.fields.total_ms, 'number');
+    } finally {
+      restore();
+      if (previous === undefined) delete process.env.PRINT_BRIDGE_LOG_LEVEL;
+      else process.env.PRINT_BRIDGE_LOG_LEVEL = previous;
+    }
   });
 });

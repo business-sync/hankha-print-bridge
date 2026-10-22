@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 import { isPrivateIpv4 } from './lan.js';
 import { stateDir } from './identity.js';
+import { log } from './log.js';
 
 export type TransportKind = 'network' | 'usb' | 'serial';
 export type PrinterType = 'receipt' | 'label';
@@ -310,11 +311,13 @@ export function loadRegistry(): Registry {
     cached = registry;
     if (errors.length > 0) {
       // Surfaced through /status too; logging here is what an operator sees at startup.
-      for (const error of errors) process.stderr.write(`printers.json: ${error}\n`);
+      for (const error of errors) log.warn(`printers.json: ${error}`, { event: 'registry.invalid_entry', path, detail: error });
     }
     return cached;
   } catch (err) {
-    process.stderr.write(`printers.json is unreadable (${err instanceof Error ? err.message : String(err)}) — starting with no printers\n`);
+    log.error(`printers.json is unreadable (${err instanceof Error ? err.message : String(err)}) — starting with no printers`, {
+      event: 'registry.unreadable', path, err,
+    });
     cached = { ...EMPTY_REGISTRY, printers: [] };
     return cached;
   }
