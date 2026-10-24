@@ -49,11 +49,29 @@ jobs:
           git --version
           git config user.name "robot"
           git config user.email "root@hankh.com"
+      # The bump is rebuilt on the current tip of main, never rebased onto it. The checkout is this
+      # run's push SHA, and when two pushes land close together the other run's bump commit is
+      # already on main by the time this job runs. Both bumps rewrite the same `image:` line, so
+      # `git pull --rebase` conflicts every time. Resetting to origin/main and re-applying the sed
+      # can't conflict, and a rejected push (main moved again) just goes round the loop.
       - name: change image tag to deploy prod
         run: |
-          sed "s|image: ghcr\.io/business-sync/hankha-print-bridge:[^ ]*|image: ghcr.io/business-sync/hankha-print-bridge:${GITHUB_SHA}|" k8s/prod/deployment.yaml > tmp_deployment.yaml
-          mv tmp_deployment.yaml k8s/prod/deployment.yaml
-          git add k8s/prod/deployment.yaml
-          git commit -m "[skip actions] 🤖 change prod docker image version to ${GITHUB_SHA}"
-          git pull origin main --rebase
-          git push
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            sed "s|image: ghcr\.io/business-sync/hankha-print-bridge:[^ ]*|image: ghcr.io/business-sync/hankha-print-bridge:${GITHUB_SHA}|" k8s/prod/deployment.yaml > tmp_deployment.yaml
+            mv tmp_deployment.yaml k8s/prod/deployment.yaml
+            git add k8s/prod/deployment.yaml
+            if git diff --cached --quiet; then
+              echo "prod manifest already at ${GITHUB_SHA}"
+              exit 0
+            fi
+            git commit -m "[skip actions] 🤖 change prod docker image version to ${GITHUB_SHA}"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push rejected on attempt ${attempt} (main moved), retrying"
+            sleep $((attempt * 5))
+          done
+          echo "could not push the prod image bump after 5 attempts"
+          exit 1
