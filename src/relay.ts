@@ -47,8 +47,12 @@ function envMs(name: string, fallback: number): number {
  * does not. Retrying every 30 seconds against a backend that will never answer is pure noise in
  * both logs, so it is asked again only twice an hour — often enough to pick up a deploy, rare
  * enough to be invisible.
+ *
+ * The same window covers an upgrade that something in FRONT of the API refuses — a 401 on the
+ * handshake that the API itself contradicts over plain HTTP (see `probeToken`). Overridable only
+ * so the tests can run the window in seconds rather than minutes.
  */
-const WS_UNSUPPORTED_RETRY_MS = 30 * 60_000;
+const WS_UNSUPPORTED_RETRY_MS = envMs('PRINT_BRIDGE_WS_RETRY_MS', 30 * 60_000);
 
 /**
  * A floor under every websocket reconnect, including the ones we consider clean.
@@ -579,7 +583,45 @@ let serverAcks = false;
 /** Duration of the last websocket session, read by the loop to tell a flap from a clean session. */
 let lastSessionMs = Number.POSITIVE_INFINITY;
 
-type SessionOutcome = 'served' | 'unsupported' | 'revoked' | 'error';
+/**
+ * `refused`: the handshake was answered 401 but the API accepts the token over plain HTTP, so it
+ * was something in front of the API that refused the upgrade. Handled like `unsupported` — the
+ * long-poll carries the work and the socket is tried again after the window — but logged for
+ * what it is, because the fix is on a network, not in a deploy.
+ */
+type SessionOutcome = 'served' | 'unsupported' | 'refused' | 'revoked' | 'error';
+/** The heartbeat status behind the last `refused` outcome, for the line the loop writes about it. */
+let lastRefusalProbe: number | null = null;
+
+/**
+ * Ask the API itself whether this token is still good, over plain HTTP.
+ *
+ * A 401 on the websocket handshake used to mean "revoked" on its own, and that was wrong in the
+ * one way that matters: an edge, a proxy or a WAF that refuses upgrades but passes ordinary
+ * requests answers the handshake 401 too, and the loop then sat out the rejection backoff with
+ * the long-poll — which was working the whole time — never tried. A venue stopped printing over
+ * a proxy setting. So the handshake's 401 is believed only when the API says the same thing to a
+ * heartbeat: the cheapest authenticated call there is, behind the same guard as every bridge
+ * route, with no side effect beyond `last_seen_at`. (`/work?wait=0` would do as well, but a 200
+ * from it is a claimed job that would then have to be handled.)
+ *
+ * Resolves with the heartbeat's status, or null when no answer came back at all.
+ */
+async function probeToken(base: string, token: string): Promise<number | null> {
+  const startedAt = Date.now();
+  try {
+    const code = await heartbeat(base, token);
+    log.debug(`relay: websocket handshake answered 401 — the API answers a heartbeat with ${code}`, {
+      event: 'relay.ws.auth_probe', status: code, duration_ms: Date.now() - startedAt,
+    });
+    return code;
+  } catch (err) {
+    log.debug(`relay: websocket handshake answered 401 — the heartbeat that would confirm it failed (${describeError(err)})`, {
+      event: 'relay.ws.auth_probe', err, duration_ms: Date.now() - startedAt,
+    });
+    return null;
+  }
+}
 
 /**
  * One WebSocket session, from handshake to close.
@@ -653,9 +695,19 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
     });
   } catch (err) {
     if (err instanceof WebSocketHandshakeError) {
-      // Only 401 is the API saying "this token is not valid". A 403 comes from something in front
-      // of it (proxy, WAF, captive portal) and says nothing about the credential.
-      if (err.status === 401) return 'revoked';
+      // Only 401 is the API saying "this token is not valid" — and even that is checked, because
+      // an edge that refuses upgrades answers 401 too (see `probeToken`). A 403 comes from
+      // something in front of the API (proxy, WAF, captive portal) and says nothing about the
+      // credential.
+      if (err.status === 401) {
+        const probe = await probeToken(base, token);
+        if (probe === 401) return 'revoked';
+        if (probe !== null) {
+          lastRefusalProbe = probe;
+          return 'refused';
+        }
+        // No answer at all from the probe: a network fault, retried like one below.
+      }
       // Any ordinary HTTP answer that is not an auth failure means this path does not speak
       // WebSocket. A 5xx is the exception: that is a server having a bad minute, not a missing
       // route, and it should be retried like any other transient fault.
@@ -877,6 +929,7 @@ export function startRelay(): void {
   // implement the socket. `auto` — the default — prefers the socket and quietly degrades.
   let wsBlockedUntil = mode === 'poll' ? Number.POSITIVE_INFINITY : 0;
   let wsUnsupportedLogged = false;
+  let wsRefusedLogged = false;
 
   let rejections = 0;
   /*
@@ -969,16 +1022,25 @@ export function startRelay(): void {
             }
             continue;
           }
-          if (outcome === 'unsupported') {
+          if (outcome === 'unsupported' || outcome === 'refused') {
             wsBlockedUntil = Date.now() + WS_UNSUPPORTED_RETRY_MS;
-            log.debug('relay: websocket not offered — long-polling, asking again in 30 min', {
-              event: 'relay.ws.blocked', retry_in_ms: WS_UNSUPPORTED_RETRY_MS,
+            log.debug(`relay: websocket not available — long-polling, asking again in ${seconds(WS_UNSUPPORTED_RETRY_MS)}`, {
+              event: 'relay.ws.blocked', because: outcome, retry_in_ms: WS_UNSUPPORTED_RETRY_MS,
             });
-            if (!wsUnsupportedLogged) {
+            if (outcome === 'unsupported' && !wsUnsupportedLogged) {
               wsUnsupportedLogged = true;
               log.info('relay: this server does not offer a websocket endpoint — using long-polling', {
                 event: 'relay.ws.unsupported',
               });
+            }
+            if (outcome === 'refused' && !wsRefusedLogged) {
+              // Once, not per window: the cause is a network setting, and it is the same one every
+              // half hour. The debug line above says each time it is still there.
+              wsRefusedLogged = true;
+              log.warn(
+                `relay: the websocket upgrade was refused with 401, but the API accepts this token over plain HTTP (heartbeat ${lastRefusalProbe}) — something between this bridge and the API is blocking websockets. Long-polling instead; trying the websocket again in ${seconds(WS_UNSUPPORTED_RETRY_MS)}`,
+                { event: 'relay.ws.refused', probe_status: lastRefusalProbe, retry_in_ms: WS_UNSUPPORTED_RETRY_MS },
+              );
             }
           }
           if (mode === 'ws') {
