@@ -197,9 +197,10 @@ environment variable beats both files, which is how CI overrides one without edi
 | `PRINT_BRIDGE_TLS_CERT` / `_KEY` | *(empty)* | bring your own certificate to serve https |
 | `PRINT_BRIDGE_RELAY_URL` | `https://api.hankha.la` | the cloud API to take jobs from |
 | `PRINT_BRIDGE_RELAY_TRANSPORT` | `auto` | `auto` \| `ws` \| `poll` — see [Cloud jobs](#cloud-jobs) |
+| `PRINT_BRIDGE_WS_RETRY_MS` | `1800000` | how long the WebSocket stays off after the edge refuses it (a 404, or a handshake 401 while a heartbeat with the same token is accepted); work keeps flowing over the long-poll meanwhile |
 | `PRINT_BRIDGE_MAX_ATTEMPTS` | `3` | retries for a job that provably did not print |
 | `PRINT_BRIDGE_SEND_TIMEOUT_MS` | `15000` | how long one send may take |
-| `PRINT_BRIDGE_SYNC_TIMEOUT_MS` | `8000` | how long `POST /print` blocks — matches the POS's own timeout |
+| `PRINT_BRIDGE_SYNC_TIMEOUT_MS` | `8000` | how long `POST /print` blocks. Keep it under the POS's own 12 s timeout: the POS waits 4 s longer so it receives this bridge's printed-or-not verdict, and only then decides whether failing over is safe |
 | `PRINT_BRIDGE_LOG_FORMAT` | `text` | `json` gives one object per line, for a log aggregator |
 | `PRINT_BRIDGE_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `PRINT_BRIDGE_SERVICE_CONTROL` | `on` | `off` removes `/service/*` and the "This computer" card |
