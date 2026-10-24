@@ -5,7 +5,7 @@ import { registerStopper } from './lifecycle.js';
 import { log } from './log.js';
 import { diagIntervalMs, startDiagnostics } from './diagnostics.js';
 import { keepWarmMs, startKeepWarm } from './keepwarm.js';
-import { enroll, isRelayRejected, isRelayRunning, relayDiagnostics, relayStatus, startRelay } from './relay.js';
+import { enroll, isRelayRejected, isRelayRunning, markRelayShutdown, relayDiagnostics, relayStatus, startRelay } from './relay.js';
 import { createWatchdog, watchdogLimitMs } from './watchdog.js';
 import { startPairing } from './pairing.js';
 import { queue } from './queue.js';
@@ -385,6 +385,9 @@ function runService(): void {
     });
     diagnostics?.stop();
     keepWarm?.stop();
+    // A result report waiting to retry gives up now, with a line saying so, instead of holding a
+    // timer the exit then kills silently.
+    markRelayShutdown();
 
     server.close();
     // Let the write already on the wire finish. Jobs still WAITING are left on disk on purpose:

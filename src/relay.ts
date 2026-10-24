@@ -373,16 +373,117 @@ function markUp(transport: 'websocket' | 'long-poll'): void {
   diag.failures = 0;
 }
 
-async function postResult(base: string, token: string, jobId: string, result: JobResult): Promise<void> {
+/** One POST of a result. Resolves with the status; throws only when no answer came back at all. */
+async function postResult(base: string, token: string, jobId: string, result: JobResult): Promise<number> {
   const res = await fetch(`${base}/api/v1/modules/print/bridge/jobs/${jobId}/result`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(result),
     signal: AbortSignal.timeout(15_000),
   });
-  // 409 means the server already settled this job (usually our own earlier report arriving
-  // twice). Not an error worth retrying — the outcome is recorded either way.
-  if (!res.ok && res.status !== 409) throw new Error(`result POST failed: HTTP ${res.status}`);
+  // Release the pooled connection.
+  await res.body?.cancel().catch(() => undefined);
+  return res.status;
+}
+
+/** Retries of a result report after the first attempt, each preceded by `resultRetryDelayMs`. */
+const RESULT_RETRIES = 3;
+/** About 1 s, 2 s and 4 s before the three retries — `backoffMs` with its usual 50–100 % jitter. */
+function resultRetryDelayMs(retry: number): number {
+  return backoffMs(retry);
+}
+
+/** Set once the process is stopping: a report in a retry pause gives up instead of sleeping on. */
+let shuttingDown = false;
+const retryWakers = new Set<() => void>();
+
+/** A sleep that `markRelayShutdown` cuts short. */
+function retrySleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      retryWakers.delete(done);
+      resolve();
+    }
+    retryWakers.add(done);
+  });
+}
+
+/**
+ * The process is stopping. Called from the graceful stop in index.ts so a result report that is
+ * waiting to retry gives up now, with a line saying so, rather than holding a timer that the
+ * exit then kills silently.
+ */
+export function markRelayShutdown(): void {
+  shuttingDown = true;
+  for (const wake of [...retryWakers]) wake();
+}
+
+/**
+ * Report a job's outcome, riding out the faults one POST cannot.
+ *
+ * This used to be a single attempt, and a failed one was the end of it: the server's sweeper
+ * then wrote UNKNOWN over a job this bridge knew the truth about, the POS showed the ticket as
+ * unconfirmed, and an operator pressing reprint on a receipt that had in fact come out is exactly
+ * the duplicate this module exists to prevent. A result report is worth a few seconds of retries.
+ *
+ * 2xx and 409 are final successes — 409 means the server already settled this job, usually our
+ * own earlier report arriving twice, and the outcome is recorded either way. A network error, a
+ * 5xx, a 408 or a 429 is retried up to RESULT_RETRIES more times. Any other 4xx is final: the
+ * server has decided, and sending the same body again cannot change its mind.
+ *
+ * Never rejects: the print has already happened or already failed, so there is nobody left to
+ * throw to. The server's sweeper moves an unreported job to UNKNOWN and never re-queues one, so
+ * nothing prints twice because of a lost report. Exported for the tests; `handlePrint` is the
+ * real caller.
+ */
+export async function reportResult(
+  base: string,
+  token: string,
+  jobId: string,
+  result: JobResult,
+  delayMs: (retry: number) => number = resultRetryDelayMs,
+): Promise<boolean> {
+  for (let attempt = 1; ; attempt += 1) {
+    let status: number | undefined;
+    let err: unknown;
+    try {
+      status = await postResult(base, token, jobId, result);
+    } catch (e) {
+      err = e;
+    }
+    if (status !== undefined && ((status >= 200 && status < 300) || status === 409)) {
+      if (attempt > 1) {
+        gate.clear('relay.result.retry');
+        log.info(`relay: job ${jobId} reported on attempt ${attempt}`, {
+          event: 'relay.result.reported', job_id: jobId, attempts: attempt, status,
+        });
+      }
+      return true;
+    }
+    const detail = status === undefined ? describeError(err) : `HTTP ${status}`;
+    const transient = status === undefined || status >= 500 || status === 408 || status === 429;
+    if (transient && attempt <= RESULT_RETRIES && !shuttingDown) {
+      const wait = delayMs(attempt - 1);
+      // Gated: a server having a bad minute is one condition, however many jobs it catches.
+      const pass = gate.hit('relay.result.retry');
+      if (pass) {
+        const repeated = pass.repeated > 0 ? ` (repeated ${pass.repeated} times over ${seconds(pass.over_ms)})` : '';
+        log.warn(`relay: could not report job ${jobId} (${detail}) — retrying in ${seconds(wait)} (attempt ${attempt} of ${RESULT_RETRIES + 1})${repeated}`, {
+          event: 'relay.result.retry', job_id: jobId, attempt, status, err, wait_ms: wait,
+          repeated: pass.repeated || undefined,
+        });
+      }
+      await retrySleep(wait);
+      if (!shuttingDown) continue;
+    }
+    log.warn(`relay: could not report job ${jobId} (${detail}${shuttingDown ? '; shutting down' : ''}) after ${attempt} attempt${attempt === 1 ? '' : 's'}`, {
+      event: 'relay.result.failed', job_id: jobId, attempts: attempt, status, err,
+      shutting_down: shuttingDown || undefined,
+    });
+    return false;
+  }
 }
 
 // Exported for tests only; `dispatch` is the real caller.
@@ -399,7 +500,10 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
     // the nearest reason the server's `JOB_FAILURE_REASONS` accepts: an unfamiliar one is 422'd,
     // the result is lost, and the sweeper later writes UNKNOWN over a job that provably never
     // printed. `none` is exact — nothing was sent to any printer — so the POS may offer a retry.
-    await postResult(base, token, job.job_id, {
+    //
+    // Not awaited, here or below: a report that has to retry must not hold up the next poll.
+    // `reportResult` never rejects and logs a report it had to give up on.
+    void reportResult(base, token, job.job_id, {
       ok: false,
       reason: 'device-missing',
       printed_certainty: 'none',
@@ -433,7 +537,7 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
       // `printed_certainty: 'none'` is the whole point of reporting this properly: nothing was
       // ever sent to the printer, so the POS may safely offer to print again once the document
       // is fixed. Reporting it as a device fault would send someone to check a cable.
-      await postResult(base, token, job.job_id, {
+      void reportResult(base, token, job.job_id, {
         ok: false,
         reason: 'payload-rejected',
         printed_certainty: 'none',
@@ -445,7 +549,7 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
   } else if (typeof job.payload_base64 === 'string') {
     payload = Buffer.from(job.payload_base64, 'base64');
   } else {
-    await postResult(base, token, job.job_id, {
+    void reportResult(base, token, job.job_id, {
       ok: false,
       reason: 'payload-rejected',
       printed_certainty: 'none',
@@ -470,18 +574,13 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
   // Redelivery is safe: the queue answers a job id it has already settled from its on-disk ring
   // instead of printing a second copy, so a duplicate here becomes a duplicate REPORT, never a
   // duplicate receipt.
-  void submission.settled
-    .then((settled) =>
-      postResult(base, token, job.job_id, settled.result ?? { ok: false, reason: 'unknown', printed_certainty: 'unknown' })
-    )
-    .catch((err: unknown) => {
-      // The print already happened or already failed; only the report was lost. The server's own
-      // sweeper moves an unreported job to UNKNOWN, and it never re-queues one, so nothing prints
-      // twice as a result of this.
-      log.warn(`relay: could not report job ${job.job_id} (${describeError(err)})`, {
-        event: 'relay.result.failed', job_id: job.job_id, err,
-      });
-    });
+  //
+  // `reportResult` retries what can be retried and never rejects; a report lost for good is
+  // logged there. The server's own sweeper moves an unreported job to UNKNOWN, and it never
+  // re-queues one, so nothing prints twice as a result of a lost report.
+  void submission.settled.then((settled) =>
+    reportResult(base, token, job.job_id, settled.result ?? { ok: false, reason: 'unknown', printed_certainty: 'unknown' })
+  );
 }
 
 async function handleScan(base: string, token: string, work: Extract<Work, { type: 'scan' }>) {
