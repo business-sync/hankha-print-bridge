@@ -200,7 +200,9 @@ The events most useful for a disconnect or a missing ticket. Levels are the defa
 | `relay.ws.ack_timeout` | warn | since_ack_ms (followed by a `local` close, code 4000) |
 | `relay.ws.flap` | warn | session_ms, wait_ms |
 | `relay.ws.bad_frame` / `relay.ws.handler_error` | warn / error | bytes, error_* |
-| `relay.ws.unsupported` / `relay.ws.blocked` | info / debug | the server has no websocket; long-polling for 30 min |
+| `relay.ws.unsupported` / `relay.ws.blocked` | info / debug | the server has no websocket; long-polling for 30 min. `blocked` carries `because` (`unsupported` or `refused`) |
+| `relay.ws.auth_probe` | debug | status or error_*, duration_ms. The heartbeat that checks a 401 on the websocket handshake before it is believed |
+| `relay.ws.refused` | warn, once per process | probe_status, retry_in_ms. The upgrade was refused with 401 but the API accepts the token over HTTP: something in front of the API blocks websockets; long-polling for 30 min |
 | `relay.poll` | debug | status, duration_ms |
 | `relay.retry` | warn, gated | detail, status, error_code, cause_code, failures, wait_ms, repeated |
 | `relay.recovered` | info | transport, down_ms, failures, suppressed_retries |
@@ -214,7 +216,8 @@ The events most useful for a disconnect or a missing ticket. Levels are the defa
 | `relay.reconnect_storm` | warn, gated | reconnects_last_hour (more than 20) |
 | `relay.watchdog.armed` / `relay.watchdog.cleared` / `relay.watchdog.restart` | info / info / error | limit_ms; down_ms, because; down_ms |
 | `relay.loop.exited` | error | should never appear: the bridge is offline until restarted |
-| `relay.dispatch.failed` / `relay.result.failed` | error / warn | kind or job_id, error_* |
+| `relay.dispatch.failed` | error | kind, error_* |
+| `relay.result.retry` / `relay.result.reported` / `relay.result.failed` | warn, gated / info / warn | job_id, attempt(s), status or error_*, wait_ms. A result POST that failed with a network error, 5xx, 408 or 429 is retried three times; `failed` is the give-up, with `shutting_down` when the stop cut it short |
 
 ### Printing
 | Event | Level | Key fields |
@@ -279,6 +282,10 @@ the session length.
 - **`relay.token_switched`:** the bridge picked up a newer pairing by itself.
 - **`relay.heartbeat.rejected` with status 401** and no token rejection yet: the loop has not
   noticed. It will on its next poll.
+- **`relay.ws.refused`:** the websocket upgrade came back 401 but a heartbeat with the same token
+  was accepted, so the token is fine and something between the bridge and the API (a proxy, WAF or
+  edge that does not pass upgrades) refused it. Printing continues over the long-poll; the fix is on
+  that network, not a re-pair.
 
 Fix: open `http://localhost:9200` on that PC and pair it again.
 

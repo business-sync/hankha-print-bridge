@@ -64,7 +64,8 @@ questions:
   the same synchronous block, and every caller goes through it.
 - **Websocket timers are cleaned up:** the heartbeat and ack-watch intervals are cleared on every
   session exit (`closed` always resolves). The HTTP heartbeat interval lives for the process.
-- **Auth is told apart from network faults:** only 401 (or close 1008/4401) counts as a rejected
+- **Auth is told apart from network faults:** only a 401 on the long-poll, a close 1008/4401, or a
+  401 on the websocket handshake that a heartbeat with the same token confirms counts as a rejected
   token. 403/5xx/timeouts are transient and retried with backoff.
 - **Reconnect delay:** a reconnect after a clean close is floored at 1 s, flaps back off, and
   404/405/426 blocks the websocket for 30 min and falls back to long-polling.

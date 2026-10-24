@@ -599,15 +599,22 @@ because a running relay loop holds the previous token.
 `/api/v1/modules/print/bridge/socket` and falls back to the long-poll on
 `/api/v1/modules/print/bridge/work` — which is what the server offers today, so `auto` and `poll`
 behave identically until that endpoint ships. A server that answers the upgrade with an ordinary
-HTTP status is remembered as not supporting it and asked again only twice an hour. `ws` refuses to
-fall back, for testing a server that does have it.
+HTTP status is remembered as not supporting it and asked again only twice an hour. A `401` on the
+upgrade is checked before it is believed: the bridge sends one ordinary heartbeat with the same
+token, and only a `401` there means the token is dead. Anything else means something in front of
+the API refused the upgrade — logged once (`relay.ws.refused`) and handled like a missing endpoint:
+long-polling, with the websocket tried again in 30 minutes. `ws` refuses to fall back, for testing
+a server that does have it.
 
 The WebSocket contract, for whoever builds the server half: accept the upgrade with the same bearer
 token the other bridge routes take, then push the same `Work` JSON objects the long-poll returns.
 The bridge sends `{"type":"hello"}` on open and `{"type":"heartbeat"}` every 30 seconds, answers
 pings, and ignores frame types it does not know. **Results keep going back over HTTP** — reusing an
 endpoint that already exists is worth more than the round trip it saves, and it means a half-built
-server side cannot lose a print result.
+server side cannot lose a print result. A result the API cannot be reached for — a network error, a
+5xx, a 408 or a 429 — is sent again up to three more times over a few seconds (about 1 s, 2 s and
+4 s, jittered); a 2xx or 409 is final, any other 4xx is given up at once, and a report still
+retrying when the bridge is stopped is given up with a log line rather than lost silently.
 
 Cloud jobs go through the same queue as everything else, and the poll loop no longer waits for them
 to print: a printer taking four seconds to answer used to stop the bridge fetching *any* work for
