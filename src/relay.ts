@@ -801,6 +801,10 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
       if (err.status === 401) {
         const probe = await probeToken(base, token);
         if (probe === 401) return 'revoked';
+        // A 5xx (or 408/429) heartbeat says nothing about the edge: the API itself is having a bad
+        // minute. Treat it like any transient fault below — one long-poll, then the socket again —
+        // rather than blocking the socket for the whole window.
+        if (probe !== null && (probe >= 500 || probe === 408 || probe === 429)) return 'error';
         if (probe !== null) {
           lastRefusalProbe = probe;
           return 'refused';
