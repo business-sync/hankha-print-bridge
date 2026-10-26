@@ -1395,6 +1395,16 @@ ${I18N_SCRIPT}
       rows.push([t('relayChannel'), relay.transport || t('relayNotEstablished')]);
       rows.push([t('relayLastContact'), ago(relay.last_ok_at)]);
       if (relay.last_error) rows.push([t('relayLastError'), relay.last_error]);
+      /* The verdict outlives last_error on purpose: the socket can be up while fetch is refused. */
+      if (relay.tls_trust) {
+        var tt = relay.tls_trust;
+        rows.push([t('relayCertificate'), t(
+          tt.kind === 'intercepted' ? 'relayTlsIntercepted' : tt.kind === 'runtime' ? 'relayTlsRuntime' : 'relayTlsUnverified',
+          { issuer: tt.issuer || '?', runtime: tt.runtime || '?' })]);
+      }
+      if (relay.explicit_roots_since) {
+        rows.push([t('relayRootsWorkaround'), t('relayRootsWorkaroundOn', { ago: ago(relay.explicit_roots_since) })]);
+      }
     }
 
     for (var i = 0; i < rows.length; i++) {
@@ -1435,19 +1445,29 @@ ${I18N_SCRIPT}
      */
     var rejected = pairForce && /token rejected|revoked|re-?enroll/i.test(relay.last_error || '');
     /*
-     * A third cause, with advice that is neither of the above. A certificate the bridge does not
-     * trust means a program on THIS computer is re-signing its HTTPS connections, and that
-     * neither clears by waiting nor is cured by a fresh code — the fix is a setting in that
-     * program, or its root certificate handed to the bridge. Rejected wins if both somehow match:
-     * the server having an opinion about the token means the connection got through.
+     * A third cause, with advice that is neither of the above — and two faces of its own. A
+     * certificate the bridge refused neither clears by waiting nor is cured by a fresh code. The
+     * relay's verdict (tls_trust, from tls-trust.ts) says whether a program on THIS computer is
+     * re-signing HTTPS, or whether the bridge's own runtime refused a valid public certificate —
+     * opposite advice, and 1.14.6 gave the first for both. Until the verdict arrives (one peek
+     * connection after the first failure) the code alone makes it "unverified". Rejected wins if
+     * both somehow match: the server having an opinion about the token means the connection got
+     * through.
      */
-    var intercepted = pairForce && !rejected && TLS_TRUST_RE.test(relay.last_error || '');
+    var trust = relay.tls_trust || null;
+    var tlsKind = trust ? trust.kind : (TLS_TRUST_RE.test(relay.last_error || '') ? 'unverified' : null);
+    var intercepted = pairForce && !rejected && tlsKind === 'intercepted';
+    var runtimeFault = pairForce && !rejected && (tlsKind === 'runtime' || tlsKind === 'unverified');
     var why = relay.last_error ? ' (' + relay.last_error + ')' : '';
+    var tlsVars = { why: why, issuer: trust && trust.issuer ? trust.issuer : '?', runtime: trust && trust.runtime ? trust.runtime : '?' };
 
     $('pair-submit').textContent = t(pairForce ? 'repair' : 'connect');
     $('pair-lead').textContent = !pairForce
       ? t('pairLeadNew')
-      : t(rejected ? 'pairLeadRejected' : intercepted ? 'pairLeadTlsIntercepted' : 'pairLeadDropped', { why: why });
+      : t(rejected ? 'pairLeadRejected'
+          : intercepted ? 'pairLeadTlsIntercepted'
+          : runtimeFault ? (tlsKind === 'runtime' ? 'pairLeadTlsRuntime' : 'pairLeadTlsUnverified')
+          : 'pairLeadDropped', tlsVars);
 
     /*
      * The removal step is not tidiness. One computer holds one bridge row per organisation, so
@@ -1462,11 +1482,15 @@ ${I18N_SCRIPT}
       steps.appendChild(h('li', null, t('pairStepRemove')));
       steps.appendChild(h('li', null, t('pairStepNewCode')));
     } else if (intercepted) {
-      /* The two remedies, in the order a venue can try them. The code field and the Re-pair
-         button below stay exactly as they are: a control that cannot help here is still better
-         than a page with no way out, should this regex ever be wrong about a last_error. */
-      steps.appendChild(h('li', null, t('pairStepTlsExclude')));
-      steps.appendChild(h('li', null, t('pairStepTlsCaCert')));
+      /* The code field and the Re-pair button below stay exactly as they are: a control that
+         cannot help here is still better than a page with no way out, should the verdict ever be
+         wrong. Nothing here tells a shop to exclude the bridge from scanning or to add a root
+         certificate: that is the computer's administrator's call, and the README has it. */
+      steps.appendChild(h('li', null, t('pairStepTlsStop')));
+      steps.appendChild(h('li', null, t('pairStepTlsSupport')));
+    } else if (runtimeFault) {
+      steps.appendChild(h('li', null, t('pairStepTlsUpdate')));
+      steps.appendChild(h('li', null, t('pairStepTlsSupport')));
     } else {
       steps.appendChild(h('li', null, t('pairStepAdd')));
       steps.appendChild(h('li', null, t('pairStepCode')));
@@ -1971,11 +1995,17 @@ ${I18N_SCRIPT}
       if (state.relay && state.relay.connected) return 'hidden';
       /*
        * Not connected, with a credential on disk, used to mean one thing: somebody removed this
-       * computer from the shop. A certificate the relay does not trust is the other way to land
-       * here, and "get a new code" is exactly the wrong advice for it — an antivirus or proxy on
-       * this computer is inspecting HTTPS, and no code changes that. Same regex as the relay card.
+       * computer from the shop. A certificate the relay refused is the other way to land here,
+       * and "get a new code" is exactly the wrong advice for it — whether a program on this
+       * computer is re-signing HTTPS or the bridge's own runtime refused a valid certificate, no
+       * code changes that. Same verdict as the relay card.
        */
-      return state.relay && TLS_TRUST_RE.test(state.relay.last_error || '') ? 'intercepted' : 'removed';
+      var trust = state.relay && state.relay.tls_trust;
+      var kind = trust ? trust.kind : (state.relay && TLS_TRUST_RE.test(state.relay.last_error || '') ? 'unverified' : null);
+      if (kind === 'intercepted') return 'intercepted';
+      if (kind === 'runtime') return 'runtime';
+      if (kind === 'unverified') return 'unverified';
+      return 'removed';
     }
     return 'waiting';
   }
@@ -2083,13 +2113,15 @@ ${I18N_SCRIPT}
       return;
     }
 
-    if (screen === 'intercepted') {
+    if (screen === 'intercepted' || screen === 'runtime' || screen === 'unverified') {
       icon.textContent = '\u26a0';
       icon.className = 'ps-icon warn';
       psShow('ps-icon', true);
-      lead.textContent = psText('interceptedLead');
-      sub.textContent = psText('interceptedSub');
-      /* No "get a new code" button: a fresh code is redeemed over the same inspected connection
+      var trust = (state.relay && state.relay.tls_trust) || {};
+      var tlsVars = { issuer: trust.issuer || '?', runtime: trust.runtime || '?' };
+      lead.textContent = t('ps.' + screen + 'Lead', tlsVars);
+      sub.textContent = t('ps.' + screen + 'Sub', tlsVars);
+      /* No "get a new code" button: a fresh code is redeemed over the same refused connection
          and fails the same way. Details still opens the relay card, which keeps its Re-pair box.
          The LAN half keeps printing, so the printer count is the useful line here too. */
       psFacts();

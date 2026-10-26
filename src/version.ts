@@ -36,3 +36,10 @@ export const BRIDGE_VERSION = process.env.APP_VERSION?.trim() || UNSET_VERSION;
 
 /** Reported by `/health` so the POS can tell a real bridge from some other app on that port. */
 export const BRIDGE_SERVICE = 'hankha-print-bridge';
+
+/**
+ * `bun 1.3.11` in the shipped binary, `node 24.19.0` under `npm run dev` and in the container.
+ * Logged at start and written beside every TLS verdict, because a bridge that cannot verify a
+ * valid public certificate is a fault in this runtime, and the version is what support needs.
+ */
+export const RUNTIME = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`;

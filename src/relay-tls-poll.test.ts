@@ -71,9 +71,15 @@ describe('relay loop behind an HTTPS interceptor (long-poll)', () => {
     assert.equal(line?.fields.host, `127.0.0.1:${port}`);
     assert.equal(line?.fields.issuer, fixture.issuer, 'the issuer is what identifies the interceptor');
     assert.equal(line?.fields.self_signed, true);
+    assert.equal(line?.fields.authorized, false);
+    assert.equal(line?.fields.kind, 'intercepted', 'a self-signed certificate nothing here accepts IS an interceptor');
+    assert.equal(line?.fields.origin, 'poll');
     assert.match(line?.msg ?? '', /Fake Interceptor Inc/);
-    assert.match(line?.msg ?? '', /antivirus or proxy/);
-    assert.match(line?.msg ?? '', /NODE_EXTRA_CA_CERTS/, 'the line carries the remedy');
+    assert.match(line?.msg ?? '', /antivirus or a proxy/);
+    assert.match(line?.msg ?? '', /stop that program inspecting/, 'the line carries the remedy');
+    assert.doesNotMatch(line?.msg ?? '', /NODE_EXTRA_CA_CERTS|exclude the bridge/i, 'and never tells a shop to add roots or exclude the bridge');
+    assert.equal(relay.relayStatus().tls_trust?.kind, 'intercepted', 'the page keys its advice on the verdict');
+    assert.equal(relay.relayStatus().tls_trust?.issuer, fixture.issuer);
 
     // The ordinary retry line still comes first and still carries the code…
     const retry = events('relay.retry')[0];

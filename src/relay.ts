@@ -4,13 +4,14 @@ import { renderJobDocument, resolveRelayPrinter } from './jobs.js';
 import { errorCode, log, LogGate, redactUrl } from './log.js';
 import { queue, type JobResult } from './queue.js';
 import { loadRegistry } from './registry.js';
+import { relayFetch } from './relay-fetch.js';
 import { connectWebSocket, WebSocketHandshakeError } from './relay-socket.js';
-import { BRIDGE_VERSION } from './version.js';
+import { BRIDGE_VERSION, RUNTIME } from './version.js';
 import { arch, hostname, platform } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { backoffMs } from './backoff.js';
 import { markTick } from './ticks.js';
-import { peekPeerCertificate, tlsTrustCode } from './tls-trust.js';
+import { classifyTlsTrust, peekPeerCertificate, type TlsTrustVerdict, tlsTrustCode } from './tls-trust.js';
 
 /**
  * The outbound half of the bridge.
@@ -227,7 +228,7 @@ export async function enroll(code: string): Promise<{ bridge_id: string }> {
   const state = loadState();
   const base = relayUrl(state);
   const self = describeSelf();
-  const res = await fetch(`${base}/api/v1/modules/print/bridge/enroll`, {
+  const res = await relayFetch(`${base}/api/v1/modules/print/bridge/enroll`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -254,6 +255,19 @@ export async function enroll(code: string): Promise<{ bridge_id: string }> {
   return { bridge_id: body.data.bridge_id };
 }
 
+/**
+ * The last TLS-trust verdict, for the status page's advice. Set once the certificate behind a
+ * refused chain has been read back; cleared by the next relay request that verifies. It outlives
+ * `last_error`: a websocket that connects clears that, and on the till that motivated this the
+ * websocket DID connect while every `fetch` kept failing, so the verdict has to survive it.
+ */
+export interface TlsTrustStatus extends TlsTrustVerdict {
+  runtime: string;
+  /** Which relay call met the failure. */
+  origin: 'websocket' | 'poll' | 'heartbeat' | 'result' | 'scan';
+  at: string;
+}
+
 export interface RelayStatus {
   enrolled: boolean;
   bridge_id: string | null;
@@ -262,6 +276,9 @@ export interface RelayStatus {
   transport: 'websocket' | 'long-poll' | null;
   last_ok_at: string | null;
   last_error: string | null;
+  tls_trust: TlsTrustStatus | null;
+  /** Relay requests carry the bundled roots explicitly (see relay-fetch.ts) since this time. */
+  explicit_roots_since: string | null;
 }
 
 const status: RelayStatus = {
@@ -271,10 +288,12 @@ const status: RelayStatus = {
   transport: null,
   last_ok_at: null,
   last_error: null,
+  tls_trust: null,
+  explicit_roots_since: null,
 };
 
 export function relayStatus(): RelayStatus {
-  return { ...status };
+  return { ...status, explicit_roots_since: relayFetch.state().latched_at };
 }
 
 /**
@@ -346,12 +365,6 @@ function seconds(ms: number): string {
   return ms < 120_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)} min`;
 }
 
-/** The part of the TLS-trust line an operator acts on. Mirrors the status page's advice. */
-const TLS_TRUST_ADVICE =
-  'Exclude the bridge from HTTPS scanning in that program, or save its root certificate as a PEM file ' +
-  'and point NODE_EXTRA_CA_CERTS at it (bridge.env on Windows, the LaunchDaemon plist on macOS), then ' +
-  'restart the bridge';
-
 /** `https://api.hankha.la` → `api.hankha.la`, for a log line that names who presented what. */
 function hostOf(base: string): string {
   try {
@@ -361,40 +374,80 @@ function hostOf(base: string): string {
   }
 }
 
+/** The one line of advice per verdict. Mirrors the status page; nothing here widens trust. */
+function tlsTrustAdvice(verdict: TlsTrustVerdict, host: string): string {
+  switch (verdict.kind) {
+    case 'intercepted':
+      return (
+        `a program on this computer (an antivirus or a proxy) is re-signing its HTTPS connections. Have whoever ` +
+        `manages this computer stop that program inspecting the bridge's connection to ${host}, then restart the ` +
+        'bridge; a new pairing code will not help'
+      );
+    case 'runtime':
+      return (
+        `the certificate is the real one and the fault is in this bridge build's runtime (${RUNTIME}), not in this ` +
+        'computer or its network. Update the Print Bridge; do not change antivirus settings or add root ' +
+        'certificates for this, and a new pairing code will not help'
+      );
+    default:
+      return (
+        'neither an interceptor nor a runtime fault can be named from here. Update the Print Bridge, and if the ' +
+        'newest build still shows this send bridge.log to Hankha support; a new pairing code will not help'
+      );
+  }
+}
+
 /**
- * Name the interceptor in the log, once per gate window, when a relay attempt failed because
- * the certificate it was shown is signed by a root this bridge does not have.
+ * Say WHY the chain was refused, once per gate window, when a relay attempt failed because the
+ * certificate it was shown is signed by a root this process did not accept.
  *
- * `relay.retry` and `relay.ws.handshake_failed` already say WHAT failed (`fetch failed
- * (UNABLE_TO_GET_ISSUER_CERT_LOCALLY)`), and that was the whole of the evidence from a venue
- * whose antivirus had started inspecting HTTPS: a code, a 30-second retry loop, and no way to
- * tell from the file which program on that PC was doing it. This opens one more connection with
- * verification off — see `peekPeerCertificate` — purely to read the issuer of the certificate
- * that was actually presented, and writes it beside the advice. The real request is never
- * relaxed; a line in the log is the only thing that changes.
+ * `relay.retry`, `relay.ws.handshake_failed` and `relay.heartbeat.failed` already say WHAT
+ * failed (`fetch failed (UNABLE_TO_GET_ISSUER_CERT_LOCALLY)`). The cause is not in that code:
+ * an antivirus re-signing HTTPS and a runtime that failed to apply its own root store throw the
+ * same one, and 1.14.6 — which assumed the first — sent a till with the second looking for an
+ * antivirus that was not there. This opens one more connection — see `peekPeerCertificate` — to
+ * read who issued the certificate actually presented and whether `node:tls` here accepts it,
+ * folds in what the explicit-roots retry found (relay-fetch.ts), and writes the verdict beside
+ * the advice that fits it. The real request is never relaxed; a line in the log and a field in
+ * the status are the only things that change.
  *
  * Gated on its own key rather than riding `relay.retry`'s: in `auto` mode a single outage
- * reaches this from both the websocket path and the poll path within the same second, and
- * the issuer is worth saying once, not twice.
+ * reaches this from the websocket, the poll and the heartbeat within the same second, and the
+ * verdict is worth saying once, not three times.
  */
-function noteTlsTrustFailure(err: unknown, base: string): void {
+function noteTlsTrustFailure(err: unknown, base: string, origin: TlsTrustStatus['origin']): void {
   const code = tlsTrustCode(err);
   if (!code) return;
   const pass = gate.hit('relay.tls.untrusted');
   if (!pass) return;
   const host = hostOf(base);
   void peekPeerCertificate(base).then((cert) => {
+    const retry = relayFetch.state();
+    const verdict = classifyTlsTrust({
+      code, cert, explicit_roots: retry.latched ? 'verified' : retry.failed_code ? 'failed' : null,
+    });
+    status.tls_trust = { ...verdict, runtime: RUNTIME, origin, at: new Date().toISOString() };
     const repeated = pass.repeated > 0 ? ` (repeated ${pass.repeated} times over ${seconds(pass.over_ms)})` : '';
     const what = cert
-      ? `the certificate ${host} presented was issued by "${cert.issuer}", which this bridge does not trust (${code})`
-      : `${host} presented a certificate this bridge does not trust (${code}), and it could not be read back to name its issuer`;
-    log.warn(
-      `relay: ${what} — an antivirus or proxy on this computer is inspecting HTTPS. ${TLS_TRUST_ADVICE}${repeated}`,
-      {
-        event: 'relay.tls.untrusted', code, host, ...(cert ?? {}), repeated: pass.repeated || undefined,
-      },
-    );
+      ? `the certificate ${host} presented (issued by "${cert.issuer}") was refused by ${origin === 'websocket' ? 'the websocket' : 'fetch'} (${code})`
+      : `${host} presented a certificate that was refused (${code}), and it could not be read back to name its issuer`;
+    log.warn(`relay: ${what} — ${verdict.evidence}: ${tlsTrustAdvice(verdict, host)}${repeated}`, {
+      event: 'relay.tls.untrusted', kind: verdict.kind, code, host, origin, runtime: RUNTIME,
+      explicit_roots: retry.latched ? 'verified' : retry.failed_code ? `failed (${retry.failed_code})` : undefined,
+      ...(cert ?? {}), repeated: pass.repeated || undefined,
+    });
   });
+}
+
+/**
+ * A relay request over HTTP verified and was answered: whatever a trust verdict said is over.
+ * Not folded into `markUp`, because a websocket connecting says nothing about `fetch` — the
+ * till that motivated this had the socket up and every `fetch` refused for two days.
+ */
+function noteRelayHttpOk(): void {
+  if (status.tls_trust === null) return;
+  status.tls_trust = null;
+  gate.clear('relay.tls.untrusted');
 }
 
 /** The link stopped carrying work. Idempotent: an outage starts once. */
@@ -412,11 +465,11 @@ function markUp(transport: 'websocket' | 'long-poll'): void {
   status.transport = transport;
   status.last_ok_at = new Date().toISOString();
   status.last_error = null;
+  if (transport === 'long-poll') noteRelayHttpOk();
   if (diag.down_since !== null) {
     const down = Date.now() - diag.down_since;
     const retries = gate.clear('relay.retry');
     gate.clear('relay.ws.handshake_failed');
-    gate.clear('relay.tls.untrusted');
     log.info(`relay: connection restored over ${transport} after ${seconds(down)}`, {
       event: 'relay.recovered', transport, down_ms: down, failures: diag.failures,
       suppressed_retries: retries?.repeated || undefined,
@@ -428,7 +481,7 @@ function markUp(transport: 'websocket' | 'long-poll'): void {
 
 /** One POST of a result. Resolves with the status; throws only when no answer came back at all. */
 async function postResult(base: string, token: string, jobId: string, result: JobResult): Promise<number> {
-  const res = await fetch(`${base}/api/v1/modules/print/bridge/jobs/${jobId}/result`, {
+  const res = await relayFetch(`${base}/api/v1/modules/print/bridge/jobs/${jobId}/result`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(result),
@@ -507,6 +560,7 @@ export async function reportResult(
       err = e;
     }
     if (status !== undefined && ((status >= 200 && status < 300) || status === 409)) {
+      noteRelayHttpOk();
       if (attempt > 1) {
         gate.clear('relay.result.retry');
         log.info(`relay: job ${jobId} reported on attempt ${attempt}`, {
@@ -516,6 +570,7 @@ export async function reportResult(
       return true;
     }
     const detail = status === undefined ? describeError(err) : `HTTP ${status}`;
+    if (status === undefined) noteTlsTrustFailure(err, base, 'result');
     const transient = status === undefined || status >= 500 || status === 408 || status === 429;
     if (transient && attempt <= RESULT_RETRIES && !shuttingDown) {
       const wait = delayMs(attempt - 1);
@@ -640,7 +695,7 @@ async function handleScan(base: string, token: string, work: Extract<Work, { typ
   // Shares `runScan`'s in-flight map with the LAN /scan route, so a cloud-requested scan and a
   // button press on the same port join one sweep instead of doubling the SYN traffic.
   const scan = await runScan(work.port || DEFAULT_PRINTER_PORT);
-  const res = await fetch(`${base}/api/v1/modules/print/bridge/scan-result`, {
+  const res = await relayFetch(`${base}/api/v1/modules/print/bridge/scan-result`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({
@@ -661,7 +716,7 @@ async function handleScan(base: string, token: string, work: Extract<Work, { typ
 
 /** One HTTP heartbeat. Resolves with the status; throws only when no answer came back at all. */
 async function heartbeat(base: string, token: string): Promise<number> {
-  const res = await fetch(`${base}/api/v1/modules/print/bridge/heartbeat`, {
+  const res = await relayFetch(`${base}/api/v1/modules/print/bridge/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(describeSelf()),
@@ -681,7 +736,7 @@ async function heartbeat(base: string, token: string): Promise<number> {
  * rejected one used to be logged on EVERY beat instead, and a venue with a revoked token sent in
  * a file of hundreds of identical lines.
  */
-function noteHeartbeat(outcome: { status?: number; err?: unknown; duration_ms: number }): void {
+function noteHeartbeat(outcome: { status?: number; err?: unknown; duration_ms: number }, base: string): void {
   const ok = outcome.status !== undefined && outcome.status >= 200 && outcome.status < 300;
   log.debug(`relay: heartbeat ${outcome.status ?? describeError(outcome.err)} in ${outcome.duration_ms}ms`, {
     event: 'relay.heartbeat', status: outcome.status, duration_ms: outcome.duration_ms,
@@ -695,9 +750,17 @@ function noteHeartbeat(outcome: { status?: number; err?: unknown; duration_ms: n
     }
     diag.heartbeat_failures = 0;
     diag.last_heartbeat_ok_at = Date.now();
+    noteRelayHttpOk();
     return;
   }
   diag.heartbeat_failures += 1;
+  // A heartbeat refused on trust grounds is not a blip, and `markUp('websocket')` has cleared
+  // `last_error` by now: the socket can be up while every fetch is refused. Keep the code where
+  // the status page reads it, and get the verdict.
+  if (outcome.status === undefined && tlsTrustCode(outcome.err)) {
+    status.last_error = describeError(outcome.err);
+    noteTlsTrustFailure(outcome.err, base, 'heartbeat');
+  }
   const pass = gate.hit('relay.heartbeat');
   if (!pass) return;
   const repeated = pass.repeated > 0 ? ` (repeated ${pass.repeated} times over ${seconds(pass.over_ms)})` : '';
@@ -842,6 +905,7 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
           log.error(`relay: failed to handle ${work.type} (${describeError(err)})`, {
             event: 'relay.dispatch.failed', kind: work.type, connection_id: connectionId, err,
           });
+          noteTlsTrustFailure(err, base, 'scan');
         });
       },
     });
@@ -872,7 +936,7 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
       if (err.status === 404 || err.status === 405 || err.status === 426) return 'unsupported';
     }
     status.last_error = describeError(err);
-    noteTlsTrustFailure(err, base);
+    noteTlsTrustFailure(err, base, 'websocket');
     // Used to set `last_error` and nothing else: a bridge whose socket could never connect left no
     // line saying so, or why.
     const pass = gate.hit('relay.ws.handshake_failed');
@@ -1039,9 +1103,9 @@ export function startRelay(): void {
     const startedAt = Date.now();
     try {
       const code = await heartbeat(base, token);
-      noteHeartbeat({ status: code, duration_ms: Date.now() - startedAt });
+      noteHeartbeat({ status: code, duration_ms: Date.now() - startedAt }, base);
     } catch (err) {
-      noteHeartbeat({ err, duration_ms: Date.now() - startedAt });
+      noteHeartbeat({ err, duration_ms: Date.now() - startedAt }, base);
     }
   };
 
@@ -1216,7 +1280,7 @@ export function startRelay(): void {
 
         try {
           const pollStartedAt = Date.now();
-          const res = await fetch(
+          const res = await relayFetch(
             `${base}/api/v1/modules/print/bridge/work?wait=${POLL_WAIT_S}`,
             {
               headers: { Authorization: `Bearer ${token}` },
@@ -1257,7 +1321,7 @@ export function startRelay(): void {
         } catch (err) {
           markDown();
           status.last_error = describeError(err);
-          noteTlsTrustFailure(err, base);
+          noteTlsTrustFailure(err, base, 'poll');
           const wait = backoffMs(Math.min(failures, 5));
           failures += 1;
           diag.failures = failures;

@@ -175,6 +175,7 @@ The events most useful for a disconnect or a missing ticket. Levels are the defa
 |---|---|---|
 | `app.starting` | info | version, pid, platform, arch, runtime |
 | `app.config` | info | host, port, log_level, log_format, relay_transport, watchdog_ms, diag_interval_ms, auth_required, … |
+| `tls.warmup` | debug | roots, duration_ms, runtime. The root-certificate setup finished on the main thread before the first connection (see `src/tls-warmup.ts`) |
 | `server.listening` | info | host, port, scheme |
 | `app.ready` | info | startup_ms |
 | `server.listen_failed` | error | host, port, error_code (EADDRINUSE…) |
@@ -217,6 +218,8 @@ The events most useful for a disconnect or a missing ticket. Levels are the defa
 | `relay.watchdog.armed` / `relay.watchdog.cleared` / `relay.watchdog.restart` | info / info / error | limit_ms; down_ms, because; down_ms |
 | `relay.loop.exited` | error | should never appear: the bridge is offline until restarted |
 | `relay.dispatch.failed` | error | kind, error_* |
+| `relay.tls.untrusted` | warn, gated | **kind** (`runtime` / `intercepted` / `unverified`), code, host, **origin** (`websocket` / `poll` / `heartbeat` / `result` / `scan`), runtime, issuer, subject, fingerprint_sha256, valid_from, valid_to, self_signed, authorized, authorization_error, explicit_roots, repeated. The verdict on a certificate a relay request refused — see README "The bridge cannot verify api.hankha.la". `runtime` means the certificate is real and this build refused it (update the bridge); `intercepted` means a program on the PC re-signs HTTPS (the issuer names it) |
+| `relay.tls.explicit_roots` | warn, once per process | code, host, runtime, roots. A relay request verified only once the bundled roots were passed to `fetch` explicitly: the runtime's own trust store was wrong (oven-sh/bun #28612). Every later relay request carries them; the bridge works, and should be updated |
 | `relay.result.retry` / `relay.result.reported` / `relay.result.failed` | warn, gated / info / warn | job_id, attempt(s), status or error_*, wait_ms. A result POST that failed with a network error, 5xx, 408 or 429 is retried three times; `failed` is the give-up, with `shutting_down` when the stop cut it short |
 
 ### Printing

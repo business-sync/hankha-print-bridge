@@ -59,29 +59,34 @@ The bridge restarts by itself if it crashes, and again every time this computer 
 not need to start it by hand.
 
 
-HTTPS INSPECTION / CORPORATE PROXY
-----------------------------------
-Antivirus programs and corporate proxies that "scan HTTPS" re-sign every secure connection
-with their own certificate. Browsers trust it; the bridge does not, so printing from phones
-and tablets through this computer stops while printing from this computer keeps working.
-The page at http://127.0.0.1:9200 says "Something on this computer is inspecting HTTPS", and
-bridge.log names the program: look for relay.tls.untrusted and read the issuer= field.
+THE BRIDGE CANNOT VERIFY HANKHA'S CERTIFICATE
+---------------------------------------------
+When printing from phones and tablets through this computer stops while printing from this
+computer keeps working, and bridge.log shows UNABLE_TO_GET_ISSUER_CERT_LOCALLY (or
+SELF_SIGNED_CERT_IN_CHAIN, CERT_UNTRUSTED), the bridge refused the certificate the cloud
+presented. There are two causes, and the bridge says which: the page at http://127.0.0.1:9200
+and the relay.tls.untrusted line in bridge.log (its kind= field).
 
-Fix 1 (best): in that program's settings, exclude hankha-print-bridge.exe (or the address
-api.hankha.la) from HTTPS/SSL scanning, then restart the bridge -- reboot, or run the last
-three lines below.
+kind=runtime  -- "This bridge version cannot verify Hankha's certificate". The certificate is
+the real one; this version of the bridge program failed to check it (versions 1.14.4 to 1.14.6
+on Windows did this). Install the newest bridge and it reconnects by itself. Nothing on this
+computer needs changing. Do NOT exclude the bridge from antivirus scanning and do NOT add
+root certificates: it fixes nothing and widens trust.
 
-Fix 2: give the bridge that program's root certificate. In an elevated PowerShell, with the
-name from the log in place of Kaspersky and the thumbprint it prints in place of <THUMBPRINT>:
+kind=intercepted  -- "Something on this computer is inspecting HTTPS". An antivirus or proxy
+on this computer re-signs every secure connection with its own certificate; the page and the
+issuer= field in the log name it. Whoever manages this computer stops that program inspecting
+the bridge's connection (hankha-print-bridge.exe, or the address api.hankha.la), then restarts
+the bridge -- reboot, or:
 
-    Get-ChildItem Cert:\LocalMachine\Root | Where-Object Subject -like '*Kaspersky*' | Format-List Subject, Thumbprint
-    $cert = Get-Item Cert:\LocalMachine\Root\<THUMBPRINT>
-    $pem = "-----BEGIN CERTIFICATE-----`n" + [Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks') + "`n-----END CERTIFICATE-----"
-    Set-Content -Path 'C:\ProgramData\Hankha\PrintBridge\interceptor-root.pem' -Value $pem -Encoding ascii
-    Add-Content -Path 'C:\ProgramData\Hankha\PrintBridge\bridge.env' -Value 'NODE_EXTRA_CA_CERTS=C:\ProgramData\Hankha\PrintBridge\interceptor-root.pem' -Encoding ascii
     Stop-ScheduledTask -TaskName 'Hankha Print Bridge'
     Get-Process hankha-print-bridge -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-ScheduledTask -TaskName 'Hankha Print Bridge'
 
-Setup.exe and install.ps1 rewrite bridge.env, so add that one line again after every upgrade.
-The .pem file beside it is left alone.
+If that program must keep inspecting, an administrator can give the bridge its root
+certificate instead: the "Trusting an interceptor's root" section of the README has the
+PowerShell for it (NODE_EXTRA_CA_CERTS in bridge.env; setup.exe rewrites that file, so the
+line goes back after every upgrade).
+
+kind=unverified  -- the certificate could not be read back. Install the newest bridge; if it
+still shows this, send bridge.log to Hankha support.

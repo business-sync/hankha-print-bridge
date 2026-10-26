@@ -13,3 +13,7 @@ dist-installers/
 .env
 .env.local
 .env.*.local
+
+# Cross-compiled TLS probes and their output (scripts/tls-probe/README.md); the source is tracked, the 115 MB binaries are not
+scripts/tls-probe/*.exe
+scripts/tls-probe/probe-output-*.txt

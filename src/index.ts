@@ -14,8 +14,9 @@ import { render } from './render/index.js';
 import { sampleLabel, sampleReceipt } from './samples.js';
 import { createBridgeServer, isTlsEnabled } from './server.js';
 import { statePath } from './identity.js';
+import { warmTlsTrustStore } from './tls-warmup.js';
 import { driverFor } from './transports/index.js';
-import { BRIDGE_SERVICE, BRIDGE_VERSION } from './version.js';
+import { BRIDGE_SERVICE, BRIDGE_VERSION, RUNTIME } from './version.js';
 
 const DEFAULT_PORT = 9200;
 /**
@@ -222,7 +223,7 @@ function runService(): void {
   log.info(`starting ${BRIDGE_SERVICE} v${BRIDGE_VERSION}`, {
     event: 'app.starting', version: BRIDGE_VERSION, pid: process.pid, platform: process.platform,
     arch: process.arch,
-    runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`,
+    runtime: RUNTIME,
   });
   // The settings that shape connection and printing behaviour, as this process actually resolved
   // them. Support otherwise has to guess what a venue's bridge.env said. Nothing secret: the
@@ -243,6 +244,12 @@ function runService(): void {
     managed: process.env.PRINT_BRIDGE_MANAGED?.trim() || undefined,
     auth_required: Boolean(process.env.PRINT_BRIDGE_TOKEN?.trim()),
     tls: isTlsEnabled(),
+  });
+
+  // Before the first connection of any kind: see tls-warmup.ts for the race this closes.
+  const warm = warmTlsTrustStore();
+  log.debug(warm ? `tls: trust store ready (${warm.roots} roots) in ${warm.ms}ms` : 'tls: trust store warm-up unavailable on this runtime', {
+    event: 'tls.warmup', roots: warm?.roots, duration_ms: warm?.ms, runtime: RUNTIME,
   });
 
   const server = createBridgeServer();

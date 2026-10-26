@@ -9,6 +9,7 @@ export function maskCode(code: string): string {
   return code.slice(0, keep) + '*'.repeat(Math.max(0, code.length - keep));
 }
 import { enroll, isRelayRunning, relayUrl, startRelay, wakeRelay } from './relay.js';
+import { relayFetch } from './relay-fetch.js';
 import { BRIDGE_VERSION } from './version.js';
 import { arch, hostname, platform } from 'node:os';
 
@@ -149,7 +150,7 @@ function selfDescription() {
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
   const base = relayUrl(loadState());
-  const res = await fetch(`${base}${path}`, {
+  const res = await relayFetch(`${base}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

@@ -72,11 +72,15 @@ describe('relay loop behind an HTTPS interceptor (websocket)', () => {
     const line = events('relay.tls.untrusted')[0];
     assert.equal(line?.fields.code, 'DEPTH_ZERO_SELF_SIGNED_CERT');
     assert.equal(line?.fields.issuer, fixture.issuer);
+    assert.equal(line?.fields.kind, 'intercepted');
+    assert.equal(line?.fields.origin, 'websocket');
     assert.match(line?.msg ?? '', /Fake Interceptor Inc/);
+    assert.match(line?.msg ?? '', /refused by the websocket/);
     assert.ok(records.indexOf(failed as LogRecord) < records.indexOf(line as LogRecord), 'the failure comes first, then who caused it');
 
     assert.match(relay.relayStatus().last_error ?? '', /DEPTH_ZERO_SELF_SIGNED_CERT/);
     assert.equal(relay.relayStatus().connected, false);
+    assert.equal(relay.relayStatus().tls_trust?.kind, 'intercepted');
     assert.equal(upgrades, 0, 'no upgrade ever reached the server: verification was not relaxed');
   });
 

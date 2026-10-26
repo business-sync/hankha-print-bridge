@@ -117,8 +117,48 @@ function step(label) {
   console.log(`\n\u2500\u2500 ${label}`);
 }
 
+/**
+ * The oldest Bun whose root-certificate setup is thread-safe (oven-sh/bun #28612, fixed by
+ * #29426). Below it, the first `fetch` and the first `new WebSocket()` of a process race to
+ * initialise the bundled root list, and on a Windows till the loser verified nothing for the life
+ * of the process: v1.14.4 to v1.14.6, built on 1.3.11, failed every heartbeat and result report
+ * with UNABLE_TO_GET_ISSUER_CERT_LOCALLY while the websocket connected. `src/tls-warmup.ts`
+ * closes the window from the bridge's side too, but a binary built on a racy runtime is still a
+ * binary that can be wrong for a whole process, so the build refuses one.
+ */
+const MIN_BUN = '1.3.13';
+
+function bunVersion() {
+  const res = spawnSync('bun', ['--version'], { encoding: 'utf8' });
+  if (res.status !== 0) throw new Error(`bun --version failed:\n${res.stderr}`);
+  return res.stdout.trim();
+}
+
+function olderThan(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i += 1) {
+    if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) < (pb[i] ?? 0);
+  }
+  return false;
+}
+
+function assertBunVersion() {
+  const version = bunVersion();
+  if (olderThan(version, MIN_BUN)) {
+    throw new Error(
+      `bun ${version} is on PATH, but the bridge must be compiled with bun ${MIN_BUN} or newer: ` +
+        'older runtimes race on root-certificate setup (oven-sh/bun #28612) and a shipped binary ' +
+        'can then refuse every HTTPS request for the life of the process. Put a newer bun first ' +
+        'on PATH (e.g. PATH="$HOME/.bun-1.3.14/bin:$PATH") and run again.'
+    );
+  }
+  console.log(`bun ${version} (minimum ${MIN_BUN})`);
+}
+
 /** `bun build --compile` for one target triple. */
 function compile(target, outfile) {
+  assertBunVersion();
   const flags = [
     'build',
     '--compile',
@@ -143,7 +183,7 @@ function compile(target, outfile) {
   // as SYSTEM in session 0 where nothing is visible anyway, and keeping the console means
   // double-clicking the exe is a usable way to see why it won't start.
   //
-  // And deliberately no `--compile-exec-argv=--use-system-ca` (Bun 1.3.11) yet. It would let a
+  // And deliberately no `--compile-exec-argv=--use-system-ca` (Bun 1.3.x) yet. It would let a
   // venue PC whose antivirus re-signs HTTPS reach the cloud with no configuration at all, and
   // it was evaluated for 1.14.x: the flag compiles in, api.hankha.la still verifies with it and
   // NODE_EXTRA_CA_CERTS still works beside it — but that a root in the macOS keychain or the
