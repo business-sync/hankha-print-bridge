@@ -57,3 +57,31 @@ The most common failure is another program already holding port 9200; the log sa
 
 The bridge restarts by itself if it crashes, and again every time this computer boots. You do
 not need to start it by hand.
+
+
+HTTPS INSPECTION / CORPORATE PROXY
+----------------------------------
+Antivirus programs and corporate proxies that "scan HTTPS" re-sign every secure connection
+with their own certificate. Browsers trust it; the bridge does not, so printing from phones
+and tablets through this computer stops while printing from this computer keeps working.
+The page at http://127.0.0.1:9200 says "Something on this computer is inspecting HTTPS", and
+bridge.log names the program: look for relay.tls.untrusted and read the issuer= field.
+
+Fix 1 (best): in that program's settings, exclude hankha-print-bridge.exe (or the address
+api.hankha.la) from HTTPS/SSL scanning, then restart the bridge -- reboot, or run the last
+three lines below.
+
+Fix 2: give the bridge that program's root certificate. In an elevated PowerShell, with the
+name from the log in place of Kaspersky and the thumbprint it prints in place of <THUMBPRINT>:
+
+    Get-ChildItem Cert:\LocalMachine\Root | Where-Object Subject -like '*Kaspersky*' | Format-List Subject, Thumbprint
+    $cert = Get-Item Cert:\LocalMachine\Root\<THUMBPRINT>
+    $pem = "-----BEGIN CERTIFICATE-----`n" + [Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks') + "`n-----END CERTIFICATE-----"
+    Set-Content -Path 'C:\ProgramData\Hankha\PrintBridge\interceptor-root.pem' -Value $pem -Encoding ascii
+    Add-Content -Path 'C:\ProgramData\Hankha\PrintBridge\bridge.env' -Value 'NODE_EXTRA_CA_CERTS=C:\ProgramData\Hankha\PrintBridge\interceptor-root.pem' -Encoding ascii
+    Stop-ScheduledTask -TaskName 'Hankha Print Bridge'
+    Get-Process hankha-print-bridge -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-ScheduledTask -TaskName 'Hankha Print Bridge'
+
+Setup.exe and install.ps1 rewrite bridge.env, so add that one line again after every upgrade.
+The .pem file beside it is left alone.

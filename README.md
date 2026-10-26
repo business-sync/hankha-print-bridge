@@ -621,6 +621,119 @@ Cloud jobs go through the same queue as everything else, and the poll loop no lo
 to print: a printer taking four seconds to answer used to stop the bridge fetching *any* work for
 those four seconds.
 
+### HTTPS inspection / corporate proxy
+
+The bridge verifies `api.hankha.la` against the root certificates compiled into its binary, not
+the ones the operating system trusts. On most tills that is the same answer. It is not on a PC
+where an antivirus (Kaspersky, ESET, Bitdefender, Avast…) or a corporate proxy does **HTTPS
+inspection**: that program terminates every TLS connection itself and re-signs it with a root it
+has installed into the OS store, so the browser is happy and the bridge is handed a certificate
+it has never heard of. The relay then fails every attempt, for good, with one of
+
+```
+UNABLE_TO_GET_ISSUER_CERT_LOCALLY   SELF_SIGNED_CERT_IN_CHAIN   CERT_UNTRUSTED
+UNABLE_TO_VERIFY_LEAF_SIGNATURE     DEPTH_ZERO_SELF_SIGNED_CERT
+```
+
+in `relay.last_error`. LAN printing is unaffected; only cloud jobs stop.
+
+The bridge tells this apart from a dropped uplink (`src/tls-trust.ts`). The status page says
+**Something on this computer is inspecting HTTPS** instead of offering a new pairing code — the
+Cloud relay card under Details says the same, with the two remedies below as its steps — and the
+log names the program, once per ten minutes, right after the usual retry line:
+
+```
+WARN relay: the certificate api.hankha.la presented was issued by "O=Kaspersky, CN=Kaspersky Anti-Virus Personal Root Certificate", which this bridge does not trust (UNABLE_TO_GET_ISSUER_CERT_LOCALLY) — an antivirus or proxy on this computer is inspecting HTTPS. Exclude the bridge from HTTPS scanning in that program, or save its root certificate as a PEM file and point NODE_EXTRA_CA_CERTS at it (bridge.env on Windows, the LaunchDaemon plist on macOS), then restart the bridge {event=relay.tls.untrusted code=UNABLE_TO_GET_ISSUER_CERT_LOCALLY host=api.hankha.la issuer="O=Kaspersky, CN=…" subject=CN=hankha.la fingerprint_sha256=… self_signed=false}
+```
+
+That line comes from one extra connection opened *without* verification purely to read who
+signed the certificate; nothing is sent over it, and every real request keeps verifying exactly
+as before.
+
+Two remedies, in the order to try them:
+
+1. **Exclude the bridge from HTTPS scanning** in that program's settings — by process
+   (`hankha-print-bridge.exe`; on macOS the `hankha-print-bridge` binary inside the app or under
+   `/usr/local/hankha/print-bridge/`) or by host (`api.hankha.la`). Restart the bridge. This is
+   the right fix: the program stops re-signing the connection and the bridge sees the real
+   certificate again.
+
+2. **Hand the bridge that program's root certificate.** The binary honours `NODE_EXTRA_CA_CERTS`
+   for `fetch`, `node:https` and its WebSocket alike, and a PEM file named there is trusted *in
+   addition to* the bundled roots. The `issuer=` in the log line is the certificate to export.
+
+   **Windows** (elevated PowerShell). `print-bridge.cmd` exports every `KEY=value` line of
+   `bridge.env` into the bridge's environment before starting it, so this is a file edit and a
+   restart:
+
+   ```powershell
+   # The root the log named: its Subject is the issuer= in bridge.log.
+   Get-ChildItem Cert:\LocalMachine\Root | Where-Object Subject -like '*Kaspersky*' | Format-List Subject, Thumbprint
+   # Export it as PEM (paste the thumbprint it printed).
+   $cert = Get-Item Cert:\LocalMachine\Root\<THUMBPRINT>
+   $pem = "-----BEGIN CERTIFICATE-----`n" + [Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks') + "`n-----END CERTIFICATE-----"
+   Set-Content -Path 'C:\ProgramData\Hankha\PrintBridge\interceptor-root.pem' -Value $pem -Encoding ascii
+   # Tell the bridge. Add-Content, not Set-Content: a "serve other terminals" install already has lines here.
+   Add-Content -Path 'C:\ProgramData\Hankha\PrintBridge\bridge.env' -Value 'NODE_EXTRA_CA_CERTS=C:\ProgramData\Hankha\PrintBridge\interceptor-root.pem' -Encoding ascii
+   # Restart the scheduled task (it runs as SYSTEM, which can read ProgramData).
+   Stop-ScheduledTask -TaskName 'Hankha Print Bridge'
+   Get-Process hankha-print-bridge -ErrorAction SilentlyContinue | Stop-Process -Force
+   Start-ScheduledTask -TaskName 'Hankha Print Bridge'
+   ```
+
+   ⚠ `setup.exe` and `install.ps1` **rewrite `bridge.env`** — a plain install deletes it and a
+   "serve other terminals" install replaces it — so that one line has to be added again after
+   every upgrade. The `.pem` beside it is left alone.
+
+   **macOS `.pkg`** (LaunchDaemon). Export the root from Keychain Access (File → Export Items,
+   Privacy Enhanced Mail) or with `security find-certificate -c "<name>" -p
+   /Library/Keychains/System.keychain`, keep it under `/usr/local/hankha/print-bridge/`, add the
+   variable to the daemon's `EnvironmentVariables` and reload it:
+
+   ```bash
+   sudo plutil -insert EnvironmentVariables.NODE_EXTRA_CA_CERTS -string /usr/local/hankha/print-bridge/interceptor-root.pem /Library/LaunchDaemons/la.hankha.print-bridge.plist
+   sudo launchctl bootout system/la.hankha.print-bridge
+   sudo launchctl bootstrap system /Library/LaunchDaemons/la.hankha.print-bridge.plist
+   ```
+
+   A `.pkg` upgrade ships a fresh plist, so repeat this after one. For the **`.dmg`** the same
+   key goes into `~/Library/LaunchAgents/la.hankha.print-bridge.plist` (no `sudo`, `gui/$(id -u)`
+   in place of `system`); the app writes that file when it registers the agent, so edit it
+   afterwards, and again after an uninstall-and-reinstall.
+
+#### Why the binary does not simply read the OS trust store
+
+Bun 1.3.11 has `--use-system-ca`, and `bun build --compile-exec-argv=--use-system-ca` would bake
+it into the shipped binary, so an interceptor's root — which by construction *is* in the OS
+store — would be picked up with no configuration at all. It was evaluated for 1.14.x and **not
+adopted**, for want of proof on the two platforms that matter:
+
+- **Shown** (2026-10-26, Bun 1.3.11, the `compile()` flags from `scripts/package.mjs` plus the
+  exec-argv one): the compiled binary carries the flag (`process.execArgv`), `api.hankha.la`
+  still verifies with it over `fetch`, `node:https` and `WebSocket`, `NODE_EXTRA_CA_CERTS` still
+  works beside it, and startup time does not change. On Linux (Docker, root added with
+  `update-ca-certificates`) the self-signed server verified with the flag — and *without* it,
+  because Bun on Linux already reads the OpenSSL directory by default, so that run says nothing
+  about what the flag adds.
+- **Not shown**: that a root in the **macOS keychain** or the **Windows certificate store** is
+  trusted by the compiled binary. The macOS test needs a trust root added to the build Mac's
+  keychain, a security setting this release did not change; the Windows binary cannot run on the
+  build machine. Node's flag of the same name, which Bun's follows, reads the keychains' trust
+  settings on macOS and the machine's root store on Windows — where an antivirus installs its
+  root, and visible to the SYSTEM account the scheduled task runs as — so it is *expected* to
+  work. Expected is not shown.
+- **One caution** to retire at the same time: there is an unverified report of Bun's flag
+  *replacing* the bundled roots on macOS rather than adding to them, which would break
+  `api.hankha.la` on a Mac with no public roots in its trust settings. The run above saw the
+  bundled roots survive the flag on macOS, but on one machine.
+
+To finish it: on a Mac, `security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db self-signed.pem`,
+run a binary built with the flag against an `https` server presenting that certificate and
+expect `fetch`, `node:https` and `WebSocket` to connect (and the same binary without the flag to
+fail with `DEPTH_ZERO_SELF_SIGNED_CERT`), then `security remove-trusted-cert self-signed.pem`;
+and the same on a Windows till with the root in `Cert:\LocalMachine\Root`. If both pass,
+adoption is one flag in `compile()` and this subsection shrinks to a sentence.
+
 ### Reaching a USB or Bluetooth printer from a tablet
 
 A cloud job may address a printer two ways, and exactly one of them is set:
@@ -670,6 +783,12 @@ a URL pointing at `:3100` (the admin portal) or `:3101` (the POS itself) instead
 
 **"Your browser is blocking the Print Bridge"** — the POS is on `https` and the bridge address
 is not `localhost`. Install the bridge on the till itself; see the top of this file.
+
+**"Something on this computer is inspecting HTTPS"** — an antivirus or proxy is re-signing the
+bridge's connection to the cloud and the bridge rightly refuses the result; `relay.last_error`
+ends in a code like `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`. LAN printing still works. Exclude the
+bridge from HTTPS scanning, or hand it the program's root certificate — see
+[HTTPS inspection / corporate proxy](#https-inspection--corporate-proxy).
 
 **Printing works, discovery doesn't** — the bridge is older than v1.1 (no `/scan`). The POS
 shows an "update the Print Bridge" warning below v1.2.

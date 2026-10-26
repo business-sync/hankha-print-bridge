@@ -142,6 +142,14 @@ function compile(target, outfile) {
   // Deliberately NOT --windows-hide-console either: under the scheduled task the bridge runs
   // as SYSTEM in session 0 where nothing is visible anyway, and keeping the console means
   // double-clicking the exe is a usable way to see why it won't start.
+  //
+  // And deliberately no `--compile-exec-argv=--use-system-ca` (Bun 1.3.11) yet. It would let a
+  // venue PC whose antivirus re-signs HTTPS reach the cloud with no configuration at all, and
+  // it was evaluated for 1.14.x: the flag compiles in, api.hankha.la still verifies with it and
+  // NODE_EXTRA_CA_CERTS still works beside it — but that a root in the macOS keychain or the
+  // Windows certificate store is then trusted could not be shown from the build machine. Until
+  // it is, the supported route is NODE_EXTRA_CA_CERTS; "HTTPS inspection / corporate proxy" in
+  // the README records what was tested and the two runs that would settle it.
   if (target.startsWith('bun-windows') && process.platform === 'win32') {
     flags.push(
       '--windows-title=Hankha Print Bridge',
