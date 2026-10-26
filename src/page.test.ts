@@ -44,3 +44,35 @@ test('the CSP still forbids everything the page does not need', () => {
   assert.match(INDEX_CSP, /default-src 'none'/);
   assert.match(INDEX_CSP, /connect-src 'self'/);
 });
+
+test('the page knows the TLS-trust codes the relay reports, and has words for them', async () => {
+  const { TLS_TRUST_CODES } = await import('./tls-trust.js');
+  const { PAGE_STRINGS } = await import('./page-i18n.js');
+  // One list, interpolated at build time: the page matches last_error against exactly the codes
+  // the relay classifies, so the two cannot drift apart.
+  const regex = INDEX_HTML.match(/var TLS_TRUST_RE = \/([A-Z_|]+)\/;/);
+  assert.ok(regex, 'the regex reached the page');
+  assert.deepEqual(regex?.[1]?.split('|'), [...TLS_TRUST_CODES]);
+  // The words, in every language, and the strings an operator types kept verbatim in each.
+  for (const key of ['pairLeadTlsIntercepted', 'pairStepTlsExclude', 'pairStepTlsCaCert', 'ps.interceptedLead', 'ps.interceptedSub']) {
+    assert.ok(PAGE_STRINGS[key], `${key} is not in the table`);
+    assert.ok(INDEX_HTML.includes(`"${key}"`), `${key} is not in the page`);
+  }
+  for (const key of ['pairStepTlsCaCert', 'ps.interceptedSub']) {
+    for (const text of PAGE_STRINGS[key] ?? []) {
+      assert.ok(text.includes('NODE_EXTRA_CA_CERTS') && text.includes('bridge.env'), `${key}: ${text.slice(0, 40)}…`);
+    }
+  }
+  // Both places that choose advice for a disconnected bridge consult it.
+  assert.match(INDEX_HTML, /'pairLeadTlsIntercepted'/);
+  assert.match(INDEX_HTML, /'intercepted' : 'removed'/);
+});
+
+test('the page script parses', () => {
+  // The regex above is built by interpolation; a stray character in it would be a syntax error
+  // that no test of the markup can see, and the whole page would then render without a script.
+  const start = INDEX_HTML.lastIndexOf('<script>') + '<script>'.length;
+  const end = INDEX_HTML.lastIndexOf('</script>');
+  assert.ok(start > 0 && end > start, 'the inline script is present');
+  assert.doesNotThrow(() => new Function(INDEX_HTML.slice(start, end)));
+});

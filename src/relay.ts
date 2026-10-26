@@ -10,6 +10,7 @@ import { arch, hostname, platform } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { backoffMs } from './backoff.js';
 import { markTick } from './ticks.js';
+import { peekPeerCertificate, tlsTrustCode } from './tls-trust.js';
 
 /**
  * The outbound half of the bridge.
@@ -345,6 +346,57 @@ function seconds(ms: number): string {
   return ms < 120_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)} min`;
 }
 
+/** The part of the TLS-trust line an operator acts on. Mirrors the status page's advice. */
+const TLS_TRUST_ADVICE =
+  'Exclude the bridge from HTTPS scanning in that program, or save its root certificate as a PEM file ' +
+  'and point NODE_EXTRA_CA_CERTS at it (bridge.env on Windows, the LaunchDaemon plist on macOS), then ' +
+  'restart the bridge';
+
+/** `https://api.hankha.la` → `api.hankha.la`, for a log line that names who presented what. */
+function hostOf(base: string): string {
+  try {
+    return new URL(base).host;
+  } catch {
+    return redactUrl(base);
+  }
+}
+
+/**
+ * Name the interceptor in the log, once per gate window, when a relay attempt failed because
+ * the certificate it was shown is signed by a root this bridge does not have.
+ *
+ * `relay.retry` and `relay.ws.handshake_failed` already say WHAT failed (`fetch failed
+ * (UNABLE_TO_GET_ISSUER_CERT_LOCALLY)`), and that was the whole of the evidence from a venue
+ * whose antivirus had started inspecting HTTPS: a code, a 30-second retry loop, and no way to
+ * tell from the file which program on that PC was doing it. This opens one more connection with
+ * verification off — see `peekPeerCertificate` — purely to read the issuer of the certificate
+ * that was actually presented, and writes it beside the advice. The real request is never
+ * relaxed; a line in the log is the only thing that changes.
+ *
+ * Gated on its own key rather than riding `relay.retry`'s: in `auto` mode a single outage
+ * reaches this from both the websocket path and the poll path within the same second, and
+ * the issuer is worth saying once, not twice.
+ */
+function noteTlsTrustFailure(err: unknown, base: string): void {
+  const code = tlsTrustCode(err);
+  if (!code) return;
+  const pass = gate.hit('relay.tls.untrusted');
+  if (!pass) return;
+  const host = hostOf(base);
+  void peekPeerCertificate(base).then((cert) => {
+    const repeated = pass.repeated > 0 ? ` (repeated ${pass.repeated} times over ${seconds(pass.over_ms)})` : '';
+    const what = cert
+      ? `the certificate ${host} presented was issued by "${cert.issuer}", which this bridge does not trust (${code})`
+      : `${host} presented a certificate this bridge does not trust (${code}), and it could not be read back to name its issuer`;
+    log.warn(
+      `relay: ${what} — an antivirus or proxy on this computer is inspecting HTTPS. ${TLS_TRUST_ADVICE}${repeated}`,
+      {
+        event: 'relay.tls.untrusted', code, host, ...(cert ?? {}), repeated: pass.repeated || undefined,
+      },
+    );
+  });
+}
+
 /** The link stopped carrying work. Idempotent: an outage starts once. */
 function markDown(): void {
   status.connected = false;
@@ -364,6 +416,7 @@ function markUp(transport: 'websocket' | 'long-poll'): void {
     const down = Date.now() - diag.down_since;
     const retries = gate.clear('relay.retry');
     gate.clear('relay.ws.handshake_failed');
+    gate.clear('relay.tls.untrusted');
     log.info(`relay: connection restored over ${transport} after ${seconds(down)}`, {
       event: 'relay.recovered', transport, down_ms: down, failures: diag.failures,
       suppressed_retries: retries?.repeated || undefined,
@@ -819,6 +872,7 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
       if (err.status === 404 || err.status === 405 || err.status === 426) return 'unsupported';
     }
     status.last_error = describeError(err);
+    noteTlsTrustFailure(err, base);
     // Used to set `last_error` and nothing else: a bridge whose socket could never connect left no
     // line saying so, or why.
     const pass = gate.hit('relay.ws.handshake_failed');
@@ -1203,6 +1257,7 @@ export function startRelay(): void {
         } catch (err) {
           markDown();
           status.last_error = describeError(err);
+          noteTlsTrustFailure(err, base);
           const wait = backoffMs(Math.min(failures, 5));
           failures += 1;
           diag.failures = failures;

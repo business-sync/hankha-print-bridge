@@ -686,6 +686,38 @@ export const PAGE_STRINGS: Record<string, Row> = {
     '表示されたペアリングコードを下のボックスに入力してください。',
     '표시된 페어링 코드를 아래 상자에 입력하세요.',
   ],
+  /*
+   * The third disconnected state: an antivirus or proxy on this computer re-signing HTTPS.
+   * NODE_EXTRA_CA_CERTS, bridge.env, PEM and the file names stay in English in every column —
+   * they are the exact strings an operator types, and a translated one would not match.
+   */
+  pairLeadTlsIntercepted: [
+    'This bridge is paired, but a program on this computer — usually an antivirus or a proxy — is inspecting its HTTPS connections, so the server\u2019s certificate cannot be verified{why}. Pairing again will not help.',
+    'ໂປຣແກຣມພິມນີ້ຈັບຄູ່ແລ້ວ ແຕ່ມີໂປຣແກຣມໃນຄອມພິວເຕີເຄື່ອງນີ້ — ປົກກະຕິແມ່ນໂປຣແກຣມປ້ອງກັນໄວຣັສ ຫຼື ພຣັອກຊີ — ກຳລັງກວດສອບການເຊື່ອມຕໍ່ HTTPS ຂອງມັນ ຈຶ່ງບໍ່ສາມາດຢືນຢັນໃບຢັ້ງຢືນຂອງເຊີບເວີໄດ້{why}. ການຈັບຄູ່ໃໝ່ຈະບໍ່ຊ່ວຍຫຍັງ.',
+    'ตัวเชื่อมนี้จับคู่แล้ว แต่มีโปรแกรมในคอมพิวเตอร์เครื่องนี้ — มักเป็นโปรแกรมป้องกันไวรัสหรือพร็อกซี — กำลังตรวจสอบการเชื่อมต่อ HTTPS ของมัน จึงยืนยันใบรับรองของเซิร์ฟเวอร์ไม่ได้{why} การจับคู่ใหม่จะไม่ช่วยอะไร',
+    '此打印桥已配对，但这台电脑上的某个程序 — 通常是杀毒软件或代理 — 正在检查它的 HTTPS 连接，因此无法验证服务器的证书{why}。重新配对无济于事。',
+    'Cầu nối này đã ghép nối, nhưng một chương trình trên máy tính này — thường là phần mềm diệt virus hoặc proxy — đang kiểm tra các kết nối HTTPS của nó, nên không thể xác minh chứng chỉ của máy chủ{why}. Ghép nối lại sẽ không giúp ích.',
+    'このブリッジはペアリング済みですが、このパソコン上のプログラム — 通常はウイルス対策ソフトかプロキシ — がHTTPS通信を検査しているため、サーバーの証明書を検証できません{why}。再ペアリングしても解決しません。',
+    '이 브릿지는 페어링되어 있지만, 이 컴퓨터의 프로그램 — 보통 백신이나 프록시 — 이 HTTPS 연결을 검사하고 있어 서버의 인증서를 확인할 수 없습니다{why}. 다시 페어링해도 해결되지 않습니다.',
+  ],
+  pairStepTlsExclude: [
+    'Easiest: in that program\u2019s settings, exclude hankha-print-bridge (or api.hankha.la) from HTTPS/SSL scanning, then restart the bridge.',
+    'ງ່າຍທີ່ສຸດ: ໃນການຕັ້ງຄ່າຂອງໂປຣແກຣມນັ້ນ ໃຫ້ຍົກເວັ້ນ hankha-print-bridge (ຫຼື api.hankha.la) ຈາກການສະແກນ HTTPS/SSL ແລ້ວຣີສະຕາດໂປຣແກຣມພິມ.',
+    'ง่ายที่สุด: ในการตั้งค่าของโปรแกรมนั้น ให้ยกเว้น hankha-print-bridge (หรือ api.hankha.la) จากการสแกน HTTPS/SSL แล้วรีสตาร์ตตัวเชื่อม',
+    '最简单：在该程序的设置中，把 hankha-print-bridge（或 api.hankha.la）从 HTTPS/SSL 扫描中排除，然后重启打印桥。',
+    'Dễ nhất: trong cài đặt của chương trình đó, loại trừ hankha-print-bridge (hoặc api.hankha.la) khỏi việc quét HTTPS/SSL, rồi khởi động lại cầu nối.',
+    '最も簡単な方法: そのプログラムの設定で hankha-print-bridge（または api.hankha.la）をHTTPS/SSLスキャンの対象から除外し、ブリッジを再起動してください。',
+    '가장 쉬운 방법: 해당 프로그램 설정에서 hankha-print-bridge(또는 api.hankha.la)를 HTTPS/SSL 검사에서 제외한 뒤 브릿지를 다시 시작하세요.',
+  ],
+  pairStepTlsCaCert: [
+    'Or export that program\u2019s root certificate as a PEM file and set NODE_EXTRA_CA_CERTS to its path — in bridge.env on Windows, in the LaunchDaemon plist on macOS — then restart the bridge. The log names the certificate it received.',
+    'ຫຼື ສົ່ງອອກໃບຢັ້ງຢືນຮາກ (root certificate) ຂອງໂປຣແກຣມນັ້ນເປັນໄຟລ໌ PEM ແລ້ວຕັ້ງ NODE_EXTRA_CA_CERTS ໃຫ້ຊີ້ໄປຫາມັນ — ໃນ bridge.env ສຳລັບ Windows, ໃນ LaunchDaemon plist ສຳລັບ macOS — ແລ້ວຣີສະຕາດໂປຣແກຣມພິມ. ບັນທຶກ (log) ບອກຊື່ໃບຢັ້ງຢືນທີ່ໄດ້ຮັບ.',
+    'หรือส่งออกใบรับรองราก (root certificate) ของโปรแกรมนั้นเป็นไฟล์ PEM แล้วตั้ง NODE_EXTRA_CA_CERTS ให้ชี้ไปที่ไฟล์นั้น — ใน bridge.env บน Windows, ใน LaunchDaemon plist บน macOS — แล้วรีสตาร์ตตัวเชื่อม บันทึก (log) ระบุชื่อใบรับรองที่ได้รับ',
+    '或者把该程序的根证书导出为 PEM 文件，并把 NODE_EXTRA_CA_CERTS 设为它的路径 — Windows 在 bridge.env 中，macOS 在 LaunchDaemon plist 中 — 然后重启打印桥。日志中写明了收到的是哪张证书。',
+    'Hoặc xuất chứng chỉ gốc (root certificate) của chương trình đó ra tệp PEM và đặt NODE_EXTRA_CA_CERTS trỏ tới tệp đó — trong bridge.env trên Windows, trong LaunchDaemon plist trên macOS — rồi khởi động lại cầu nối. Nhật ký (log) nêu tên chứng chỉ đã nhận được.',
+    'または、そのプログラムのルート証明書をPEMファイルに書き出し、NODE_EXTRA_CA_CERTS にそのパスを設定 — Windowsでは bridge.env、macOSでは LaunchDaemon plist — してからブリッジを再起動してください。受信した証明書の名前はログに記録されています。',
+    '또는 해당 프로그램의 루트 인증서를 PEM 파일로 내보내고 NODE_EXTRA_CA_CERTS 를 그 경로로 설정 — Windows는 bridge.env, macOS는 LaunchDaemon plist — 한 뒤 브릿지를 다시 시작하세요. 수신한 인증서의 이름은 로그에 기록되어 있습니다.',
+  ],
 
   pairCodeShort: [
     'A pairing code is eight characters, like XXXX-XXXX.',
@@ -1115,6 +1147,25 @@ export const PAGE_STRINGS: Record<string, Row> = {
     'Đang thử lại. Việc in sẽ tự khôi phục, không cần làm gì.',
     '再試行しています。印刷は自動的に再開されます。特に操作は必要ありません。',
     '다시 시도하는 중입니다. 인쇄는 자동으로 다시 시작됩니다. 별도로 할 일은 없습니다.',
+  ],
+  /* The pairing screen's version of pairLeadTlsIntercepted: shown instead of "removed". */
+  'ps.interceptedLead': [
+    'Something on this computer is inspecting HTTPS',
+    'ມີບາງຢ່າງໃນຄອມພິວເຕີເຄື່ອງນີ້ກຳລັງກວດສອບ HTTPS',
+    'มีบางอย่างในคอมพิวเตอร์เครื่องนี้กำลังตรวจสอบ HTTPS',
+    '这台电脑上有程序正在检查 HTTPS',
+    'Có thứ gì đó trên máy tính này đang kiểm tra HTTPS',
+    'このパソコン上の何かがHTTPSを検査しています',
+    '이 컴퓨터의 무언가가 HTTPS를 검사하고 있습니다',
+  ],
+  'ps.interceptedSub': [
+    'An antivirus or proxy is intercepting the connection to Hankha, so its certificate cannot be verified. Exclude the Print Bridge from HTTPS scanning in that program, or set NODE_EXTRA_CA_CERTS to that program\u2019s root certificate (bridge.env on Windows, the LaunchDaemon plist on macOS). Getting a new code will not help.',
+    'ໂປຣແກຣມປ້ອງກັນໄວຣັສ ຫຼື ພຣັອກຊີ ກຳລັງແຊກແຊງການເຊື່ອມຕໍ່ໄປຫາ Hankha ຈຶ່ງບໍ່ສາມາດຢືນຢັນໃບຢັ້ງຢືນຂອງມັນໄດ້. ໃຫ້ຍົກເວັ້ນ Print Bridge ຈາກການສະແກນ HTTPS ໃນໂປຣແກຣມນັ້ນ ຫຼື ຕັ້ງ NODE_EXTRA_CA_CERTS ໃຫ້ຊີ້ໄປຫາໃບຢັ້ງຢືນຮາກຂອງໂປຣແກຣມນັ້ນ (bridge.env ໃນ Windows, LaunchDaemon plist ໃນ macOS). ການຂໍລະຫັດໃໝ່ຈະບໍ່ຊ່ວຍຫຍັງ.',
+    'โปรแกรมป้องกันไวรัสหรือพร็อกซีกำลังแทรกการเชื่อมต่อไปยัง Hankha จึงยืนยันใบรับรองของมันไม่ได้ ให้ยกเว้น Print Bridge จากการสแกน HTTPS ในโปรแกรมนั้น หรือตั้ง NODE_EXTRA_CA_CERTS ให้ชี้ไปที่ใบรับรองรากของโปรแกรมนั้น (bridge.env บน Windows, LaunchDaemon plist บน macOS) การขอรหัสใหม่จะไม่ช่วยอะไร',
+    '杀毒软件或代理正在拦截到 Hankha 的连接，因此无法验证其证书。请在该程序中把打印桥从 HTTPS 扫描中排除，或把 NODE_EXTRA_CA_CERTS 设为该程序的根证书（Windows 在 bridge.env 中，macOS 在 LaunchDaemon plist 中）。获取新代码无济于事。',
+    'Phần mềm diệt virus hoặc proxy đang chặn kết nối tới Hankha, nên không thể xác minh chứng chỉ của nó. Hãy loại trừ Print Bridge khỏi việc quét HTTPS trong chương trình đó, hoặc đặt NODE_EXTRA_CA_CERTS trỏ tới chứng chỉ gốc của chương trình đó (bridge.env trên Windows, LaunchDaemon plist trên macOS). Lấy mã mới sẽ không giúp ích.',
+    'ウイルス対策ソフトかプロキシがHankhaへの接続に割り込んでいるため、その証明書を検証できません。そのプログラムでプリントブリッジをHTTPSスキャンから除外するか、NODE_EXTRA_CA_CERTS にそのプログラムのルート証明書を設定してください（Windowsでは bridge.env、macOSでは LaunchDaemon plist）。新しいコードを取得しても解決しません。',
+    '백신이나 프록시가 Hankha로의 연결에 끼어들어 인증서를 확인할 수 없습니다. 해당 프로그램에서 프린트 브릿지를 HTTPS 검사에서 제외하거나, NODE_EXTRA_CA_CERTS 를 해당 프로그램의 루트 인증서로 설정하세요(Windows는 bridge.env, macOS는 LaunchDaemon plist). 새 코드를 받아도 해결되지 않습니다.',
   ],
   'ps.details': ['Details', 'ລາຍລະອຽດ', 'รายละเอียด', '详细信息', 'Chi tiết', '詳細', '세부정보'],
   'ps.hideDetails': [

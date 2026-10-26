@@ -50,6 +50,7 @@
  * printer token in a URL query string. This makes that navigation impossible rather than unlikely.
  */
 import { I18N_CSS, I18N_SCRIPT } from './page-i18n.js';
+import { TLS_TRUST_CODES } from './tls-trust.js';
 import { SERVICE_CSS, SERVICE_HTML, SERVICE_SCRIPT } from './page-service.js';
 
 export const INDEX_CSP =
@@ -1370,6 +1371,16 @@ ${I18N_SCRIPT}
    */
   var pairForce = false;
 
+  /*
+   * The OpenSSL codes behind "the server's certificate is signed by a root this bridge does not
+   * have" — what an antivirus or proxy doing HTTPS inspection on this computer produces, and the
+   * one disconnected state that neither waiting nor a new code can fix. Interpolated from the
+   * relay's own list (tls-trust.ts) at build time, so the page and the log can never disagree
+   * about which errors this is. Matched against last_error, which the relay writes in the form
+   * "fetch failed (UNABLE_TO_GET_ISSUER_CERT_LOCALLY)".
+   */
+  var TLS_TRUST_RE = /${TLS_TRUST_CODES.join('|')}/;
+
   function renderRelay(relay) {
     /* last_ok_at renders as "12s ago", so this one has to redraw as the clock moves. */
     if (!changed('relay', [relay, ago(relay && relay.last_ok_at)])) return;
@@ -1423,12 +1434,20 @@ ${I18N_SCRIPT}
      * which one this is must never leave the operator with no way out; only the wording moves.
      */
     var rejected = pairForce && /token rejected|revoked|re-?enroll/i.test(relay.last_error || '');
+    /*
+     * A third cause, with advice that is neither of the above. A certificate the bridge does not
+     * trust means a program on THIS computer is re-signing its HTTPS connections, and that
+     * neither clears by waiting nor is cured by a fresh code — the fix is a setting in that
+     * program, or its root certificate handed to the bridge. Rejected wins if both somehow match:
+     * the server having an opinion about the token means the connection got through.
+     */
+    var intercepted = pairForce && !rejected && TLS_TRUST_RE.test(relay.last_error || '');
     var why = relay.last_error ? ' (' + relay.last_error + ')' : '';
 
     $('pair-submit').textContent = t(pairForce ? 'repair' : 'connect');
     $('pair-lead').textContent = !pairForce
       ? t('pairLeadNew')
-      : t(rejected ? 'pairLeadRejected' : 'pairLeadDropped', { why: why });
+      : t(rejected ? 'pairLeadRejected' : intercepted ? 'pairLeadTlsIntercepted' : 'pairLeadDropped', { why: why });
 
     /*
      * The removal step is not tidiness. One computer holds one bridge row per organisation, so
@@ -1442,6 +1461,12 @@ ${I18N_SCRIPT}
     if (rejected) {
       steps.appendChild(h('li', null, t('pairStepRemove')));
       steps.appendChild(h('li', null, t('pairStepNewCode')));
+    } else if (intercepted) {
+      /* The two remedies, in the order a venue can try them. The code field and the Re-pair
+         button below stay exactly as they are: a control that cannot help here is still better
+         than a page with no way out, should this regex ever be wrong about a last_error. */
+      steps.appendChild(h('li', null, t('pairStepTlsExclude')));
+      steps.appendChild(h('li', null, t('pairStepTlsCaCert')));
     } else {
       steps.appendChild(h('li', null, t('pairStepAdd')));
       steps.appendChild(h('li', null, t('pairStepCode')));
@@ -1926,7 +1951,7 @@ ${I18N_SCRIPT}
   var psPrinters = null;
 
   /*
-   * Which of the five screens to show.
+   * Which screen to show.
    *
    * The distinction that matters is the last two: a bridge whose token the SERVER rejected will
    * never recover by waiting and needs a person, while one that simply cannot reach the network
@@ -1943,7 +1968,14 @@ ${I18N_SCRIPT}
     if (state.phase === 'offline') return 'offline';
     /* Idle with a credential is the ordinary healthy bridge: nothing to pair, show diagnostics. */
     if (state.has_credential) {
-      return state.relay && state.relay.connected ? 'hidden' : 'removed';
+      if (state.relay && state.relay.connected) return 'hidden';
+      /*
+       * Not connected, with a credential on disk, used to mean one thing: somebody removed this
+       * computer from the shop. A certificate the relay does not trust is the other way to land
+       * here, and "get a new code" is exactly the wrong advice for it — an antivirus or proxy on
+       * this computer is inspecting HTTPS, and no code changes that. Same regex as the relay card.
+       */
+      return state.relay && TLS_TRUST_RE.test(state.relay.last_error || '') ? 'intercepted' : 'removed';
     }
     return 'waiting';
   }
@@ -2047,6 +2079,19 @@ ${I18N_SCRIPT}
       sub.textContent = psText('offlineSub');
       /* Printing over the LAN is unaffected by the relay being unreachable, so the printer
          count is the useful half of this screen rather than a decoration on it. */
+      psFacts();
+      return;
+    }
+
+    if (screen === 'intercepted') {
+      icon.textContent = '\u26a0';
+      icon.className = 'ps-icon warn';
+      psShow('ps-icon', true);
+      lead.textContent = psText('interceptedLead');
+      sub.textContent = psText('interceptedSub');
+      /* No "get a new code" button: a fresh code is redeemed over the same inspected connection
+         and fails the same way. Details still opens the relay card, which keeps its Re-pair box.
+         The LAN half keeps printing, so the printer count is the useful line here too. */
       psFacts();
       return;
     }
