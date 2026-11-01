@@ -1,5 +1,5 @@
 /*
- * The test slip and test label.
+ * The test slips (a customer receipt and a kitchen ticket) and the test label.
  *
  * Shared by `POST /printers/:id/test` and by `--test-print` on the command line, so the thing an
  * operator prints from a settings screen is byte-for-byte the thing a technician prints over SSH.
@@ -11,27 +11,136 @@
  */
 import { BRIDGE_VERSION } from './version.js';
 import type { PrinterRecord } from './registry.js';
-import { charsPerLine, type LabelDocument, type ReceiptDocument } from './render/index.js';
+import { charsPerLine, type JobDocument, type LabelDocument, type ReceiptDocument, type ReceiptElement } from './render/index.js';
 
-export function sampleReceipt(printer: PrinterRecord): ReceiptDocument {
+/**
+ * Which test slip a receipt-type printer gets.
+ *
+ * A receipt roll in the kitchen used to get the CUSTOMER sample: item, price, `TOTAL LAK 50,000`,
+ * a barcode and a QR. At a venue that pressed Test on its pizza printer, that read as "the
+ * kitchen printer prints bills" — the exact misroute staff were trying to rule out. A kitchen
+ * printer now prints something shaped like what it will actually print: a station banner, an
+ * order number and quantities, no money.
+ */
+export const SAMPLE_DOCS = ['receipt', 'kitchen'] as const;
+export type SampleDoc = (typeof SAMPLE_DOCS)[number];
+
+/** What a caller may ask for. Both optional; the registry's `role` decides when they are absent. */
+export interface SampleRequest {
+  doc?: SampleDoc;
+  /** The station the slip is for (`PIZZA`, `HOT`) — printed as the banner. Implies `kitchen`. */
+  station?: string;
+}
+
+/** The longest banner a double-width line holds on 58 mm paper (384 dots / 24 / 2 = 16) and then some. */
+const STATION_MAX = 20;
+
+/**
+ * A station code fit for the banner: upper-case ASCII letters, digits, space, `_` and `-`.
+ *
+ * Station codes are the POS's ASCII enum (`PIZZA`, `HOT`, `BAR`), but this arrives over HTTP and
+ * is printed verbatim, so anything else is dropped rather than sent to the printer as bytes it
+ * would interpret. Null when nothing printable is left.
+ */
+export function stationBanner(raw: string | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw
+    .toUpperCase()
+    .replace(/[^A-Z0-9 _-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, STATION_MAX)
+    .trim();
+  return cleaned || null;
+}
+
+/**
+ * Which test slip a printer gets, honouring what the caller asked for.
+ *
+ * Label printers always get the label. Otherwise an explicit `doc` wins, a `station` alone means
+ * kitchen, and with neither the registry `role` decides: `kitchen` and `bar` print the kitchen
+ * ticket, `receipt` and untagged print the customer sample — untagged stays a receipt because
+ * that is what every bridge before 1.14.8 printed, and most printers are the bill printer.
+ */
+export function resolveSample(printer: PrinterRecord, request: SampleRequest = {}): ResolvedSample {
+  if (printer.type === 'label') return { doc: 'label', station: null };
+  const asked = stationBanner(request.station);
+  const byRole: SampleDoc = printer.role === 'kitchen' || printer.role === 'bar' ? 'kitchen' : 'receipt';
+  const doc = request.doc ?? (asked ? 'kitchen' : byRole);
+  if (doc === 'receipt') return { doc, station: null };
+  return { doc, station: asked ?? (printer.role === 'bar' ? 'BAR' : 'KITCHEN') };
+}
+
+/** What `resolveSample` decided — also what the test route logs, so a venue log says which slip came out. */
+export interface ResolvedSample {
+  doc: SampleDoc | 'label';
+  /** The kitchen ticket's banner; null for the receipt and the label. */
+  station: string | null;
+}
+
+/** The document `resolveSample` picked, ready to render. */
+export function sampleFor(printer: PrinterRecord, request: SampleRequest = {}, now: Date = new Date()): JobDocument {
+  const { doc, station } = resolveSample(printer, request);
+  if (doc === 'label') return sampleLabel(printer);
+  if (doc === 'receipt') return sampleReceipt(printer);
+  return sampleKitchenTicket(printer, station ?? 'KITCHEN', now);
+}
+
+/** The printer-facts block both slips open with: what to compare the paper against. */
+function diagnostics(printer: PrinterRecord, subtitle: string): ReceiptElement[] {
   const width = printer.dots_per_line ?? 576;
   const columns = charsPerLine(width, 'A');
   // A repeating 0-9 ruler: if the line wraps, the paper is narrower than `dots_per_line` says.
   const ruler = Array.from({ length: columns }, (_, i) => String(i % 10)).join('');
+  return [
+    { type: 'text', value: 'HANKHA PRINT BRIDGE', align: 'center', bold: true, width: 2, height: 2 },
+    { type: 'text', value: subtitle, align: 'center' },
+    { type: 'rule' },
+    { type: 'columns', left: 'Printer', right: printer.id },
+    { type: 'columns', left: 'Transport', right: printer.transport },
+    { type: 'columns', left: 'Language', right: printer.language },
+    { type: 'columns', left: 'Width', right: `${width} dots / ${columns} cols` },
+    { type: 'rule' },
+    { type: 'text', value: ruler, font: 'B' },
+    { type: 'text', value: 'The ruler above must fit on one line.', font: 'B' },
+  ];
+}
 
+/**
+ * A kitchen ticket with no money on it.
+ *
+ * Shaped like the slip the POS sends a station — banner, order number and time, big quantities,
+ * a modifier line — so a cook holding it sees "this is my kind of paper" and nobody mistakes the
+ * printer for the bill printer. No barcode or QR: kitchen tickets never carry them, and a test
+ * that exercised them would pass or fail on something the station will never print.
+ */
+export function sampleKitchenTicket(printer: PrinterRecord, station: string, now: Date = new Date()): ReceiptDocument {
+  const time = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
   return {
     kind: 'receipt',
     elements: [
-      { type: 'text', value: 'HANKHA PRINT BRIDGE', align: 'center', bold: true, width: 2, height: 2 },
-      { type: 'text', value: `v${BRIDGE_VERSION}`, align: 'center' },
+      ...diagnostics(printer, `v${BRIDGE_VERSION} - kitchen test ticket`),
+      { type: 'rule', char: '=' },
+      { type: 'text', value: station, align: 'center', bold: true, width: 2, height: 2 },
+      { type: 'columns', left: '#TEST-0001', right: time, bold: true },
       { type: 'rule' },
-      { type: 'columns', left: 'Printer', right: printer.id },
-      { type: 'columns', left: 'Transport', right: printer.transport },
-      { type: 'columns', left: 'Language', right: printer.language },
-      { type: 'columns', left: 'Width', right: `${width} dots / ${columns} cols` },
+      { type: 'text', value: '2x Test item', bold: true, height: 2 },
+      { type: 'text', value: '   - no onion' },
+      { type: 'text', value: '1x Test item', bold: true, height: 2 },
       { type: 'rule' },
-      { type: 'text', value: ruler, font: 'B' },
-      { type: 'text', value: 'The ruler above must fit on one line.', font: 'B' },
+      { type: 'text', value: 'Kitchen ticket - no prices.', align: 'center', font: 'B' },
+      { type: 'text', value: 'If you can read this, printing works.', align: 'center', font: 'B' },
+      { type: 'cut', mode: 'partial' },
+    ],
+  };
+}
+
+/** The customer sample: priced lines, a total, a barcode and a QR — what the bill printer prints. */
+export function sampleReceipt(printer: PrinterRecord): ReceiptDocument {
+  return {
+    kind: 'receipt',
+    elements: [
+      ...diagnostics(printer, `v${BRIDGE_VERSION}`),
       { type: 'rule' },
       { type: 'columns', left: '2x Test item', right: '50,000' },
       { type: 'columns', left: 'TOTAL', right: 'LAK 50,000', bold: true },

@@ -1059,7 +1059,11 @@ ${I18N_SCRIPT}
 
     var where = h('td', 'mono');
     where.textContent = at;
-    where.appendChild(h('span', 'detail', status.transport + ' · ' + status.type + ' · ' + status.language));
+    /* The role tag is what decides which test slip this row prints (a kitchen ticket for
+       kitchen/bar, the customer sample otherwise), so it belongs next to the hardware facts. */
+    var role = status.role || (record && record.role) || '';
+    where.appendChild(h('span', 'detail', status.transport + ' · ' + status.type + ' · ' + status.language
+      + (role ? ' · ' + role : '')));
     tr.appendChild(where);
 
     var state = h('td');

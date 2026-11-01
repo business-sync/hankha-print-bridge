@@ -136,7 +136,10 @@ fetched afterwards from the routes that are guarded, so a bridge that wants a to
 sentence instead of a bare `401`.
 
 It is not a configuration screen. `printers.json` stays the source of truth; the one thing the
-page can do to a printer is send it the same test slip `--test-print` sends.
+page can do to a printer is send it the same test slip `--test-print` sends. Which slip that is
+follows the printer's `role`: a printer tagged `kitchen` or `bar` prints a kitchen test ticket
+(station banner, quantities, no prices), anything else the customer sample. The role is shown
+next to the transport in each row.
 
 ### The "This computer" card
 
@@ -326,6 +329,7 @@ directory both installers already create. Read it with `GET /printers`, replace 
 ```bash
 hankha-print-bridge --list-printers
 hankha-print-bridge --test-print counter
+hankha-print-bridge --test-print pizza --doc kitchen --station PIZZA
 ```
 
 ```json
@@ -497,7 +501,15 @@ dialled, as it always was.
 - `GET /printers` / `PUT /printers` — read and replace the registry. A `PUT` that fails validation
   changes nothing and returns **every** problem at once, not just the first.
 - `POST /printers/:id/test` — print the same test slip `--test-print` prints. Its ruler line shows
-  whether `dots_per_line` matches the paper.
+  whether `dots_per_line` matches the paper. Optional body `{ doc?: "receipt" | "kitchen",
+  station? }` picks the slip: `kitchen` is a kitchen test ticket with `station` (upper-cased ASCII,
+  at most 20 characters kept) as its banner, `receipt` the customer sample with a price, a total, a
+  barcode and a QR. A `station` alone means `kitchen`. With no body the printer's `role` decides
+  (`kitchen`/`bar` → kitchen ticket, `receipt` or untagged → customer sample), so a client that
+  sends nothing gets what every earlier bridge printed on an untagged printer. An unknown `doc` or
+  a `station` longer than 24 characters is a `400 invalid-body`. The answer carries
+  `sample: { doc, station }`, and the result is logged at info as `print.test.result` with the
+  same `doc` and `station`. Label printers always get the test label.
 - `POST /printers/:id/identify` — send a status query and report the reply. Network only: a print
   spooler is one-way, so there is no channel to read an answer on, and this returns 501 for `usb`
   rather than pretending. Nothing calls it automatically.

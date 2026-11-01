@@ -1303,3 +1303,142 @@ describe('print route logging', () => {
     assert.equal(typeof json.diagnostics?.relay_connected, 'boolean');
   });
 });
+
+/**
+ * `POST /printers/:id/test` picks the slip by what the printer is FOR.
+ *
+ * A venue pressed Test on its pizza printer and got the customer sample — prices, a total, a
+ * barcode — and read it as the kitchen printer printing bills. The body `{ doc?, station? }` lets a
+ * terminal that knows the printer's slot say so; with no body the registry `role` decides, and an
+ * untagged printer keeps the receipt every earlier bridge printed.
+ */
+describe('POST /printers/:id/test', () => {
+  let previous: unknown;
+  let fake: TcpServer | undefined;
+  let received: Buffer[] = [];
+  let connections = 0;
+  let lanAddress: string | undefined;
+
+  before(async () => {
+    previous = await (await fetch(`${baseUrl}/printers`)).json();
+    const lan = localInterfaces()[0];
+    if (!lan) return;
+    lanAddress = lan.address;
+    fake = createTcpServer((socket) => {
+      connections += 1;
+      socket.on('data', (chunk) => received.push(chunk));
+    });
+    const port = await new Promise<number>((resolve) => {
+      fake?.listen(0, '0.0.0.0', () => resolve((fake?.address() as { port: number }).port));
+    });
+    const saved = await put('/printers', {
+      printers: [
+        { id: 'pizza', name: 'Pizza', transport: 'network', address: lan.address, port },
+        { id: 'bar', name: 'Bar', transport: 'network', address: lan.address, port, role: 'bar' },
+      ],
+    });
+    assert.equal(saved.status, 200);
+  });
+
+  beforeEach(() => {
+    received = [];
+    connections = 0;
+  });
+
+  after(async () => {
+    fake?.close();
+    const restored = await put('/printers', previous);
+    assert.equal(restored.status, 200);
+  });
+
+  /** What reached the fake printer, as text — the slips are ASCII apart from ESC/POS commands. */
+  async function paper(): Promise<string> {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return Buffer.concat(received).toString('latin1');
+  }
+
+  it('prints the customer sample on an untagged printer when asked nothing', async (t) => {
+    if (!lanAddress) return t.skip('no private LAN interface on this machine');
+    const res = await fetch(`${baseUrl}/printers/pizza/test`, { method: 'POST' });
+    const json = await res.json();
+    assert.equal(res.status, 200);
+    assert.deepEqual(json.sample, { doc: 'receipt', station: null });
+    assert.ok((await paper()).includes('TOTAL'));
+  });
+
+  it('prints a kitchen ticket with the station banner when the terminal says kitchen', async (t) => {
+    if (!lanAddress) return t.skip('no private LAN interface on this machine');
+    const { status, json } = await post('/printers/pizza/test', { doc: 'kitchen', station: 'pizza' });
+    assert.equal(status, 200);
+    assert.equal(json.ok, true);
+    assert.deepEqual(json.sample, { doc: 'kitchen', station: 'PIZZA' });
+    const text = await paper();
+    assert.ok(text.includes('PIZZA'));
+    assert.ok(text.includes('2x Test item'));
+    assert.ok(!text.includes('TOTAL'), 'a kitchen test ticket must carry no total');
+  });
+
+  it('prints a BAR ticket on a printer tagged bar, with no body at all', async (t) => {
+    if (!lanAddress) return t.skip('no private LAN interface on this machine');
+    const res = await fetch(`${baseUrl}/printers/bar/test`, { method: 'POST' });
+    const json = await res.json();
+    assert.equal(res.status, 200);
+    assert.deepEqual(json.sample, { doc: 'kitchen', station: 'BAR' });
+    const text = await paper();
+    assert.ok(text.includes('BAR'));
+    assert.ok(!text.includes('TOTAL'));
+  });
+
+  it('refuses a doc it does not know instead of guessing a receipt', async () => {
+    const { status, json } = await post('/printers/pizza/test', { doc: 'bill' });
+    assert.equal(status, 400);
+    assert.equal(json.reason, 'invalid-body');
+    assert.match(json.errors[0], /doc must be one of receipt, kitchen/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(connections, 0, 'a refused test must not reach the printer');
+  });
+
+  it('refuses a station that is not a short string', async () => {
+    const long = await post('/printers/pizza/test', { doc: 'kitchen', station: 'X'.repeat(25) });
+    assert.equal(long.status, 400);
+    const wrongType = await post('/printers/pizza/test', { station: 7 });
+    assert.equal(wrongType.status, 400);
+    const notAnObject = await post('/printers/pizza/test', ['kitchen']);
+    assert.equal(notAnObject.status, 400);
+  });
+
+  it('still answers 404 for a printer it does not have', async () => {
+    const { status, json } = await post('/printers/ghost/test', { doc: 'kitchen' });
+    assert.equal(status, 404);
+    assert.equal(json.reason, 'unknown-printer');
+  });
+
+  it('says in the venue log, at info, which slip came out', async (t) => {
+    if (!lanAddress) return t.skip('no private LAN interface on this machine');
+    const records: LogRecord[] = [];
+    const level = process.env.PRINT_BRIDGE_LOG_LEVEL;
+    process.env.PRINT_BRIDGE_LOG_LEVEL = 'info';
+    const restore = setLogSink((r) => records.push(r));
+    try {
+      const { status } = await post('/printers/pizza/test', { doc: 'kitchen', station: 'PIZZA' });
+      assert.equal(status, 200);
+      const line = records.find((r) => r.event === 'print.test.result');
+      assert.equal(line?.level, 'info');
+      assert.equal(line?.fields.doc, 'kitchen');
+      assert.equal(line?.fields.station, 'PIZZA');
+      assert.equal(line?.fields.printer_id, 'pizza');
+      assert.match(line?.msg ?? '', /test kitchen slip printed on pizza \(PIZZA\)/);
+    } finally {
+      restore();
+      if (level === undefined) delete process.env.PRINT_BRIDGE_LOG_LEVEL;
+      else process.env.PRINT_BRIDGE_LOG_LEVEL = level;
+    }
+  });
+
+  it('reports the role on /status so the dashboard can show it', async (t) => {
+    if (!lanAddress) return t.skip('no private LAN interface on this machine');
+    const json = (await (await fetch(`${baseUrl}/status`)).json()) as { printers: { id: string; role: string | null }[] };
+    assert.equal(json.printers.find((p) => p.id === 'bar')?.role, 'bar');
+    assert.equal(json.printers.find((p) => p.id === 'pizza')?.role, null);
+  });
+});
