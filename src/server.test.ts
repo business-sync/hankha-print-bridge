@@ -1318,6 +1318,20 @@ describe('POST /printers/:id/test', () => {
   let received: Buffer[] = [];
   let connections = 0;
   let lanAddress: string | undefined;
+  let printerPort = 0;
+
+  /** The venue's shape: an untagged bills printer named as the main one, an untagged pizza printer, a bar. */
+  async function useRegistry(withMain: boolean): Promise<void> {
+    const saved = await put('/printers', {
+      printers: [
+        { id: 'bill', name: 'Bill', transport: 'network', address: lanAddress, port: printerPort },
+        { id: 'pizza', name: 'Pizza', transport: 'network', address: lanAddress, port: printerPort },
+        { id: 'bar', name: 'Bar', transport: 'network', address: lanAddress, port: printerPort, role: 'bar' },
+      ],
+      ...(withMain ? { default_receipt_printer: 'bill' } : {}),
+    });
+    assert.equal(saved.status, 200);
+  }
 
   before(async () => {
     previous = await (await fetch(`${baseUrl}/printers`)).json();
@@ -1328,16 +1342,10 @@ describe('POST /printers/:id/test', () => {
       connections += 1;
       socket.on('data', (chunk) => received.push(chunk));
     });
-    const port = await new Promise<number>((resolve) => {
+    printerPort = await new Promise<number>((resolve) => {
       fake?.listen(0, '0.0.0.0', () => resolve((fake?.address() as { port: number }).port));
     });
-    const saved = await put('/printers', {
-      printers: [
-        { id: 'pizza', name: 'Pizza', transport: 'network', address: lan.address, port },
-        { id: 'bar', name: 'Bar', transport: 'network', address: lan.address, port, role: 'bar' },
-      ],
-    });
-    assert.equal(saved.status, 200);
+    await useRegistry(true);
   });
 
   beforeEach(() => {
@@ -1357,13 +1365,40 @@ describe('POST /printers/:id/test', () => {
     return Buffer.concat(received).toString('latin1');
   }
 
-  it('prints the customer sample on an untagged printer when asked nothing', async (t) => {
+  it('prints the customer sample on the main receipt printer when asked nothing', async (t) => {
     if (!lanAddress) return t.skip('no private LAN interface on this machine');
-    const res = await fetch(`${baseUrl}/printers/pizza/test`, { method: 'POST' });
+    const res = await fetch(`${baseUrl}/printers/bill/test`, { method: 'POST' });
     const json = await res.json();
     assert.equal(res.status, 200);
     assert.deepEqual(json.sample, { doc: 'receipt', station: null });
     assert.ok((await paper()).includes('TOTAL'));
+  });
+
+  /* The request the venue's 11:19 test page was: no body, an untagged pizza printer. */
+  it('prints a kitchen ticket on any other untagged printer when asked nothing', async (t) => {
+    if (!lanAddress) return t.skip('no private LAN interface on this machine');
+    const res = await fetch(`${baseUrl}/printers/pizza/test`, { method: 'POST' });
+    const json = await res.json();
+    assert.equal(res.status, 200);
+    assert.deepEqual(json.sample, { doc: 'kitchen', station: 'KITCHEN' });
+    const text = await paper();
+    assert.ok(text.includes('KITCHEN'));
+    assert.ok(!text.includes('TOTAL'), 'a kitchen printer\'s test page must carry no total');
+  });
+
+  it('keeps the customer sample on an untagged printer when no bills printer is named', async (t) => {
+    if (!lanAddress) return t.skip('no private LAN interface on this machine');
+    // Three receipt printers and no default: the bridge cannot tell which one prints bills.
+    await useRegistry(false);
+    try {
+      const res = await fetch(`${baseUrl}/printers/pizza/test`, { method: 'POST' });
+      const json = await res.json();
+      assert.equal(res.status, 200);
+      assert.deepEqual(json.sample, { doc: 'receipt', station: null });
+      assert.ok((await paper()).includes('TOTAL'));
+    } finally {
+      await useRegistry(true);
+    }
   });
 
   it('prints a kitchen ticket with the station banner when the terminal says kitchen', async (t) => {
