@@ -11,8 +11,8 @@ import { startPairing } from './pairing.js';
 import { queue } from './queue.js';
 import { findPrinter, loadRegistry, registryPath } from './registry.js';
 import { render } from './render/index.js';
-import { sampleLabel, sampleReceipt } from './samples.js';
-import { createBridgeServer, isTlsEnabled } from './server.js';
+import { resolveSample, sampleFor } from './samples.js';
+import { createBridgeServer, isTlsEnabled, parseTestPrintBody } from './server.js';
 import { statePath } from './identity.js';
 import { warmTlsTrustStore } from './tls-warmup.js';
 import { driverFor } from './transports/index.js';
@@ -53,6 +53,9 @@ Options:
                         from any device, including a phone.
   --list-printers       List configured printers and everything this machine can see, then exit
   --test-print <id>     Print a test slip on a configured printer, then exit
+    [--doc receipt|kitchen] [--station <code>]
+                        Which slip: the customer receipt or a kitchen ticket with that
+                        station as its banner. Default: by the printer's role in printers.json.
 
 Environment:
   PRINT_BRIDGE_PORT     TCP port to listen on               (default ${DEFAULT_PORT})
@@ -135,7 +138,7 @@ if (enrollAt !== -1) {
 } else if (args.includes('--list-printers')) {
   void listPrinters();
 } else if (testPrintAt !== -1) {
-  void testPrint(args[testPrintAt + 1]);
+  void testPrint(args[testPrintAt + 1], optionValue('--doc'), optionValue('--station'));
 } else {
   runService();
 }
@@ -178,9 +181,15 @@ async function listPrinters(): Promise<void> {
  * Deliberately NOT through the queue: this is a diagnostic, and the answer wanted is "did this
  * printer take the bytes, right now" rather than "was it accepted for printing later".
  */
-async function testPrint(printerId: string | undefined): Promise<void> {
+async function testPrint(printerId: string | undefined, doc?: string, station?: string): Promise<void> {
   if (!printerId || printerId.startsWith('-')) {
     console.error('--test-print needs a printer id. Run --list-printers to see them.');
+    process.exit(2);
+  }
+  // The same rules as `POST /printers/:id/test`, so a typo here fails the same way it would there.
+  const { request, errors } = parseTestPrintBody({ doc, station });
+  if (errors.length > 0) {
+    console.error(errors.join('\n'));
     process.exit(2);
   }
   const printer = findPrinter(loadRegistry(), printerId);
@@ -190,10 +199,12 @@ async function testPrint(printerId: string | undefined): Promise<void> {
   }
 
   try {
-    const payload = render(printer.type === 'label' ? sampleLabel(printer) : sampleReceipt(printer), printer);
+    const chosen = resolveSample(printer, request);
+    const payload = render(sampleFor(printer, request), printer);
     const outcome = await driverFor(printer.transport).send(printer, payload, 15_000);
     if (outcome.ok) {
-      console.log(`Sent ${payload.length} bytes to ${printer.id} in ${outcome.duration_ms}ms.`);
+      const what = chosen.station ? `${chosen.doc} slip, ${chosen.station}` : `${chosen.doc} slip`;
+      console.log(`Sent ${payload.length} bytes (${what}) to ${printer.id} in ${outcome.duration_ms}ms.`);
       process.exit(0);
     }
     console.error(`Failed: ${outcome.reason} (${outcome.printed_certainty}) — ${outcome.detail}`);
@@ -202,6 +213,18 @@ async function testPrint(printerId: string | undefined): Promise<void> {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
+}
+
+/** The word after an option such as `--doc`, or undefined when the option is absent. */
+function optionValue(name: string): string | undefined {
+  const at = args.indexOf(name);
+  if (at === -1) return undefined;
+  const value = args[at + 1];
+  if (!value || value.startsWith('-')) {
+    console.error(`${name} needs a value.`);
+    process.exit(2);
+  }
+  return value;
 }
 
 function runService(): void {

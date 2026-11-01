@@ -43,7 +43,7 @@ import { describeJob, isSafeJobId, queue, type JobRecord } from './queue.js';
 import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
 import { loadState, stateDir, statePath } from './identity.js';
 import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay, wakeRelay } from './relay.js';
-import { sampleLabel, sampleReceipt } from './samples.js';
+import { resolveSample, SAMPLE_DOCS, sampleFor, type SampleRequest } from './samples.js';
 import { pairingHandoffTarget, pairingSnapshot, restartPairing } from './pairing.js';
 import { qrSvg } from './qr.js';
 import { printerStatuses } from './status.js';
@@ -404,6 +404,9 @@ interface PrintAnswerContext {
   job_id?: string;
   printer_id?: string;
   job?: JobRecord;
+  /** Test prints only: which sample went out (`receipt` / `kitchen` / `label`) and its banner. */
+  doc?: string;
+  station?: string;
 }
 
 /**
@@ -428,6 +431,8 @@ function printResponder(res: ServerResponse, route: string, ctx: PrintAnswerCont
       reason: payload.reason,
       printed_certainty: payload.printed_certainty,
       deduplicated: payload.deduplicated,
+      doc: ctx.doc,
+      station: ctx.station,
       duration_ms: Date.now() - startedAt,
     };
     if (status >= 400 && status < 500) {
@@ -438,10 +443,18 @@ function printResponder(res: ServerResponse, route: string, ctx: PrintAnswerCont
       log.warn(`print: ${route} failed — ${String(payload.reason)}${fields.job_id ? ` (job ${fields.job_id})` : ''}`, {
         event: route === '/printers/:id/test' ? 'print.test.result' : 'print.sync.result', ...fields,
       });
-    } else {
-      log.debug(`print: ${route} answered ${status}`, {
-        event: route === '/printers/:id/test' ? 'print.test.result' : 'print.sync.result', ...fields,
+    } else if (route === '/printers/:id/test') {
+      /*
+       * Info, not debug, for a test print that came out. Someone pressed a button and is holding
+       * the paper; the venue log is how support later tells WHICH slip that was. Without it a
+       * test page reads as a bare 980-byte job — which is how a kitchen printer's test slip was
+       * once mistaken for a misrouted customer receipt.
+       */
+      log.info(`print: test ${fields.doc ?? ''} slip printed on ${fields.printer_id}${fields.station ? ` (${fields.station})` : ''}`, {
+        event: 'print.test.result', ...fields,
       });
+    } else {
+      log.debug(`print: ${route} answered ${status}`, { event: 'print.sync.result', ...fields });
     }
     sendJson(res, status, payload);
   };
@@ -638,16 +651,61 @@ async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void
   });
 }
 
-async function handleTestPrint(res: ServerResponse, printerId: string): Promise<void> {
+/** Longest `station` a test print accepts. The banner keeps 20 characters of it; this only bounds junk. */
+const TEST_STATION_MAX = 24;
+
+/**
+ * The optional body of `POST /printers/:id/test`: `{ doc?: 'receipt' | 'kitchen', station? }`.
+ *
+ * Optional end to end: the bridge dashboard and every POS before this sends no body, and gets the
+ * slip the printer's registry `role` implies. A POS that knows the printer is bound to a kitchen
+ * station says so, because venues rarely tag roles and an untagged printer would otherwise still
+ * print the customer sample. Anything malformed is a 400 rather than a guess — a typo in `doc`
+ * printing a receipt is the bug this exists to remove.
+ */
+export function parseTestPrintBody(value: unknown): { request: SampleRequest; errors: string[] } {
+  if (value === undefined || value === null) return { request: {}, errors: [] };
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return { request: {}, errors: ['body must be a JSON object'] };
+  }
+  const raw = value as Record<string, unknown>;
+  const errors: string[] = [];
+  const request: SampleRequest = {};
+  if (raw.doc !== undefined && raw.doc !== null) {
+    if (typeof raw.doc === 'string' && (SAMPLE_DOCS as readonly string[]).includes(raw.doc)) {
+      request.doc = raw.doc as SampleRequest['doc'];
+    } else {
+      errors.push(`doc must be one of ${SAMPLE_DOCS.join(', ')}`);
+    }
+  }
+  if (raw.station !== undefined && raw.station !== null) {
+    if (typeof raw.station === 'string' && raw.station.length <= TEST_STATION_MAX) {
+      request.station = raw.station;
+    } else {
+      errors.push(`station must be a string of at most ${TEST_STATION_MAX} characters`);
+    }
+  }
+  return { request, errors };
+}
+
+async function handleTestPrint(res: ServerResponse, printerId: string, body: unknown): Promise<void> {
   const ctx: PrintAnswerContext = { printer_id: printerId };
   const answer = printResponder(res, '/printers/:id/test', ctx);
+  const parsed = parseTestPrintBody(body);
+  if (parsed.errors.length > 0) {
+    answer(400, { ok: false, reason: 'invalid-body', errors: parsed.errors });
+    return;
+  }
   const printer = findPrinter(loadRegistry(), printerId);
   if (!printer) {
     answer(404, { ok: false, reason: 'unknown-printer' });
     return;
   }
 
-  const document = printer.type === 'label' ? sampleLabel(printer) : sampleReceipt(printer);
+  const chosen = resolveSample(printer, parsed.request);
+  ctx.doc = chosen.doc;
+  if (chosen.station) ctx.station = chosen.station;
+  const document = sampleFor(printer, parsed.request);
   let payload: Buffer;
   try {
     payload = render(document, printer);
@@ -694,7 +752,8 @@ async function handleTestPrint(res: ServerResponse, printerId: string): Promise<
     return;
   }
 
-  answer(outcome.result?.ok ? 200 : 502, { ok: outcome.result?.ok === true, job: describeJob(outcome) });
+  // `sample` says which slip went out, so a caller can name it ("kitchen test ticket sent").
+  answer(outcome.result?.ok ? 200 : 502, { ok: outcome.result?.ok === true, sample: chosen, job: describeJob(outcome) });
 }
 
 /**
@@ -1306,7 +1365,7 @@ export function createBridgeServer(): Server {
       if (method === 'POST' && segments[0] === 'printers' && segments.length === 3) {
         const printerId = segments[1] ?? '';
         if (segments[2] === 'test') {
-          await handleTestPrint(res, printerId);
+          await handleTestPrint(res, printerId, value);
           return;
         }
         if (segments[2] === 'identify') {

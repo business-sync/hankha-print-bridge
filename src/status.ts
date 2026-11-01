@@ -19,6 +19,8 @@ export interface PrinterStatus {
   type: string;
   language: string;
   enabled: boolean;
+  /** The registry `role` tag (`receipt` / `kitchen` / `bar`), or null when nobody tagged it. */
+  role: string | null;
   online: boolean;
   latency_ms: number | null;
   detail?: string;
@@ -64,6 +66,7 @@ async function probeOne(printer: PrinterRecord): Promise<PrinterStatus> {
   return {
     id: printer.id, name: printer.name, transport: printer.transport,
     type: printer.type, language: printer.language, enabled: printer.enabled,
+    role: printer.role ?? null,
     ...outcome,
     // Stamped after the probe, not before it. A connect timeout is 1500 ms, so a `checked_at`
     // taken at the top labels the answer with a time from before the question was asked — and
