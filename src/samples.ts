@@ -54,21 +54,49 @@ export function stationBanner(raw: string | undefined): string | null {
   return cleaned || null;
 }
 
+/** What the caller knows beyond the printer itself. */
+export interface SampleContext {
+  /**
+   * The bridge's main receipt printer — `defaultPrinter(registry, 'receipt')`: the one named
+   * `default_receipt_printer` ("Use for bills" in the POS console), or the only receipt printer.
+   * Null when the registry cannot say, i.e. several receipt printers and none named.
+   */
+  mainReceiptPrinterId?: string | null;
+  /** The kitchen ticket's clock. */
+  now?: Date;
+}
+
 /**
  * Which test slip a printer gets, honouring what the caller asked for.
  *
- * Label printers always get the label. Otherwise an explicit `doc` wins, a `station` alone means
- * kitchen, and with neither the registry `role` decides: `kitchen` and `bar` print the kitchen
- * ticket, `receipt` and untagged print the customer sample — untagged stays a receipt because
- * that is what every bridge before 1.14.8 printed, and most printers are the bill printer.
+ * Label printers always get the label. Otherwise, first match wins:
+ *  1. an explicit `doc`;
+ *  2. a `station` alone means kitchen;
+ *  3. the registry `role`: `kitchen` / `bar` print the kitchen ticket, `receipt` the customer sample;
+ *  4. untagged: the main receipt printer prints the customer sample, any OTHER printer the kitchen
+ *     ticket. Venues rarely tag roles, and a kitchen printer whose test page reads
+ *     `TOTAL LAK 50,000` is taken for a kitchen printer that prints bills. When the registry
+ *     cannot say which printer is the main one, untagged stays the customer sample, as every
+ *     bridge before 1.14.8 printed.
  */
-export function resolveSample(printer: PrinterRecord, request: SampleRequest = {}): ResolvedSample {
+export function resolveSample(
+  printer: PrinterRecord,
+  request: SampleRequest = {},
+  context: SampleContext = {},
+): ResolvedSample {
   if (printer.type === 'label') return { doc: 'label', station: null };
   const asked = stationBanner(request.station);
-  const byRole: SampleDoc = printer.role === 'kitchen' || printer.role === 'bar' ? 'kitchen' : 'receipt';
-  const doc = request.doc ?? (asked ? 'kitchen' : byRole);
+  const doc: SampleDoc = request.doc ?? (asked ? 'kitchen' : byRegistry(printer, context.mainReceiptPrinterId ?? null));
   if (doc === 'receipt') return { doc, station: null };
   return { doc, station: asked ?? (printer.role === 'bar' ? 'BAR' : 'KITCHEN') };
+}
+
+/** Steps 3 and 4 of `resolveSample`: what the registry alone says this printer is for. */
+function byRegistry(printer: PrinterRecord, mainReceiptPrinterId: string | null): SampleDoc {
+  if (printer.role === 'kitchen' || printer.role === 'bar') return 'kitchen';
+  if (printer.role === 'receipt') return 'receipt';
+  if (mainReceiptPrinterId === null) return 'receipt';
+  return printer.id === mainReceiptPrinterId ? 'receipt' : 'kitchen';
 }
 
 /** What `resolveSample` decided — also what the test route logs, so a venue log says which slip came out. */
@@ -79,11 +107,11 @@ export interface ResolvedSample {
 }
 
 /** The document `resolveSample` picked, ready to render. */
-export function sampleFor(printer: PrinterRecord, request: SampleRequest = {}, now: Date = new Date()): JobDocument {
-  const { doc, station } = resolveSample(printer, request);
+export function sampleFor(printer: PrinterRecord, request: SampleRequest = {}, context: SampleContext = {}): JobDocument {
+  const { doc, station } = resolveSample(printer, request, context);
   if (doc === 'label') return sampleLabel(printer);
   if (doc === 'receipt') return sampleReceipt(printer);
-  return sampleKitchenTicket(printer, station ?? 'KITCHEN', now);
+  return sampleKitchenTicket(printer, station ?? 'KITCHEN', context.now ?? new Date());
 }
 
 /** The printer-facts block both slips open with: what to compare the paper against. */

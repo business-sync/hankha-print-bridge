@@ -34,8 +34,29 @@ function banner(doc: unknown): string | undefined {
 }
 
 describe('resolveSample', () => {
-  it('keeps the customer sample for an untagged printer, as every earlier bridge did', () => {
+  it('keeps the customer sample for an untagged printer when no main receipt printer is known', () => {
+    // Several receipt printers and none named for bills: the registry cannot say, so it stays
+    // what every earlier bridge printed.
     assert.deepEqual(resolveSample(pizza), { doc: 'receipt', station: null });
+    assert.deepEqual(resolveSample(pizza, {}, { mainReceiptPrinterId: null }), { doc: 'receipt', station: null });
+  });
+
+  it('prints a kitchen ticket on an untagged printer that is not the main receipt printer', () => {
+    // The venue case: Test pressed on an untagged pizza printer, the bills printer named.
+    assert.deepEqual(resolveSample(pizza, {}, { mainReceiptPrinterId: 'bill' }), { doc: 'kitchen', station: 'KITCHEN' });
+  });
+
+  it('keeps the customer sample on the main receipt printer itself', () => {
+    assert.deepEqual(resolveSample(pizza, {}, { mainReceiptPrinterId: 'pizza' }), { doc: 'receipt', station: null });
+  });
+
+  it('lets a role tag beat the main-printer rule', () => {
+    assert.deepEqual(resolveSample({ ...pizza, role: 'receipt' }, {}, { mainReceiptPrinterId: 'bill' }), {
+      doc: 'receipt', station: null,
+    });
+    assert.deepEqual(resolveSample({ ...pizza, role: 'kitchen' }, {}, { mainReceiptPrinterId: 'pizza' }), {
+      doc: 'kitchen', station: 'KITCHEN',
+    });
   });
 
   it('prints a kitchen ticket for a printer tagged kitchen', () => {
@@ -55,6 +76,8 @@ describe('resolveSample', () => {
     // the bill printer tests as a bill even if someone tagged it kitchen.
     assert.deepEqual(resolveSample(pizza, { doc: 'kitchen', station: 'PIZZA' }), { doc: 'kitchen', station: 'PIZZA' });
     assert.deepEqual(resolveSample({ ...pizza, role: 'kitchen' }, { doc: 'receipt' }), { doc: 'receipt', station: null });
+    // ...and over the main-printer rule.
+    assert.deepEqual(resolveSample(pizza, { doc: 'receipt' }, { mainReceiptPrinterId: 'bill' }), { doc: 'receipt', station: null });
   });
 
   it('reads a station on its own as a request for the kitchen ticket', () => {
@@ -120,7 +143,7 @@ describe('the kitchen test ticket', () => {
   });
 
   it('is what sampleFor renders for a kitchen request', () => {
-    assert.deepEqual(sampleFor(pizza, { doc: 'kitchen', station: 'pizza' }, at1119), ticket);
+    assert.deepEqual(sampleFor(pizza, { doc: 'kitchen', station: 'pizza' }, { now: at1119 }), ticket);
   });
 });
 

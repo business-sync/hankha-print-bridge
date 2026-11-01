@@ -9,7 +9,7 @@ import { enroll, isRelayRejected, isRelayRunning, markRelayShutdown, relayDiagno
 import { createWatchdog, watchdogLimitMs } from './watchdog.js';
 import { startPairing } from './pairing.js';
 import { queue } from './queue.js';
-import { findPrinter, loadRegistry, registryPath } from './registry.js';
+import { defaultPrinter, findPrinter, loadRegistry, registryPath } from './registry.js';
 import { render } from './render/index.js';
 import { resolveSample, sampleFor } from './samples.js';
 import { createBridgeServer, isTlsEnabled, parseTestPrintBody } from './server.js';
@@ -55,7 +55,8 @@ Options:
   --test-print <id>     Print a test slip on a configured printer, then exit
     [--doc receipt|kitchen] [--station <code>]
                         Which slip: the customer receipt or a kitchen ticket with that
-                        station as its banner. Default: by the printer's role in printers.json.
+                        station as its banner. Default: by the printer's role in printers.json;
+                        untagged, the bills printer gets the receipt and any other a kitchen ticket.
 
 Environment:
   PRINT_BRIDGE_PORT     TCP port to listen on               (default ${DEFAULT_PORT})
@@ -192,15 +193,17 @@ async function testPrint(printerId: string | undefined, doc?: string, station?: 
     console.error(errors.join('\n'));
     process.exit(2);
   }
-  const printer = findPrinter(loadRegistry(), printerId);
+  const registry = loadRegistry();
+  const printer = findPrinter(registry, printerId);
   if (!printer) {
     console.error(`No printer with id '${printerId}'. Run --list-printers to see them.`);
     process.exit(1);
   }
 
   try {
-    const chosen = resolveSample(printer, request);
-    const payload = render(sampleFor(printer, request), printer);
+    const context = { mainReceiptPrinterId: defaultPrinter(registry, 'receipt')?.id ?? null };
+    const chosen = resolveSample(printer, request, context);
+    const payload = render(sampleFor(printer, request, context), printer);
     const outcome = await driverFor(printer.transport).send(printer, payload, 15_000);
     if (outcome.ok) {
       const what = chosen.station ? `${chosen.doc} slip, ${chosen.station}` : `${chosen.doc} slip`;

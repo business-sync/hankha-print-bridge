@@ -40,7 +40,7 @@ import {
   type UninstallScope,
 } from './service-actions.js';
 import { describeJob, isSafeJobId, queue, type JobRecord } from './queue.js';
-import { findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
+import { defaultPrinter, findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
 import { loadState, stateDir, statePath } from './identity.js';
 import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay, wakeRelay } from './relay.js';
 import { resolveSample, SAMPLE_DOCS, sampleFor, type SampleRequest } from './samples.js';
@@ -658,10 +658,10 @@ const TEST_STATION_MAX = 24;
  * The optional body of `POST /printers/:id/test`: `{ doc?: 'receipt' | 'kitchen', station? }`.
  *
  * Optional end to end: the bridge dashboard and every POS before this sends no body, and gets the
- * slip the printer's registry `role` implies. A POS that knows the printer is bound to a kitchen
- * station says so, because venues rarely tag roles and an untagged printer would otherwise still
- * print the customer sample. Anything malformed is a 400 rather than a guess — a typo in `doc`
- * printing a receipt is the bug this exists to remove.
+ * slip `resolveSample` infers from the registry (role, else bills printer vs any other). A POS
+ * that knows the printer is bound to a kitchen station says so, which also names the station on
+ * the banner. Anything malformed is a 400 rather than a guess — a typo in `doc` printing a
+ * receipt is the bug this exists to remove.
  */
 export function parseTestPrintBody(value: unknown): { request: SampleRequest; errors: string[] } {
   if (value === undefined || value === null) return { request: {}, errors: [] };
@@ -696,16 +696,18 @@ async function handleTestPrint(res: ServerResponse, printerId: string, body: unk
     answer(400, { ok: false, reason: 'invalid-body', errors: parsed.errors });
     return;
   }
-  const printer = findPrinter(loadRegistry(), printerId);
+  const registry = loadRegistry();
+  const printer = findPrinter(registry, printerId);
   if (!printer) {
     answer(404, { ok: false, reason: 'unknown-printer' });
     return;
   }
 
-  const chosen = resolveSample(printer, parsed.request);
+  const context = { mainReceiptPrinterId: defaultPrinter(registry, 'receipt')?.id ?? null };
+  const chosen = resolveSample(printer, parsed.request, context);
   ctx.doc = chosen.doc;
   if (chosen.station) ctx.station = chosen.station;
-  const document = sampleFor(printer, parsed.request);
+  const document = sampleFor(printer, parsed.request, context);
   let payload: Buffer;
   try {
     payload = render(document, printer);
