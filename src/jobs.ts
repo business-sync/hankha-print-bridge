@@ -30,7 +30,7 @@ import {
   defaultPrinter, disabledAtAddress, findPrinter, loadRegistry, resolveByAddress,
   DEFAULT_DOTS_PER_LINE, type PrinterRecord, type Registry,
 } from './registry.js';
-import { parseLabelDocument, parseReceiptDocument, render, RenderError } from './render/index.js';
+import { parseLabelDocument, parseReceiptDocument, render, RenderError, widthMismatch } from './render/index.js';
 
 /** A raster receipt on 80 mm paper is a few hundred KB; four megabytes is far past any real slip. */
 export const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
@@ -48,7 +48,18 @@ export interface JobRequest {
 
 export type Prepared =
   | { ok: true; printer: PrinterRecord; payload: Buffer; copies: number; ttl_s: number | undefined; job_id: string | undefined }
-  | { ok: false; status: number; reason: string; errors?: string[] };
+  | { ok: false; status: number; reason: string; errors?: string[]; expected?: number };
+
+/**
+ * Stricter checks for the LAN API, off for every other caller.
+ *
+ * `declaredWidth` is the line width the terminal says it laid the slip out for. With it set, a
+ * width that is not the printer's is a structured `width_mismatch` instead of whatever the renderer
+ * would have done with it.
+ */
+export interface PrepareOptions {
+  lan?: { declaredWidth: number };
+}
 
 /** A target the registry has never heard of. Network only — the other transports need real config. */
 export function adHocNetworkPrinter(ip: string, port: number): PrinterRecord {
@@ -120,7 +131,7 @@ function resolvePrinter(request: JobRequest, wants: 'receipt' | 'label'): Printe
  * Everything that can go wrong is returned rather than thrown, with the HTTP status the caller
  * should use, because both callers need to report a reason and only one of them is HTTP.
  */
-export function prepare(request: JobRequest): Prepared {
+export function prepare(request: JobRequest, options: PrepareOptions = {}): Prepared {
   const forms = [request.payload_base64, request.receipt, request.label].filter((v) => v !== undefined);
   if (forms.length === 0) {
     return { ok: false, status: 400, reason: 'invalid-body', errors: ['send exactly one of payload_base64, receipt or label'] };
@@ -162,6 +173,19 @@ export function prepare(request: JobRequest): Prepared {
     return { ok: false, status: 400, reason: 'invalid-document', errors: parsed.errors };
   }
 
+  if (options.lan) {
+    const mismatch = widthMismatch(parsed.document, printer, options.lan.declaredWidth);
+    if (mismatch) {
+      return {
+        ok: false,
+        status: 422,
+        reason: 'width_mismatch',
+        expected: mismatch.expected,
+        errors: [`printer '${printer.id}' prints ${mismatch.expected} dots per line`],
+      };
+    }
+  }
+
   try {
     const payload = render(parsed.document, printer);
     if (payload.length > MAX_PAYLOAD_BYTES) {
@@ -172,6 +196,56 @@ export function prepare(request: JobRequest): Prepared {
     if (err instanceof RenderError) return { ok: false, status: 422, reason: 'render-failed', errors: err.errors };
     throw err;
   }
+}
+
+export interface LanJobRequest {
+  printer_id: string;
+  document: unknown;
+  dots_per_line: number;
+  expires_in_s: number;
+}
+
+export type LanPrepared =
+  | { ok: true; printer: PrinterRecord; payload: Buffer; ttl_s: number; rendered_dots: number | undefined }
+  | { ok: false; status: number; reason: string; errors?: string[]; expected?: number };
+
+/**
+ * `prepare`, as the LAN API needs it.
+ *
+ * Two differences, both about trust. A LAN caller may name a printer only by REGISTRY ID: there is
+ * no `target`, no raw bytes, no address — a signed terminal still must not be able to make this
+ * machine dial an arbitrary host. And a registry id that is not (or no longer) there is a
+ * rejection the terminal can act on, never a fall back to some address.
+ *
+ * Everything past that — parsing, the size cap, rendering — is `prepare`, so a document means the
+ * same thing whichever door it came in by.
+ */
+export function prepareLan(request: LanJobRequest): LanPrepared {
+  const printer = findPrinter(loadRegistry(), request.printer_id);
+  if (!printer) {
+    return { ok: false, status: 422, reason: 'printer_unknown', errors: [`no printer with id '${request.printer_id}' on this bridge`] };
+  }
+  if (!printer.enabled) {
+    return { ok: false, status: 422, reason: 'printer_disabled', errors: [disabledError(printer)] };
+  }
+
+  const kind = (request.document as { kind?: unknown } | null | undefined)?.kind;
+  const prepared = prepare(
+    {
+      printer_id: printer.id,
+      copies: 1,
+      ttl_s: request.expires_in_s,
+      ...(kind === 'label' ? { label: request.document } : { receipt: request.document }),
+    },
+    { lan: { declaredWidth: request.dots_per_line } }
+  );
+  if (prepared.ok) {
+    return { ok: true, printer: prepared.printer, payload: prepared.payload, ttl_s: prepared.ttl_s ?? request.expires_in_s, rendered_dots: prepared.printer.dots_per_line };
+  }
+  if (prepared.status === 413) return { ...prepared, reason: 'payload_too_large' };
+  if (prepared.reason === 'invalid-document') return { ...prepared, reason: 'invalid_document' };
+  if (prepared.reason === 'render-failed') return { ...prepared, reason: 'render_failed' };
+  return prepared;
 }
 
 /**

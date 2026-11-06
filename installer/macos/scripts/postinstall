@@ -14,6 +14,19 @@ chown root:wheel "$PLIST"
 chmod 644 "$PLIST"
 chown -R root:wheel /usr/local/hankha/print-bridge
 chmod 755 "$BINARY" /usr/local/hankha/print-bridge/uninstall.sh
+[ -f /usr/local/hankha/print-bridge/lan-api.sh ] && chmod 755 /usr/local/hankha/print-bridge/lan-api.sh
+
+# An upgrade must not silently switch the LAN print API (TCP 9201) off: lan.json lives beside the
+# binary and the package payload does not contain it, so it survives. What a new binary path or
+# a reset firewall can lose is the Application Firewall allow-list entry, so re-assert it when
+# the option is on. Best effort, and a no-op when lan.json is absent.
+if grep -q '"enabled"[[:space:]]*:[[:space:]]*true' /usr/local/hankha/print-bridge/lan.json 2>/dev/null; then
+  SFW=/usr/libexec/ApplicationFirewall/socketfilterfw
+  if [ -x "$SFW" ]; then
+    "$SFW" --add "$BINARY" >/dev/null 2>&1 || true
+    "$SFW" --unblockapp "$BINARY" >/dev/null 2>&1 || true
+  fi
+fi
 
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 launchctl bootstrap system "$PLIST"

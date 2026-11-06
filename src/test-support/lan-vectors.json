@@ -1,0 +1,190 @@
+{
+  "version": 1,
+  "contract": "docs/printing/LAN_WIRE_CONTRACT.md",
+  "warning": "TEST KEYS. The private halves are published here so an implementation can reproduce the signatures. Never trust these keys outside a test: a Bridge must not pin them, a backend must not sign with them.",
+  "encodings": {
+    "b64u": "base64url without padding",
+    "p256_signature": "IEEE P1363, r||s, 64 bytes (NOT DER). signature_der_b64u is the same signature in DER and MUST be refused.",
+    "ed25519_signature": "64 bytes, deterministic",
+    "canonical_json": "JSON.stringify of the ticket payload with keys in the contract order, no whitespace"
+  },
+  "now": 1760000000,
+  "now_note": "Verify tickets as if the clock read this unix time.",
+  "bridge_id": "77",
+  "backend_key": {
+    "kid": "vec-backend-1",
+    "algorithm": "Ed25519",
+    "seed_hex": "8af78796c1d5ef3c759331570a9df9a8cc6d1f0f0ca1a29f37a05f48332e0e31",
+    "pkcs8_b64u": "MC4CAQAwBQYDK2VwBCIEIIr3h5bB1e88dZMxVwqd-ajMbR8PDKGinzegX0gzLg4x",
+    "spki_b64u": "MCowBQYDK2VwAyEAdb3yFqZCDLImgXavPZidUFSZehvfUpSUwBTycZbbYoc"
+  },
+  "bridge_key": {
+    "algorithm": "Ed25519",
+    "seed_hex": "5db3588bd514961ba1ac26bf2ed271a780c554bc4c8cbf7be55355e49f60d758",
+    "pkcs8_b64u": "MC4CAQAwBQYDK2VwBCIEIF2zWIvVFJYboawmvy7ScaeAxVS8TIy_e-VTVeSfYNdY",
+    "spki_b64u": "MCowBQYDK2VwAyEAtTO8e0yK6EbgrgbxLF1OIpTZghYAPXJ5n_wNOpvP4lQ"
+  },
+  "terminal_key": {
+    "algorithm": "ECDSA P-256",
+    "jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "hD4vn6ewxGewEGbb3m7dk0br8fnOFYlCwznsu2-usdQ",
+      "y": "sC3UTxnIWE13iwwyH_tkd_A_QtvvnKtHg7bvCQssaFY",
+      "d": "vmmW-iyLU_8QoN4A7QRcDATNK7FfCYqL7Oan3j4VSdo"
+    },
+    "pkcs8_b64": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgvmmW+iyLU/8QoN4A7QRcDATNK7FfCYqL7Oan3j4VSdqhRANCAASEPi+fp7DEZ7AQZtvebt2TRuvx+c4ViULDOey7b66x1LAt1E8ZyFhNd4sMMh/7ZHfwP0Lb75yrR4O27wkLLGhW",
+    "spki_b64u": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhD4vn6ewxGewEGbb3m7dk0br8fnOFYlCwznsu2-usdSwLdRPGchYTXeLDDIf-2R38D9C2--cq0eDtu8JCyxoVg"
+  },
+  "ticket": {
+    "payload": {
+      "v": 1,
+      "org_id": 2,
+      "branch_id": 8,
+      "terminal_id": "term-vector-01",
+      "bridge_id": "77",
+      "bridge_pubkey": "MCowBQYDK2VwAyEAtTO8e0yK6EbgrgbxLF1OIpTZghYAPXJ5n_wNOpvP4lQ",
+      "terminal_pubkey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhD4vn6ewxGewEGbb3m7dk0br8fnOFYlCwznsu2-usdSwLdRPGchYTXeLDDIf-2R38D9C2--cq0eDtu8JCyxoVg",
+      "kid": "vec-backend-1",
+      "iat": 1759996400,
+      "exp": 1762588400
+    },
+    "canonical_json": "{\"v\":1,\"org_id\":2,\"branch_id\":8,\"terminal_id\":\"term-vector-01\",\"bridge_id\":\"77\",\"bridge_pubkey\":\"MCowBQYDK2VwAyEAtTO8e0yK6EbgrgbxLF1OIpTZghYAPXJ5n_wNOpvP4lQ\",\"terminal_pubkey\":\"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhD4vn6ewxGewEGbb3m7dk0br8fnOFYlCwznsu2-usdSwLdRPGchYTXeLDDIf-2R38D9C2--cq0eDtu8JCyxoVg\",\"kid\":\"vec-backend-1\",\"iat\":1759996400,\"exp\":1762588400}",
+    "signature_b64u": "GnT9rNphCNDR1rxELbhMnonG29OYzEwvShFm5YuCc2nFbdCKhG7FNAhXRuK2FAtTAYOem8d5tqXbSI3smy3LDg",
+    "ticket": "eyJ2IjoxLCJvcmdfaWQiOjIsImJyYW5jaF9pZCI6OCwidGVybWluYWxfaWQiOiJ0ZXJtLXZlY3Rvci0wMSIsImJyaWRnZV9pZCI6Ijc3IiwiYnJpZGdlX3B1YmtleSI6Ik1Db3dCUVlESzJWd0F5RUF0VE84ZTB5SzZFYmdyZ2J4TEYxT0lwVFpnaFlBUFhKNW5fd05PcHZQNGxRIiwidGVybWluYWxfcHVia2V5IjoiTUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFaEQ0dm42ZXd4R2V3RUdiYjNtN2RrMGJyOGZuT0ZZbEN3em5zdTItdXNkU3dMZFJQR2NoWVRYZUxERElmLTJSMzhEOUMyLS1jcTBlRHR1OEpDeXhvVmciLCJraWQiOiJ2ZWMtYmFja2VuZC0xIiwiaWF0IjoxNzU5OTk2NDAwLCJleHAiOjE3NjI1ODg0MDB9.GnT9rNphCNDR1rxELbhMnonG29OYzEwvShFm5YuCc2nFbdCKhG7FNAhXRuK2FAtTAYOem8d5tqXbSI3smy3LDg"
+  },
+  "hello": {
+    "nonce": "dmVjdG9yLW5vbmNlLTAx"
+  },
+  "requests": [
+    {
+      "name": "post-job",
+      "method": "POST",
+      "target": "/lan/v1/jobs",
+      "body": "{\"dedupe_key\":\"sale-1042-receipt-0\",\"printer_id\":\"receipt\",\"job_type\":\"RECEIPT\",\"document\":{\"kind\":\"receipt\",\"elements\":[{\"type\":\"text\",\"value\":\"Bill 1042 ເຂົ້າປຸ້ນ\"}]},\"dots_per_line\":576,\"expires_in_s\":3600}",
+      "body_sha256_hex": "1348db6d78590792b2ba69a23be3407e754b6af066c50cd279e8cdace4aff27f",
+      "counter": 1,
+      "nonce_header": "dmVjdG9yLW5vbmNlLTAx.1",
+      "signing_string": "HANKHA-LAN1\nPOST\n/lan/v1/jobs\n1348db6d78590792b2ba69a23be3407e754b6af066c50cd279e8cdace4aff27f\ndmVjdG9yLW5vbmNlLTAx.1",
+      "signature_b64u": "WeXhTeWCw8UcQiGnHAusWRZZHrqu39omWbGX0Bii7ecwaiYT1FGblqxxB5FRv9EIE6XruPnV8yy5Dn51uXwN-A",
+      "signature_der_b64u": "MEQCIFnl4U3lgsPFHEIhpxwLrFkWWR66rt_aJlmxl9AYou3nAiAwaiYT1FGblqxxB5FRv9EIE6XruPnV8yy5Dn51uXwN-A"
+    },
+    {
+      "name": "get-printers-empty-body",
+      "method": "GET",
+      "target": "/lan/v1/printers",
+      "body": null,
+      "body_sha256_hex": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "counter": 2,
+      "nonce_header": "dmVjdG9yLW5vbmNlLTAx.2",
+      "signing_string": "HANKHA-LAN1\nGET\n/lan/v1/printers\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ndmVjdG9yLW5vbmNlLTAx.2",
+      "signature_b64u": "Mj8_PHod48lKgaSd0MHejniymXjRjPr6Ko9MxcAAFzCUDQ4wGJf22CYAeTCPfiZLx9w9IVxGx3bg7WBEf8blGw",
+      "signature_der_b64u": "MEUCIDI_Pzx6HePJSoGkndDB3o54spl40Yz6-iqPTMXAABcwAiEAlA0OMBiX9tgmAHkwj34mS8fcPSFcRsd24O1gRH_G5Rs"
+    },
+    {
+      "name": "post-status-with-query",
+      "method": "POST",
+      "target": "/lan/v1/jobs/status?probe=1",
+      "body": "{\"keys\":[\"sale-1042-receipt-0\"]}",
+      "body_sha256_hex": "0ea4f6f790544cfbb6da3d73846332acfad09e44ffd7a3631b80fb1161068254",
+      "counter": 3,
+      "nonce_header": "dmVjdG9yLW5vbmNlLTAx.3",
+      "signing_string": "HANKHA-LAN1\nPOST\n/lan/v1/jobs/status?probe=1\n0ea4f6f790544cfbb6da3d73846332acfad09e44ffd7a3631b80fb1161068254\ndmVjdG9yLW5vbmNlLTAx.3",
+      "signature_b64u": "Da26_I7-IOFlUipddt_y9j5IcVnKIBfd6pTALzhhvojd_np2WhKoQTHYZMTrjgVJwb3DMIKKB3dg60_e9qNIGg",
+      "signature_der_b64u": "MEUCIA2tuvyO_iDhZVIqXXbf8vY-SHFZyiAX3eqUwC84Yb6IAiEA3f56dloSqEEx2GTE644FScG9wzCCigd3YOtP3vajSBo"
+    }
+  ],
+  "ack": {
+    "dedupe_key": "sale-1042-receipt-0",
+    "job_id": "a3b1c2d4-0000-4000-8000-000000000001",
+    "accepted_at": "2025-10-09T08:53:21.000Z",
+    "nonce_header": "dmVjdG9yLW5vbmNlLTAx.1",
+    "signing_string": "HANKHA-LAN1-ACK\nsale-1042-receipt-0\na3b1c2d4-0000-4000-8000-000000000001\n2025-10-09T08:53:21.000Z\ndmVjdG9yLW5vbmNlLTAx.1",
+    "sig": "1-vzDOG0Yz8Jc0VMunXbipMeXpt1w784TvHzHu3HEje3h9PRalcafBvUzquzyGhLDwCNWamK_1T_TNoXhl4dCA"
+  },
+  "negative": [
+    {
+      "name": "body-tampered",
+      "from": "post-job",
+      "mutate": {
+        "body_replace": [
+          "sale-1042",
+          "sale-9999"
+        ]
+      },
+      "expect": "bad_signature"
+    },
+    {
+      "name": "path-tampered",
+      "from": "post-job",
+      "mutate": {
+        "target": "/lan/v1/jobs/status"
+      },
+      "expect": "bad_signature"
+    },
+    {
+      "name": "method-tampered",
+      "from": "get-printers-empty-body",
+      "mutate": {
+        "method": "POST"
+      },
+      "expect": "bad_signature"
+    },
+    {
+      "name": "query-tampered",
+      "from": "post-status-with-query",
+      "mutate": {
+        "target": "/lan/v1/jobs/status?probe=2"
+      },
+      "expect": "bad_signature"
+    },
+    {
+      "name": "nonce-tampered",
+      "from": "post-job",
+      "mutate": {
+        "nonce_header": "dmVjdG9yLW5vbmNlLTAx.9"
+      },
+      "expect": "bad_signature"
+    },
+    {
+      "name": "der-signature",
+      "from": "post-job",
+      "mutate": {
+        "use": "signature_der_b64u"
+      },
+      "expect": "bad_signature"
+    },
+    {
+      "name": "wrong-bridge",
+      "from": "post-job",
+      "mutate": {
+        "verifier_bridge_id": "78"
+      },
+      "expect": "wrong_bridge"
+    },
+    {
+      "name": "ticket-expired",
+      "from": "post-job",
+      "mutate": {
+        "clock": 1762674801
+      },
+      "expect": "ticket_expired"
+    },
+    {
+      "name": "ticket-ok-inside-skew",
+      "from": "post-job",
+      "mutate": {
+        "clock": 1762674799
+      },
+      "expect": "accepted"
+    },
+    {
+      "name": "unknown-kid",
+      "from": "post-job",
+      "mutate": {
+        "verifier_keys": []
+      },
+      "expect": "unknown_kid"
+    }
+  ]
+}

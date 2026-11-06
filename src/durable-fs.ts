@@ -37,8 +37,10 @@ function writeAll(fd: number, data: string | Buffer): void {
 }
 
 /** Write `data` to `path` so that afterwards it is either the old file or the whole new one, on disk. */
-export function writeFileDurable(path: string, data: string | Buffer, temp = `${path}.tmp`): void {
-  const fd = openSync(temp, 'w');
+export function writeFileDurable(path: string, data: string | Buffer, temp = `${path}.tmp`, mode?: number): void {
+  // `mode` only matters on creation of the temp file, which is the file that is renamed into place,
+  // so a secret (a private key) is never on disk with looser permissions than it ends up with.
+  const fd = mode === undefined ? openSync(temp, 'w') : openSync(temp, 'w', mode);
   try {
     writeAll(fd, data);
     fsyncSync(fd);

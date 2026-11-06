@@ -10,6 +10,9 @@ fi
 LABEL=la.hankha.print-bridge
 
 launchctl bootout "system/$LABEL" 2>/dev/null || true
+# Drop the Application Firewall allow-list entry the LAN print API option may have added.
+SFW=/usr/libexec/ApplicationFirewall/socketfilterfw
+[ -x "$SFW" ] && "$SFW" --remove /usr/local/hankha/print-bridge/hankha-print-bridge >/dev/null 2>&1 || true
 rm -f "/Library/LaunchDaemons/$LABEL.plist"
 rm -rf /usr/local/hankha/print-bridge
 # Leave the log behind on purpose — it is the only record of why a till stopped printing.

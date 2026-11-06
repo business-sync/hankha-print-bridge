@@ -22,6 +22,23 @@
   private firewall profile. Off by default: a POS served over https can only reach a bridge on
   localhost, so most tills never need it.
 
+  An upgrade KEEPS this setting: running install.ps1 again without -Lan leaves a bridge that was
+  installed with -Lan serving the network (and re-adds its firewall rule). Pass -NoLan to turn it
+  off. (Until M5 a plain reinstall silently switched it off.)
+
+.PARAMETER NoLan
+  Turn the legacy 9200 network option off, deleting bridge.env and its firewall rule.
+
+.PARAMETER LanApi
+  The signed LAN print API for tablets and phones (port 9201, see docs/printing). Three values:
+    keep  (default) leave it exactly as it is: an enabled <DataDir>\lan.json stays enabled, and
+          its firewall rule is re-asserted; a bridge that never had it stays without it.
+    on    write lan.json {enabled, port 9201, host 0.0.0.0} and open TCP 9201 on the PRIVATE
+          firewall profile only (never Public or Domain).
+    off   delete lan.json and the rule. The bridge's LAN key (lan-key.json) is kept, so turning
+          it back on does not invalidate tickets already issued.
+  With no lan.json the bridge opens no new port at all.
+
 .PARAMETER SkipCopy
   Files are already in place (how Setup.exe calls this) — just register and start.
 
@@ -33,6 +50,8 @@
 [CmdletBinding()]
 param(
   [switch]$Lan,
+  [switch]$NoLan,
+  [ValidateSet('keep', 'on', 'off')][string]$LanApi = 'keep',
   [switch]$SkipCopy,
   [int]$Port = 9200,
   [string]$InstallDir = (Join-Path $env:ProgramFiles 'Hankha\Print Bridge')
@@ -80,7 +99,17 @@ if (-not $SkipCopy -and ((Resolve-Path $Source).Path -ne (Resolve-Path $InstallD
 # ---------------------------------------------------------------- bind address
 
 $envFile = Join-Path $DataDir 'bridge.env'
-if ($Lan) {
+
+# Upgrades keep what the operator chose (hazard 17): the Setup.exe runs this script with no
+# network flag on every upgrade, and the old code read "no -Lan" as "turn it off".
+$envText = if (Test-Path $envFile) { Get-Content -Path $envFile -ErrorAction SilentlyContinue } else { @() }
+$hadLan = [bool]($envText | Where-Object { $_ -match '^\s*PRINT_BRIDGE_HOST\s*=\s*0\.0\.0\.0\s*$' })
+if ($hadLan -and -not $PSBoundParameters.ContainsKey('Port')) {
+  $kept = $envText | Where-Object { $_ -match '^\s*PRINT_BRIDGE_PORT\s*=\s*(\d{2,5})\s*$' } | Select-Object -First 1
+  if ($kept -and $kept -match '(\d{2,5})') { $Port = [int]$Matches[1] }
+}
+
+if ($Lan -or ($hadLan -and -not $NoLan)) {
   Write-Host 'Allowing other terminals on this network...'
   @('# Overrides read by print-bridge.cmd at startup.',
     'PRINT_BRIDGE_HOST=0.0.0.0',
@@ -89,13 +118,63 @@ if ($Lan) {
   netsh advfirewall firewall add rule name="Hankha Print Bridge" dir=in action=allow `
     protocol=TCP localport=$Port profile=private | Out-Null
 } else {
-  # A previous -Lan install would otherwise keep listening wide after a plain reinstall.
+  # -NoLan, or a bridge that never had it: a previous -Lan install must not keep listening wide.
   Remove-Item $envFile -ErrorAction SilentlyContinue
   netsh advfirewall firewall delete rule name="Hankha Print Bridge" 2>$null | Out-Null
   if ($Port -ne 9200) {
     @('PRINT_BRIDGE_HOST=127.0.0.1', "PRINT_BRIDGE_PORT=$Port") |
       Set-Content -Path $envFile -Encoding ASCII
   }
+}
+
+# ---------------------------------------------------------------- LAN print API (port 9201)
+#
+# The bridge reads <DataDir>\lan.json at startup; without it no extra port is opened. This block
+# only writes or removes that file and the firewall rule beside it - the bridge does the rest.
+# Written as ASCII on purpose: Windows PowerShell's "UTF8" adds a byte-order mark, and the
+# bridge's JSON parser refuses a file that starts with one (it would then stay OFF, silently).
+# print-bridge.cmd never touches lan.json, so a reboot or a task restart keeps the choice.
+
+$lanFile = Join-Path $DataDir 'lan.json'
+$lanRule = 'Hankha Print Bridge LAN API'
+$lanPort = 9201
+
+function Get-LanApiState {
+  # Returns the port when lan.json says {"enabled": true}, otherwise $null. Never throws.
+  try {
+    if (-not (Test-Path $lanFile)) { return $null }
+    $c = Get-Content -Raw -Path $lanFile | ConvertFrom-Json
+    if ($c.enabled -ne $true) { return $null }
+    if ($c.port -is [int] -or $c.port -is [long]) { return [int]$c.port }
+    return 9201
+  } catch { return $null }
+}
+
+switch ($LanApi) {
+  'on' {
+    Write-Host 'Turning on the LAN print API (port 9201, private networks only)...'
+    '{"enabled":true,"port":9201,"host":"0.0.0.0"}' | Set-Content -Path $lanFile -Encoding ASCII
+    $lanPort = 9201
+    $lanActive = $true
+  }
+  'off' {
+    Write-Host 'Turning off the LAN print API...'
+    Remove-Item $lanFile -ErrorAction SilentlyContinue
+    $lanActive = $false
+  }
+  default {
+    $kept = Get-LanApiState
+    $lanActive = ($null -ne $kept)
+    if ($lanActive) { $lanPort = $kept }
+  }
+}
+
+netsh advfirewall firewall delete rule name="$lanRule" 2>$null | Out-Null
+if ($lanActive) {
+  # profile=private: the rule never applies on a Public or Domain network.
+  netsh advfirewall firewall add rule name="$lanRule" dir=in action=allow `
+    protocol=TCP localport=$lanPort profile=private | Out-Null
+  Write-Host "LAN print API is ON (TCP $lanPort, private network profile)."
 }
 
 # ---------------------------------------------------------------- scheduled task

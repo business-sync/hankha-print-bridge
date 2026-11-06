@@ -356,6 +356,7 @@ if (buildMac) {
   mkdirSync(join(stage, 'Library/LaunchDaemons'), { recursive: true });
   cpSync(macBinary, join(target, 'hankha-print-bridge'));
   cpSync(join(INSTALLER, 'macos/uninstall.sh'), join(target, 'uninstall.sh'));
+  cpSync(join(INSTALLER, 'macos/lan-api.sh'), join(target, 'lan-api.sh'));
   cpSync(
     join(INSTALLER, `macos/${IDENTIFIER}.plist`),
     join(stage, `Library/LaunchDaemons/${IDENTIFIER}.plist`)

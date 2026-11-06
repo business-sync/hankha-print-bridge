@@ -41,6 +41,22 @@ private network profile:
 
     .\install.ps1 -Lan
 
+Upgrading keeps this setting. To turn it off:  .\install.ps1 -NoLan
+
+
+LET TABLETS AND PHONES PRINT WITHOUT THE INTERNET (LAN PRINT API)
+-----------------------------------------------------------------
+A separate, signed option on TCP 9201. It is OFF unless you ask for it, and until you do the
+bridge opens no extra port. Turn it on, off, or leave it alone on upgrade:
+
+    .\install.ps1 -LanApi on
+    .\install.ps1 -LanApi off
+    .\install.ps1                  (default "keep": an upgrade changes nothing)
+
+"on" writes C:\ProgramData\Hankha\PrintBridge\lan.json and opens TCP 9201 on the PRIVATE
+network profile only. If this computer's network is set to Public, tablets will not reach it;
+change the network profile to Private rather than opening the firewall further.
+
 
 UNINSTALL
 ---------

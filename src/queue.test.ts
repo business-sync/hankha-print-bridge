@@ -24,10 +24,16 @@ after(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 });
 
-function printer(id: string): PrinterRecord {
+/*
+ * One address per id. Lanes are keyed by address (M5: two registry ids at one address must not
+ * interleave), so the tests that need two printers working at once give them two addresses — which
+ * is what two printers are.
+ */
+function printer(id: string, address?: string): PrinterRecord {
+  const last = 50 + ([...id].reduce((sum, ch) => sum + ch.charCodeAt(0), 0) % 150);
   return {
     id, name: id, transport: 'network', type: 'receipt', language: 'escpos',
-    enabled: true, address: '192.168.1.50', port: 9100, dots_per_line: 576,
+    enabled: true, address: address ?? `192.168.1.${last}`, port: 9100, dots_per_line: 576,
   };
 }
 
@@ -800,7 +806,7 @@ describe('queue logging', () => {
     const restore = setLogSink((r) => records.push(r));
     try {
       const queue = new PrintQueue({ dir: scratch(), send: async () => ok() });
-      await queue.submit({ job_id: 'logged-1', source: 'relay', printer: printer('kitchen'), payload }).settled;
+      await queue.submit({ job_id: 'logged-1', source: 'relay', printer: printer('kitchen', '192.168.1.50'), payload }).settled;
       const submit = records.find((r) => r.event === 'queue.submit');
       const attempt = records.find((r) => r.event === 'queue.attempt');
       const done = records.find((r) => r.event === 'queue.done');

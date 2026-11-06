@@ -160,8 +160,19 @@ Section /o "Serve other terminals on this network" SecLan
   Pop $0
 SectionEnd
 
+Section /o "Print from tablets and phones on this network (LAN print API)" SecLanApi
+  SetShellVarContext all
+  ; Off by default, and an upgrade never turns it off: install.ps1 -LanApi defaults to "keep", so
+  ; the SecCore call above leaves an enabled lan.json alone. Ticking this writes lan.json and opens
+  ; TCP 9201 on the PRIVATE firewall profile only. Without it the bridge opens no extra port.
+  DetailPrint "Turning on the LAN print API..."
+  nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\install.ps1" -SkipCopy -InstallDir "$INSTDIR" -Port ${PORT} -LanApi on'
+  Pop $0
+SectionEnd
+
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecCore} "The print helper itself, started automatically at boot."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecLanApi} "Let tablets and phones in this shop print through this computer without the internet (port 9201, private networks only). Off unless ticked; an upgrade keeps whatever was chosen before."
   !insertmacro MUI_DESCRIPTION_TEXT ${SecLan} "Let other computers on this network use this bridge, and open port ${PORT} on the private firewall profile. Not needed when the POS runs on this computer."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
@@ -180,6 +191,8 @@ Section "Uninstall"
   Pop $0
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="${APPNAME}"'
   Pop $0
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="${APPNAME} LAN API"'
+  Pop $0
   Sleep 500
 
   Delete "$INSTDIR\hankha-print-bridge.exe"
@@ -192,6 +205,8 @@ Section "Uninstall"
   RMDir "$PROGRAMFILES64\Hankha"
 
   Delete "$APPDATA\Hankha\PrintBridge\bridge.env"
+  Delete "$APPDATA\Hankha\PrintBridge\lan.json"
+  ; lan-key.json (the signing key) stays with the other state, like the pairing identity.
   ; Logs stay: they are the only record of why a till stopped printing.
 
   Delete "$SMPROGRAMS\Hankha\Print Bridge status.lnk"

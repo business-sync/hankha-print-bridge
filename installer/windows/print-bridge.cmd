@@ -17,6 +17,9 @@ rem Read by src/service.ts; the "This computer" card on its page depends on gett
 set "PRINT_BRIDGE_MANAGED=scheduled-task"
 
 set "DATADIR=%ProgramData%\Hankha\PrintBridge"
+rem The LAN print API (port 9201) is switched by %DATADIR%\lan.json, which the BRIDGE reads itself;
+rem this launcher deliberately never creates, edits or deletes it, so a restart, a reboot and an
+rem upgrade all keep whatever install.ps1 -LanApi chose.
 set "ENVFILE=%DATADIR%\bridge.env"
 set "LOGDIR=%DATADIR%\logs"
 set "LOGFILE=%LOGDIR%\bridge.log"
@@ -39,4 +42,5 @@ if exist "%LOGFILE%" (
 
 echo. >> "%LOGFILE%"
 echo ==== started %DATE% %TIME% ==== >> "%LOGFILE%"
+if exist "%DATADIR%\lan.json" echo lan.json present: the bridge decides from its contents whether to open the LAN print API >> "%LOGFILE%"
 "%~dp0hankha-print-bridge.exe" >> "%LOGFILE%" 2>&1

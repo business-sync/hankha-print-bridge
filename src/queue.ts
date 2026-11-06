@@ -22,6 +22,12 @@
  *     live in a bounded ring on disk. That ring is the last line of defence: if the server ever
  *     redelivers a job — a bug, a replay, a partition, or our own result POST failing right after
  *     a successful print — the second delivery is ANSWERED, not reprinted.
+ *
+ * A job may also carry a `dedupe_key` (the LAN API, and the relay once the backend sends one). Its
+ * IDENTITY is then the key, not the `job_id`: the same key arriving by the LAN and by the relay is
+ * one job, whichever door it came in by. Those jobs are remembered in their own, longer ring
+ * (`keyed-ring.ts`) and only when the outcome should stop a resend — see `rememberKeyed`. A job
+ * without a key is handled exactly as it always was.
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
@@ -30,9 +36,10 @@ import { backoffMs } from './backoff.js';
 import { appendFileDurable, writeFileDurable } from './durable-fs.js';
 import { stateDir } from './identity.js';
 import { SAFE_JOB_ID, isSafeJobId } from './job-id.js';
-import type { PrintOutcome, PrintedCertainty } from './lan.js';
+import { KeyedRing, type KeyedEntry } from './keyed-ring.js';
+import { DEFAULT_PRINTER_PORT, type PrintOutcome, type PrintedCertainty } from './lan.js';
 import { log } from './log.js';
-import type { PrinterRecord } from './registry.js';
+import { findPrinter, loadRegistry, type PrinterRecord } from './registry.js';
 import { ResultOutbox } from './result-outbox.js';
 import { driverFor } from './transports/index.js';
 import type { SendOptions } from './transports/transport.js';
@@ -113,7 +120,41 @@ export interface JobRecord {
    * never match and evict the ones that can.
    */
   keyed: boolean;
+  /**
+   * The terminal's idempotency key. When present it is the job's identity (`jobIdentity`) and the
+   * `job_id` is only the Bridge's own handle (and the spool filename).
+   */
+  dedupe_key?: string;
+  /**
+   * The printer was named by its registry id, so it is looked up again on every attempt: re-pointing
+   * its IP, or turning it off, then affects jobs that are already queued. Absent for every job that
+   * is not a keyed registry job, which keep the snapshot they were addressed with.
+   */
+  registry_id?: boolean;
+  /** The line width the payload was rendered for. A registry job refuses a printer that has since changed. */
+  rendered_dots?: number;
   result?: JobResult;
+}
+
+/** What identifies a job: the terminal's key when it sent one, otherwise the id it was given. */
+export function jobIdentity(job: Pick<JobRecord, 'job_id' | 'dedupe_key'>): string {
+  return job.dedupe_key ?? job.job_id;
+}
+
+/** The charset the LAN contract allows for a `dedupe_key`: 8-128 of `[A-Za-z0-9._:-]`. */
+export const DEDUPE_KEY = /^[A-Za-z0-9._:-]{8,128}$/;
+
+/**
+ * One lane per physical destination.
+ *
+ * Two registry entries can point at one address (a kitchen and a bar station sharing a printer),
+ * and two lanes writing to one device interleave into a shredded slip. Network printers are keyed
+ * by address, so ids sharing it share a lane. Every other transport keeps one lane per id.
+ */
+export function laneKeyOf(printer: PrinterRecord): string {
+  return printer.transport === 'network' && printer.address
+    ? `net:${printer.address}:${printer.port ?? DEFAULT_PRINTER_PORT}`
+    : printer.id;
 }
 
 /** The wire view — the same record without a megabyte of base64. */
@@ -125,6 +166,11 @@ export type JobView = Omit<JobRecord, 'payload_base64' | 'printer'> & {
 
 export interface SubmitInput {
   job_id?: string;
+  /** See `JobRecord.dedupe_key`. Validated against `DEDUPE_KEY`. */
+  dedupe_key?: string;
+  /** See `JobRecord.registry_id`. */
+  registry_id?: boolean;
+  rendered_dots?: number;
   source: 'local' | 'relay';
   printer: PrinterRecord;
   payload: Buffer;
@@ -190,6 +236,10 @@ export interface QueueOptions {
   sendTimeoutMs?: number;
   /** How far past `sendTimeoutMs` a driver may run before the lane gives up on it. */
   watchdogGraceMs?: number;
+  /** Looks a registry printer up again for a `registry_id` job. Overridden in tests. */
+  resolvePrinter?: (id: string) => PrinterRecord | null;
+  /** Retention knobs for the dedupe-key ring. Overridden in tests. */
+  keyedRing?: ConstructorParameters<typeof KeyedRing>[1];
 }
 
 // Job ids become filenames; see `job-id.ts` for why they are constrained.
@@ -239,7 +289,7 @@ export class PrintQueue {
     options?: SendOptions
   ) => Promise<PrintOutcome>;
 
-  /** Everything not yet settled, by id. */
+  /** Everything not yet settled, by IDENTITY (`jobIdentity`): the dedupe key when there is one. */
   private readonly active = new Map<string, JobRecord>();
   /** FIFO per printer. The head is the job being worked on. */
   private readonly lanes = new Map<string, JobRecord[]>();
@@ -248,6 +298,15 @@ export class PrintQueue {
   /** Settled ids remembered across restarts, so a redelivery is answered rather than reprinted. */
   private readonly settledResults = new Map<string, JobResult>();
   private settledLines = 0;
+  /** Outcomes of jobs that carry a `dedupe_key`; see `keyed-ring.ts`. */
+  private readonly keyedRing: KeyedRing;
+  private readonly resolveLive: (id: string) => PrinterRecord | null;
+  /** Jobs whose bytes are on the wire right now. */
+  private readonly sendingNow = new Set<JobRecord>();
+  /** Lanes asleep between a failed attempt and the next one. */
+  private readonly backingOff = new Set<string>();
+  /** When each printer last took a job's bytes without error, by printer id. */
+  private readonly lastOk = new Map<string, string>();
   private readonly history: JobRecord[] = [];
   private draining = false;
   private loaded = false;
@@ -263,6 +322,8 @@ export class PrintQueue {
   constructor(options: QueueOptions = {}) {
     this.dir = options.dir ?? stateDir();
     this.outbox = new ResultOutbox(this.dir);
+    this.keyedRing = new KeyedRing(this.dir, options.keyedRing);
+    this.resolveLive = options.resolvePrinter ?? ((id) => findPrinter(loadRegistry(), id));
     this.maxAttempts = options.maxAttempts ?? envInt('PRINT_BRIDGE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS, 1, 10);
     this.sendTimeoutMs = options.sendTimeoutMs ?? envInt('PRINT_BRIDGE_SEND_TIMEOUT_MS', DEFAULT_SEND_TIMEOUT_MS, 1000, 120_000);
     this.watchdogGraceMs = options.watchdogGraceMs ?? DEFAULT_WATCHDOG_GRACE_MS;
@@ -344,7 +405,7 @@ export class PrintQueue {
         // Settled before the crash but the spool file outlived it. `finish` records the outcome in
         // the ring BEFORE removing the file for exactly this reason: finding the id there means
         // the job already ran, and queueing it again would print it a second time.
-        if (this.settledResults.has(job.job_id)) {
+        if (job.dedupe_key ? this.keyedRing.has(job.dedupe_key) : this.settledResults.has(job.job_id)) {
           alreadySettled += 1;
           log.warn(`queue: spool file for job ${job.job_id} was already settled — discarding it, not reprinting`, {
             event: 'queue.spool.already_settled', job_id: job.job_id,
@@ -367,7 +428,7 @@ export class PrintQueue {
         }
 
         job.status = 'queued';
-        this.active.set(job.job_id, job);
+        this.active.set(jobIdentity(job), job);
         this.laneFor(job).push(job);
         recovered += 1;
       }
@@ -386,6 +447,7 @@ export class PrintQueue {
   }
 
   private loadSettledRing(): void {
+    this.keyedRing.load();
     const path = join(this.dir, SETTLED_FILE);
     if (!existsSync(path)) return;
     try {
@@ -410,6 +472,10 @@ export class PrintQueue {
 
   private rememberSettled(job: JobRecord): void {
     if (!job.result) return;
+    if (job.dedupe_key) {
+      this.rememberKeyed(job, job.dedupe_key);
+      return;
+    }
     // A job nobody named cannot be resubmitted under its id, so recording it would fill the
     // ring with entries that can never match and evict the ones that can.
     if (!job.persistent && !job.keyed) return;
@@ -476,6 +542,33 @@ export class PrintQueue {
   }
 
   /**
+   * Remember the outcome of a job that carries a `dedupe_key`, when it should stop a resend.
+   *
+   * Only three outcomes qualify:
+   *  - `ok`: it printed, and a resend would print it twice;
+   *  - `unknown`: bytes may have reached the paper, and nobody can find out — a resend would be a
+   *    guess that costs a second slip, so the operator decides, and reprints under a NEW key;
+   *  - `cancelled`: somebody decided, and a late resend must not quietly overturn it.
+   *
+   * Everything else provably did not print (`none`, `expired`). A later send of the same key has to
+   * be allowed to try again, which is the whole point of an outbox that keeps a job until it prints.
+   */
+  private rememberKeyed(job: JobRecord, key: string): void {
+    const result = job.result;
+    if (!result) return;
+    const remember = result.ok || result.printed_certainty !== 'none' || result.reason === 'cancelled';
+    if (!remember) return;
+    this.keyedRing.add({
+      key,
+      job_id: job.job_id,
+      result,
+      accepted_at: job.created_at,
+      settled_at: new Date().toISOString(),
+      printer_id: job.printer.id,
+    });
+  }
+
+  /**
    * Remove a job's spool file. Never throws.
    *
    * `rmSync(..., { force })` only forgives a missing file. With the spool directory itself gone,
@@ -513,7 +606,7 @@ export class PrintQueue {
   }
 
   private laneFor(job: JobRecord): JobRecord[] {
-    const key = job.printer.id;
+    const key = laneKeyOf(job.printer);
     const lane = this.lanes.get(key);
     if (lane) return lane;
     const created: JobRecord[] = [];
@@ -528,12 +621,28 @@ export class PrintQueue {
     if (supplied && !isSafeJobId(supplied)) {
       throw new Error(`job_id must match ${SAFE_JOB_ID}`);
     }
+    const dedupeKey = input.dedupe_key;
+    if (dedupeKey !== undefined && !DEDUPE_KEY.test(dedupeKey)) {
+      throw new Error(`dedupe_key must match ${DEDUPE_KEY}`);
+    }
     const jobId = supplied || randomUUID();
+    const identity = dedupeKey ?? jobId;
 
-    const existing = this.active.get(jobId);
+    const existing = this.active.get(identity);
     if (existing) return { job: existing, settled: this.waitFor(existing), deduplicated: true };
 
-    const remembered = this.settledResults.get(jobId);
+    if (dedupeKey) {
+      const entry = this.keyedRing.get(dedupeKey);
+      if (entry) {
+        log.warn(`job ${dedupeKey} was submitted again — re-reporting the first outcome, NOT reprinting`, {
+          event: 'queue.duplicate', job_id: entry.job_id, dedupe_key: dedupeKey,
+        });
+        const replay = this.recordFromRing(entry, input.printer);
+        return { job: replay, settled: Promise.resolve(replay), deduplicated: true };
+      }
+    }
+
+    const remembered = dedupeKey ? undefined : this.settledResults.get(jobId);
     if (remembered) {
       // The single most important branch in this file. Something asked us to print a job we have
       // already handled; report what happened the first time and print nothing.
@@ -576,7 +685,10 @@ export class PrintQueue {
       expires_at: input.ttl_s && input.ttl_s > 0 ? new Date(now + input.ttl_s * 1000).toISOString() : null,
       retryable: input.retryable ?? persistent,
       persistent,
-      keyed: Boolean(supplied),
+      keyed: Boolean(supplied) || Boolean(dedupeKey),
+      ...(dedupeKey ? { dedupe_key: dedupeKey } : {}),
+      ...(input.registry_id ? { registry_id: true } : {}),
+      ...(input.rendered_dots !== undefined ? { rendered_dots: input.rendered_dots } : {}),
       ...(input.retry_window_ms && input.retry_window_ms > 0
         ? { retry_until: new Date(now + input.retry_window_ms).toISOString() }
         : {}),
@@ -592,18 +704,49 @@ export class PrintQueue {
       // Not queued at all: the caller is about to say "accepted", and this would make that a lie.
       throw new SpoolWriteError(jobId, spooled.error);
     }
-    this.active.set(jobId, job);
+    this.active.set(identity, job);
     this.lastActivity = Date.now();
     this.laneFor(job).push(job);
     log.info(`queue: job ${jobId} queued for ${job.printer.id} (${job.printer.transport})`, {
       event: 'queue.submit', job_id: jobId, printer_id: job.printer.id, source: job.source,
+      dedupe_key: dedupeKey,
       transport: job.printer.transport, bytes: input.payload.length, copies: job.copies,
       address: job.printer.address ? `${job.printer.address}:${job.printer.port ?? ''}` : undefined,
       lane_depth: this.laneFor(job).length,
     });
-    this.kick(job.printer.id);
+    this.kick(laneKeyOf(job.printer));
 
     return { job, settled: this.waitFor(job), deduplicated: false };
+  }
+
+  /** A job as the dedupe-key ring remembers it: enough to answer a status question or a resend. */
+  private recordFromRing(entry: KeyedEntry, printer?: PrinterRecord): JobRecord {
+    return {
+      job_id: entry.job_id,
+      dedupe_key: entry.key,
+      source: 'local',
+      printer: printer ?? {
+        id: entry.printer_id, name: entry.printer_id, transport: 'network', type: 'receipt',
+        language: 'escpos', enabled: true,
+      },
+      payload_base64: '',
+      bytes: 0,
+      copies: 1,
+      attempts: 0,
+      status: entry.result.ok ? 'done' : 'failed',
+      created_at: entry.accepted_at,
+      updated_at: entry.settled_at,
+      expires_at: null,
+      retryable: false,
+      persistent: false,
+      keyed: true,
+      result: entry.result,
+    };
+  }
+
+  /** Whether a send of this dedupe key would be answered rather than printed: it is queued or remembered. */
+  isKnown(key: string): boolean {
+    return this.active.has(key) || this.keyedRing.has(key);
   }
 
   private waitFor(job: JobRecord): Promise<JobRecord> {
@@ -651,7 +794,7 @@ export class PrintQueue {
           lane.shift();
           continue;
         }
-        if (!this.active.has(job.job_id)) {
+        if (!this.active.has(jobIdentity(job))) {
           // Cancelled while it waited.
           lane.shift();
           continue;
@@ -698,10 +841,12 @@ export class PrintQueue {
         });
       }, limitMs);
     });
+    this.sendingNow.add(job);
     try {
       return await Promise.race([this.sender(job.printer, payload, this.sendTimeoutMs, sendOptionsFor(job)), stalled]);
     } finally {
       clearTimeout(timer);
+      this.sendingNow.delete(job);
     }
   }
 
@@ -718,6 +863,12 @@ export class PrintQueue {
       log.warn(`queue: job ${job.job_id} expired before printing`, { event: 'queue.expired', job_id: job.job_id });
       this.finish(job);
       return true;
+    }
+
+    if (job.registry_id) {
+      const outcome = this.reresolve(job);
+      if (outcome === 'settled') return true;
+      if (outcome === 'moved') return false;
     }
 
     job.status = 'printing';
@@ -742,6 +893,7 @@ export class PrintQueue {
     if (outcome.ok) {
       job.status = 'done';
       job.result = { ok: true, duration_ms: outcome.duration_ms };
+      this.lastOk.set(job.printer.id, new Date().toISOString());
       // The extra connections are the evidence of a printer that was slow to wake.
       const woke = outcome.connect_attempts
         ? ` (accepted connection ${outcome.connect_attempts} after ${outcome.connected_after_ms}ms)`
@@ -820,15 +972,75 @@ export class PrintQueue {
             : `(attempt ${job.attempts} of ${this.maxAttempts})`),
       { event: 'queue.retry', job_id: job.job_id, printer_id: job.printer.id, reason: outcome.reason, attempt: job.attempts, wait_ms: wait }
     );
-    await this.sleep(wait);
+    const laneKey = laneKeyOf(job.printer);
+    this.backingOff.add(laneKey);
+    try {
+      await this.sleep(wait);
+    } finally {
+      this.backingOff.delete(laneKey);
+    }
     // Deliberately kept at the HEAD of the lane. A per-printer queue is sequential because order
     // matters — kitchen tickets, numbered receipts — and letting a later job overtake a retrying
     // one would silently reorder them.
     return false;
   }
 
+  /**
+   * Look a registry-addressed job's printer up again, just before it is sent.
+   *
+   * A job is queued for a printer by id; by the time it is its turn the operator may have pointed
+   * that id at a new IP, turned it off, removed it, or swapped the roll width. Sending to the old
+   * snapshot would print on the wrong device, or on one the operator had taken out of service.
+   *
+   *  - gone or disabled: the job fails with certainty `none` (nothing was sent), so the terminal
+   *    may resend it once the printer is back;
+   *  - a different line width than the payload was rendered for: same, because the slip would wrap;
+   *  - a different address: the job takes the new address, and moves to that address's lane so two
+   *    ids at one address still cannot write at once.
+   */
+  private reresolve(job: JobRecord): 'ok' | 'settled' | 'moved' {
+    const live = this.resolveLive(job.printer.id);
+    const refuse = (detail: string): 'settled' => {
+      job.status = 'failed';
+      job.result = { ok: false, reason: 'device-missing', printed_certainty: 'none', detail };
+      log.warn(`queue: job ${job.job_id} not sent — ${detail}`, {
+        event: 'queue.reresolve.refused', job_id: job.job_id, printer_id: job.printer.id, dedupe_key: job.dedupe_key,
+      });
+      this.finish(job);
+      return 'settled';
+    };
+    if (!live) return refuse(`printer '${job.printer.id}' is no longer in this bridge's registry`);
+    if (!live.enabled) return refuse(`printer '${job.printer.id}' is disabled on this bridge`);
+    if (job.rendered_dots !== undefined && live.dots_per_line !== undefined && live.dots_per_line !== job.rendered_dots) {
+      return refuse(
+        `printer '${job.printer.id}' now prints ${live.dots_per_line} dots per line, but this slip was laid out for ${job.rendered_dots} — send it again`
+      );
+    }
+
+    const before = laneKeyOf(job.printer);
+    const after = laneKeyOf(live);
+    job.printer = live;
+    if (before === after) return 'ok';
+
+    log.info(`queue: job ${job.job_id} follows printer '${live.id}' to its new address`, {
+      event: 'queue.reresolve.moved', job_id: job.job_id, printer_id: live.id, from: before, to: after,
+    });
+    const from = this.lanes.get(before);
+    const at = from ? from.indexOf(job) : -1;
+    if (from && at !== -1) from.splice(at, 1);
+    const target = this.lanes.get(after) ?? [];
+    this.lanes.set(after, target);
+    // Oldest first, as `load()` orders a lane — but never ahead of a job already on the wire.
+    let index = this.running.has(after) ? 1 : 0;
+    while (index < target.length && (target[index]?.created_at ?? '') <= job.created_at) index += 1;
+    target.splice(Math.min(index, target.length), 0, job);
+    this.persist(job);
+    this.kick(after);
+    return 'moved';
+  }
+
   private finish(job: JobRecord): void {
-    this.active.delete(job.job_id);
+    this.active.delete(jobIdentity(job));
     job.updated_at = new Date().toISOString();
     this.lastActivity = Date.now();
     /*
@@ -863,7 +1075,7 @@ export class PrintQueue {
    * route uses it to decide whether a timeout can honestly claim nothing was printed.
    */
   cancel(jobId: string): boolean {
-    const job = this.active.get(jobId);
+    const job = this.findActive(jobId);
     if (!job || job.status === 'printing') return false;
     job.status = 'failed';
     job.result = { ok: false, reason: 'cancelled', printed_certainty: 'none', detail: 'cancelled before printing' };
@@ -872,7 +1084,7 @@ export class PrintQueue {
     log.info(`queue: job ${jobId} cancelled before printing`, {
       event: 'queue.cancelled', job_id: jobId, printer_id: job.printer.id,
     });
-    const lane = this.lanes.get(job.printer.id);
+    const lane = this.lanes.get(laneKeyOf(job.printer));
     if (lane) {
       const at = lane.indexOf(job);
       if (at !== -1) lane.splice(at, 1);
@@ -881,8 +1093,30 @@ export class PrintQueue {
     return true;
   }
 
-  get(jobId: string): JobRecord | null {
-    return this.active.get(jobId) ?? this.history.find((job) => job.job_id === jobId) ?? null;
+  /** A queued job by identity (its dedupe key) or by the `job_id` it was given. */
+  private findActive(idOrKey: string): JobRecord | undefined {
+    const direct = this.active.get(idOrKey);
+    if (direct) return direct;
+    for (const job of this.active.values()) if (job.job_id === idOrKey) return job;
+    return undefined;
+  }
+
+  /**
+   * A job by id or dedupe key: queued, recently settled, or — for a dedupe key — remembered in the
+   * ring across restarts. Jobs without a key are never read from the ring here: `GET /jobs/:id` has
+   * always answered 404 for a settled job that has aged out of `history`, and keeps doing so.
+   */
+  get(idOrKey: string): JobRecord | null {
+    return (
+      this.findActive(idOrKey) ??
+      this.history.find((job) => job.job_id === idOrKey || job.dedupe_key === idOrKey) ??
+      this.fromKeyedRing(idOrKey)
+    );
+  }
+
+  private fromKeyedRing(key: string): JobRecord | null {
+    const entry = this.keyedRing.get(key);
+    return entry ? this.recordFromRing(entry) : null;
   }
 
   list(): JobRecord[] {
@@ -911,7 +1145,30 @@ export class PrintQueue {
 
   /** True while this printer's lane is sending or has jobs waiting. The keep-warm probe stays off it. */
   isBusy(printerId: string): boolean {
-    return this.running.has(printerId) || (this.lanes.get(printerId)?.length ?? 0) > 0;
+    for (const lane of this.lanes.values()) if (lane.some((job) => job.printer.id === printerId)) return true;
+    return false;
+  }
+
+  /** When this printer last accepted a job's bytes, in this run. Null if it has not. */
+  lastPrintOk(printerId: string): string | null {
+    return this.lastOk.get(printerId) ?? null;
+  }
+
+  /**
+   * Whether a bare connect to this printer could collide with a real job.
+   *
+   * Narrower than `isBusy`, and that is the point. A printer that is switched off keeps its lane
+   * "busy" for as long as a job waits for it — retrying, asleep in backoff — and the keep-warm probe
+   * stayed off it for exactly the time its answer was worth most. A probe only competes with a job
+   * that is sending, or about to: a lane asleep in backoff is neither.
+   */
+  isProbeBlocked(printerId: string): boolean {
+    for (const job of this.sendingNow) if (job.printer.id === printerId) return true;
+    for (const [key, lane] of this.lanes) {
+      if (lane.length === 0 || !lane.some((job) => job.printer.id === printerId)) continue;
+      if (!this.backingOff.has(key)) return true;
+    }
+    return false;
   }
 
   /**
@@ -969,7 +1226,7 @@ export class PrintQueue {
     return {
       spool: { count: spoolCount, bytes: spoolBytes },
       history: { count: this.history.length, bytes: 0 },
-      settled: { count: this.settledResults.size, bytes: settledBytes },
+      settled: { count: this.settledResults.size + this.keyedRing.size, bytes: settledBytes + this.keyedRing.fileBytes() },
     };
   }
 
@@ -1012,10 +1269,12 @@ export class PrintQueue {
        * being sent: delete it and a crash mid-print loses the job entirely, where `load()` would
        * otherwise recover it and settle it honestly as 'unknown'.
        */
+      // Spool files are named by job_id, which is not the map key for a job with a dedupe key.
+      const activeIds = new Set([...this.active.values()].map((job) => job.job_id));
       try {
         for (const entry of readdirSync(this.spoolDir())) {
           if (!entry.endsWith('.json')) continue;
-          if (this.active.has(entry.slice(0, -'.json'.length))) continue;
+          if (activeIds.has(entry.slice(0, -'.json'.length))) continue;
           rmSync(join(this.spoolDir(), entry), { force: true });
           report.spool += 1;
         }
@@ -1030,7 +1289,7 @@ export class PrintQueue {
     }
 
     if (what.settled) {
-      report.settled = this.settledResults.size;
+      report.settled = this.settledResults.size + this.keyedRing.clear();
       this.settledResults.clear();
       this.settledLines = 0;
       rmSync(join(this.dir, SETTLED_FILE), { force: true });

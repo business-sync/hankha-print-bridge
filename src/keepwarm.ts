@@ -43,9 +43,22 @@ export interface KeepWarmResult {
   latency_ms: number | null;
 }
 
+/** What the last probe of a printer found. Null fields mean "never probed", not "down". */
+export interface PrinterReach {
+  reachable: boolean | null;
+  last_ok_at: string | null;
+  checked_at: string | null;
+}
+
 export interface KeepWarm {
   /** Probe every network printer once now (what the timer does). Returns what it saw, for tests. */
   pass(): Promise<KeepWarmResult[]>;
+  /**
+   * What the probes last saw of this printer, kept apart from the lane: a pass that skips a
+   * printer because a job is on the wire leaves the previous answer standing instead of erasing it.
+   * `GET /lan/v1/printers` reads it.
+   */
+  reach(printerId: string): PrinterReach;
   stop(): void;
 }
 
@@ -64,16 +77,27 @@ export function startKeepWarm(opts: KeepWarmOptions = {}): KeepWarm {
   const intervalMs = opts.intervalMs ?? keepWarmMs();
   const probe = opts.probe ?? ((printer, timeoutMs) => networkTransport.probe(printer, timeoutMs));
   const printers = opts.printers ?? (() => loadRegistry().printers);
-  const isBusy = opts.isBusy ?? ((id: string) => queue().isBusy(id));
+  // Skips a printer only while a send is, or is about to be, on the wire — NOT for as long as a job
+  // is merely waiting on it. A printer that is switched off has a job retrying in the lane for the
+  // whole outage, and that is exactly when the answer is wanted. See `PrintQueue.isProbeBlocked`.
+  const isBusy = opts.isBusy ?? ((id: string) => queue().isProbeBlocked(id));
   const gate = new LogGate(10 * 60_000);
   /** Printers last seen unreachable, and since when — the transition is what gets logged. */
   const down = new Map<string, number>();
+  const reaches = new Map<string, PrinterReach>();
   let inFlight: Promise<KeepWarmResult[]> | null = null;
 
   const probeOne = async (printer: PrinterRecord): Promise<KeepWarmResult> => {
     if (isBusy(printer.id)) return { printer_id: printer.id, reachable: null, latency_ms: null };
     const result = await probe(printer, PROBE_TIMEOUT_MS);
     const where = `${printer.address}:${printer.port ?? ''}`;
+    const checkedAt = new Date().toISOString();
+    const before = reaches.get(printer.id);
+    reaches.set(printer.id, {
+      reachable: result.reachable,
+      last_ok_at: result.reachable ? checkedAt : (before?.last_ok_at ?? null),
+      checked_at: checkedAt,
+    });
 
     if (!result.reachable) {
       if (!down.has(printer.id)) {
@@ -109,6 +133,7 @@ export function startKeepWarm(opts: KeepWarmOptions = {}): KeepWarm {
     const targets = printers().filter(isWarmable);
     // Forget printers that were removed or disabled, so re-adding one starts clean.
     for (const id of down.keys()) if (!targets.some((p) => p.id === id)) down.delete(id);
+    for (const id of reaches.keys()) if (!targets.some((p) => p.id === id)) reaches.delete(id);
     inFlight = Promise.all(targets.map(probeOne))
       .then((results) => {
         if (results.length > 0) {
@@ -142,6 +167,7 @@ export function startKeepWarm(opts: KeepWarmOptions = {}): KeepWarm {
 
   return {
     pass,
+    reach: (printerId) => reaches.get(printerId) ?? { reachable: null, last_ok_at: null, checked_at: null },
     stop: () => clearInterval(timer),
   };
 }

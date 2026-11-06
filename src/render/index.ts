@@ -18,6 +18,36 @@ export * from './document.js';
 export { RenderError, charsPerLine, encodeText, EscPosBuilder, PRINT_FALLBACKS, twoColumns } from './escpos.js';
 export { renderLabelEpl2, renderLabelEscPos, renderLabelTspl, renderLabelZpl, renderReceiptEscPos };
 
+/**
+ * Whether a document cannot be printed on this printer because of the paper width, and the width
+ * the printer actually has.
+ *
+ * The LAN API answers this with a structured 422 (`width_mismatch`, `expected`) instead of a render
+ * error's sentence, because the terminal that laid the slip out has to act on it: re-lay it for
+ * `expected` and resend, not show a message to a cashier.
+ *
+ *  - `declared` is the width the terminal says it built for; any difference from the printer's is a
+ *    mismatch, wider OR narrower, because a slip padded for 80 mm is wrong on 58 mm and the other
+ *    way round is a layout the terminal did not intend;
+ *  - a receipt document that pins its own `dots_per_line` wider than the head is refused by the
+ *    renderer anyway; this just says so first, in the same words.
+ *
+ * Null when there is nothing to compare against — a label printer has no line width.
+ */
+export function widthMismatch(
+  document: JobDocument,
+  printer: PrinterRecord,
+  declared?: number
+): { expected: number } | null {
+  const head = printer.dots_per_line;
+  if (head === undefined) return null;
+  if (declared !== undefined && declared !== head) return { expected: head };
+  if (document.kind === 'receipt' && document.dots_per_line !== undefined && document.dots_per_line > head) {
+    return { expected: head };
+  }
+  return null;
+}
+
 export function render(document: JobDocument, printer: PrinterRecord): Buffer {
   if (document.kind === 'receipt') {
     if (printer.language !== 'escpos') {

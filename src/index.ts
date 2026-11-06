@@ -6,6 +6,7 @@ import { registerStopper } from './lifecycle.js';
 import { log } from './log.js';
 import { diagIntervalMs, startDiagnostics } from './diagnostics.js';
 import { keepWarmMs, startKeepWarm } from './keepwarm.js';
+import { startLan, type LanHandle } from './lan-server.js';
 import { enroll, isRelayRejected, isRelayRunning, markRelayShutdown, relayDiagnostics, relayStatus, startRelay } from './relay.js';
 import { createWatchdog, fileBackoffStore, watchdogLimitMs } from './watchdog.js';
 import { startPairing } from './pairing.js';
@@ -14,7 +15,7 @@ import { defaultPrinter, findPrinter, loadRegistry, registryPath } from './regis
 import { render } from './render/index.js';
 import { resolveSample, sampleFor } from './samples.js';
 import { createBridgeServer, isTlsEnabled, parseTestPrintBody } from './server.js';
-import { stateDir, statePath } from './identity.js';
+import { loadState, stateDir, statePath } from './identity.js';
 import { warmTlsTrustStore } from './tls-warmup.js';
 import { driverFor } from './transports/index.js';
 import { BRIDGE_SERVICE, BRIDGE_VERSION, RUNTIME } from './version.js';
@@ -305,6 +306,7 @@ function runService(): void {
   // Started once the port is ours, alongside the relay; stopped by `stop()`.
   let diagnostics: ReturnType<typeof startDiagnostics> | null = null;
   let keepWarm: ReturnType<typeof startKeepWarm> | null = null;
+  let lan: LanHandle | null = null;
 
   server.listen(PORT, HOST, () => {
     /*
@@ -372,6 +374,37 @@ function runService(): void {
 
     diagnostics = startDiagnostics();
     keepWarm = startKeepWarm();
+
+    /*
+     * The LAN print API (M5): a second listener, started only when `<stateDir>/lan.json` enables
+     * it. With no such file nothing here runs — no port, no key, no file written — and this is the
+     * M1 Bridge. It starts here, once the main port and the spool are ours, for the same reason the
+     * relay does: a second copy that loses EADDRINUSE must not already be accepting print jobs.
+     * A failure to start it is logged and survived; the Bridge's job is to print.
+     */
+    try {
+      let idCache: { at: number; id: string | null; install: string } | null = null;
+      const identity = () => {
+        // relay.json is a file read; a request must not pay for one each time.
+        if (!idCache || Date.now() - idCache.at > 2_000) {
+          const st = loadState();
+          idCache = { at: Date.now(), id: st.bridge_id ?? null, install: st.install_id };
+        }
+        return idCache;
+      };
+      lan = startLan({
+        mainPort: PORT,
+        queue: () => queue(),
+        installId: () => identity().install,
+        bridgeId: () => identity().id,
+        relayConnected: () => relayStatus().connected,
+        reach: (id) => keepWarm?.reach(id) ?? { reachable: null, last_ok_at: null, checked_at: null },
+      });
+    } catch (err) {
+      log.error('lan: could not start the LAN print API — the Bridge carries on without it', {
+        event: 'lan.start_failed', err, expected: false,
+      });
+    }
     log.info(`ready in ${Math.round(process.uptime() * 1000)}ms`, {
       event: 'app.ready', startup_ms: Math.round(process.uptime() * 1000),
     });
@@ -430,6 +463,7 @@ function runService(): void {
     });
     diagnostics?.stop();
     keepWarm?.stop();
+    void lan?.stop();
     // A result report waiting to retry gives up now, with a line saying so, instead of holding a
     // timer the exit then kills silently.
     markRelayShutdown();

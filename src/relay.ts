@@ -1,8 +1,10 @@
 import { loadState, saveState, type RelayState } from './identity.js';
 import { containerSuspect, DEFAULT_PRINTER_PORT, localInterfaces, runScan } from './lan.js';
 import { renderJobDocument, resolveRelayPrinter } from './jobs.js';
+import { activeLanKeys, applyRelayLanKeys } from './lan-keys.js';
+import { lanReport } from './lan-server.js';
 import { errorCode, log, LogGate, redactUrl } from './log.js';
-import { queue, type JobResult } from './queue.js';
+import { DEDUPE_KEY, queue, type JobResult } from './queue.js';
 import { loadRegistry } from './registry.js';
 import { relayFetch } from './relay-fetch.js';
 import { connectWebSocket, WebSocketHandshakeError } from './relay-socket.js';
@@ -114,6 +116,18 @@ type Work =
          * for a remote till to send. Preferred over `target_ip` when both somehow arrive.
          */
         printer_id?: string;
+        /**
+         * The terminal's idempotency key (the LAN contract's `dedupe_key`). Absent from every job a
+         * backend without M6 sends. When present it is the job's identity here: the same key that
+         * already printed over the LAN is answered, not printed again.
+         */
+        dedupe_key?: string | null;
+        /**
+         * The one Bridge this job may run on. A frame that reaches any other Bridge is refused
+         * rather than printed: the terminal pinned it because it may already have been sent over
+         * the LAN to that Bridge, and a second Bridge printing it would be a second slip.
+         */
+        pin_bridge_id?: string | number;
         kind: string;
         /** Null when `printer_id` addresses the job instead. */
         target_ip: string | null;
@@ -205,7 +219,15 @@ function describeSelf() {
     // Additive: a server that does not know this field strips it, so an older API keeps
     // working unchanged against a newer bridge.
     registry_printers: describeRegistry(),
+    // Additive, and ABSENT while the LAN API is off, so a Bridge that never turned it on sends the
+    // same heartbeat it always did.
+    ...lanFields(),
   };
+}
+
+function lanFields(): { lan?: NonNullable<ReturnType<typeof lanReport>> } {
+  const lan = lanReport();
+  return lan ? { lan } : {};
 }
 
 /**
@@ -266,11 +288,13 @@ export async function enroll(code: string): Promise<{ bridge_id: string }> {
       arch: self.arch,
       interfaces: self.interfaces,
       registry_printers: self.registry_printers,
+      ...(self.lan ? { lan: self.lan } : {}),
     }),
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw await enrollFailure(res);
-  const body = (await res.json()) as { data: { bridge_id: string; token: string } };
+  const body = (await res.json()) as { data: { bridge_id: string; token: string; lan_keys?: unknown } };
+  applyRelayLanKeys(body.data.lan_keys);
   saveState({
     ...state,
     relay_url: base,
@@ -624,6 +648,31 @@ export async function reportResult(
 export async function handlePrint(base: string, token: string, work: Extract<Work, { type: 'print' }>) {
   const { job } = work;
 
+  // A job pinned to another Bridge is that Bridge's to print. The nearest reason the server's
+  // `JOB_FAILURE_REASONS` accepts is `device-missing`; nothing was sent, so `none` is exact.
+  if (job.pin_bridge_id !== undefined && job.pin_bridge_id !== null) {
+    const own = loadState().bridge_id;
+    if (own === undefined || String(job.pin_bridge_id) !== own) {
+      void reportKept(base, token, job.job_id, {
+        ok: false,
+        reason: 'device-missing',
+        printed_certainty: 'none',
+        detail: `this job is pinned to bridge ${String(job.pin_bridge_id)}, not to this one`,
+      });
+      return;
+    }
+  }
+  // Checked here, not trusted: the key becomes the job's identity in the queue.
+  if (job.dedupe_key !== undefined && job.dedupe_key !== null && (typeof job.dedupe_key !== 'string' || !DEDUPE_KEY.test(job.dedupe_key))) {
+    void reportKept(base, token, job.job_id, {
+      ok: false,
+      reason: 'payload-rejected',
+      printed_certainty: 'none',
+      detail: 'the job carried a dedupe_key that is not 8-128 characters of A-Z a-z 0-9 . _ : -',
+    });
+    return;
+  }
+
   // `printer_id` wins over the address. It is how the server names a printer this machine owns
   // — including USB and serial ones, which have no IP at all and therefore cannot be addressed
   // any other way. A printer the operator turned off is refused however the job reaches it.
@@ -694,6 +743,11 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
     printer,
     payload,
     ttl_s,
+    // Only a keyed job takes part in the LAN API's dedupe, and only then is its printer looked up
+    // again on each attempt — a job without a key is handled exactly as it was before M5.
+    ...(job.dedupe_key
+      ? { dedupe_key: job.dedupe_key, ...(job.printer_id && printer.id === job.printer_id ? { registry_id: true } : {}) }
+      : {}),
   });
 
   // Deliberately NOT awaited. Printing used to happen inline here, which meant a printer taking
@@ -795,14 +849,25 @@ async function handleScan(base: string, token: string, work: Extract<Work, { typ
   }
 }
 
-/** One HTTP heartbeat. Resolves with the status; throws only when no answer came back at all. */
-async function heartbeat(base: string, token: string): Promise<number> {
+/** One HTTP heartbeat. Resolves with the status; throws only when no answer came back at all. Exported for tests. */
+export async function heartbeat(base: string, token: string): Promise<number> {
   const res = await relayFetch(`${base}/api/v1/modules/print/bridge/heartbeat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(describeSelf()),
     signal: AbortSignal.timeout(15_000),
   });
+  // The answer carries the ticket key set (`lan_keys`) — read only while the LAN API is on, so a
+  // Bridge without it touches the body no more than it ever did.
+  if (res.ok && activeLanKeys()) {
+    try {
+      const body = (await res.json()) as { data?: { lan_keys?: unknown }; lan_keys?: unknown } | null;
+      applyRelayLanKeys(body?.data?.lan_keys ?? body?.lan_keys);
+    } catch {
+      /* an answer with no body is a normal answer */
+    }
+    return res.status;
+  }
   // Release the pooled connection.
   await res.body?.cancel().catch(() => undefined);
   return res.status;
@@ -972,6 +1037,8 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
           serverAcks = true;
           lastAckAt = Date.now();
           status.last_ok_at = new Date().toISOString();
+          const ackFrame = work as { lan_keys?: unknown; data?: { lan_keys?: unknown } };
+          applyRelayLanKeys(ackFrame.lan_keys ?? ackFrame.data?.lan_keys);
           return;
         }
         // Unknown types are ignored rather than treated as errors, so the server can add a frame
