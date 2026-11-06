@@ -927,6 +927,35 @@ describe('POST /lan/v1/jobs/:key/cancel', () => {
   it('400 for a key that is not a dedupe key', async () => {
     assert.equal((await cancel('short')).status, 400);
   });
+
+  it('keys appear in the path literally: a colon works as is, and a percent-encoded key is refused, never decoded', async () => {
+    const release = holdSends();
+    hold = release.held;
+    await h.terminal.call('POST', '/lan/v1/jobs', jobBody('sale-1200-r0'));
+    await h.until(() => h.sends === 1);
+    const key = 'rcpt-ord:1201:c-1-default-0';
+    await h.terminal.call('POST', '/lan/v1/jobs', jobBody(key, 'COLON-MARKER'));
+
+    // The encoded spelling of the same key is NOT the same key, and is not decoded to find it.
+    const encoded = await cancel(encodeURIComponent(key));
+    assert.equal(encoded.status, 400);
+    assert.equal(encoded.json.reason, 'invalid_key');
+    const state = await h.terminal.call('POST', '/lan/v1/jobs/status', { keys: [key] });
+    assert.equal(state.json.jobs[0].state, 'queued', 'the refused cancel changed nothing');
+
+    // Other encodings of grammar characters, and of a separator, are refused the same way.
+    for (const bad of ['rcpt-ord%2E1201-c-1-default-0', 'rcpt%2Dord%3A1201%3Ac-1', 'rcpt-ord:1201%00']) {
+      assert.equal((await cancel(bad)).status, 400, bad);
+    }
+
+    const literal = await cancel(key);
+    assert.equal(literal.status, 200);
+    assert.deepEqual(literal.json, { state: 'cancelled' });
+    release.release();
+    hold = undefined;
+    await h.idle();
+    assert.equal(h.printer.count('COLON-MARKER'), 0);
+  });
 });
 
 describe('GET /lan/v1/printers', () => {

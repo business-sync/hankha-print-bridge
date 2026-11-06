@@ -151,6 +151,9 @@ describe('pairing over the shop network, as a process', () => {
     }, 'the LAN listener');
 
     // The terminal asks the Bridge who it is.
+    // Warm the Bridge's identity cache while it is unpaired, so the test fails if pairing leaves it stale.
+    const before = (await (await fetch(`${lan}/lan/v1/hello`)).json()) as { bridge_id: string | null };
+    assert.equal(before.bridge_id, null);
     const info = (await (await fetch(`${lan}/lan/v1/pair-info`)).json()) as { install_id: string; token_hash: string; bridge_pubkey: string; state: string };
     assert.equal(info.state, 'unpaired');
 
@@ -171,6 +174,11 @@ describe('pairing over the shop network, as a process', () => {
     assert.equal(ok.status, 200);
     const done = (await ok.json()) as { paired: boolean; bridge_id: string };
     assert.equal(done.bridge_id, '77');
+
+    // F4: the very next `hello` already names the new bridge id (the identity cache is dropped on
+    // pairing; it used to keep answering null for up to 2 s).
+    const hello = (await (await fetch(`${lan}/lan/v1/hello`)).json()) as { bridge_id: string | null };
+    assert.equal(hello.bridge_id, '77');
 
     // The same relay.json an enrolment writes, plus the LAN markers.
     const relay = readRelayJson(b.dir);

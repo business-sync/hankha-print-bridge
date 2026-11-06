@@ -76,8 +76,8 @@ function relayFrame(key: string | undefined, marker: string, extra: Record<strin
 }
 
 const reported = (id: string) => posts.find((p) => p.id === id);
-async function untilReported(id: string): Promise<Record<string, any>> {
-  await h.until(() => Boolean(reported(id)));
+async function untilReported(id: string, timeoutMs = 5_000): Promise<Record<string, any>> {
+  await h.until(() => Boolean(reported(id)), timeoutMs);
   await h.printer.quiet();
   return (reported(id) as { body: Record<string, any> }).body;
 }
@@ -155,7 +155,9 @@ describe('the same key by the LAN and by the relay', () => {
       // A claim with 12.5 s left gives the Bridge a 2 s deadline (the claim less the 10 s reserve).
       const frame = relayFrame('sale-5005-r0', 'AFTER-EXPIRY', { claim_expires_at: new Date(Date.now() + 12_500).toISOString() });
       await handlePrint(BASE, TOKEN, frame);
-      const result = await untilReported((frame as any).job.job_id);
+      // The queue's retry sleep is not cut at the deadline (backoff of up to ~4 s after an attempt
+      // that started just before it), so the expiry is reported up to ~7 s in: wait for that.
+      const result = await untilReported((frame as any).job.job_id, 15_000);
       assert.equal(result.ok, false);
       assert.equal(result.reason, 'expired');
       assert.equal(result.printed_certainty, 'none');

@@ -406,6 +406,9 @@ function runService(): void {
           relayBase: (state) => relayUrl(state),
           describe: () => ({ hostname: osHostname(), platform: osPlatform(), arch: osArch(), version: BRIDGE_VERSION }),
           onPaired: () => {
+            // `hello` must say the new bridge id at once, not after the 2 s the cache would keep the
+            // pre-pairing answer (a terminal that pairs and immediately asks sees null otherwise).
+            idCache = null;
             stopPairing();
             if (!isRelayRunning()) startRelay();
             else wakeRelay();

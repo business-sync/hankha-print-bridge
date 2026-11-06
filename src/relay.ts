@@ -1,7 +1,7 @@
 import { loadState, saveState, type RelayState } from './identity.js';
 import { containerSuspect, DEFAULT_PRINTER_PORT, localInterfaces, runScan } from './lan.js';
 import { renderJobDocument, resolveRelayPrinter } from './jobs.js';
-import { activeLanKeys, applyRelayLanKeys } from './lan-keys.js';
+import { activeLanKeys, applyRelayLanKeys, backendAcceptsPinMismatch } from './lan-keys.js';
 import { lanReport } from './lan-server.js';
 import { errorCode, log, LogGate, redactUrl } from './log.js';
 import { DEDUPE_KEY, queue, type JobResult } from './queue.js';
@@ -665,14 +665,16 @@ export async function reportResult(
 export async function handlePrint(base: string, token: string, work: Extract<Work, { type: 'print' }>) {
   const { job } = work;
 
-  // A job pinned to another Bridge is that Bridge's to print. The nearest reason the server's
-  // `JOB_FAILURE_REASONS` accepts is `device-missing`; nothing was sent, so `none` is exact.
+  // A job pinned to another Bridge is that Bridge's to print. Nothing was sent, so `none` is exact.
+  // The reason is `pin-mismatch` only when the last answer from the server proved it is a backend
+  // that accepts it (see `backendAcceptsPinMismatch`); otherwise `device-missing`, the nearest
+  // reason every deployed backend accepts. An unfamiliar reason is a 422 and the job never settles.
   if (job.pin_bridge_id !== undefined && job.pin_bridge_id !== null) {
     const own = loadState().bridge_id;
     if (own === undefined || String(job.pin_bridge_id) !== own) {
       void reportKept(base, token, job.job_id, {
         ok: false,
-        reason: 'device-missing',
+        reason: backendAcceptsPinMismatch() ? 'pin-mismatch' : 'device-missing',
         printed_certainty: 'none',
         detail: `this job is pinned to bridge ${String(job.pin_bridge_id)}, not to this one`,
       });
@@ -1055,7 +1057,10 @@ async function runSocketSession(base: string, token: string): Promise<SessionOut
           lastAckAt = Date.now();
           status.last_ok_at = new Date().toISOString();
           const ackFrame = work as { lan_keys?: unknown; data?: { lan_keys?: unknown } };
-          applyRelayLanKeys(ackFrame.lan_keys ?? ackFrame.data?.lan_keys);
+          // Only an ack that carries the key set speaks for the backend; one that does not must not
+          // reset what the last answer proved.
+          const ackKeys = ackFrame.lan_keys ?? ackFrame.data?.lan_keys;
+          if (ackKeys !== undefined) applyRelayLanKeys(ackKeys);
           return;
         }
         // Unknown types are ignored rather than treated as errors, so the server can add a frame

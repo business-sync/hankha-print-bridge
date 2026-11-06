@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { after, afterEach, before, beforeEach, describe, it } from 'node:test';
+import { lanStatusOf } from './lan-server.js';
 import { setLogSink } from './log.js';
+import type { JobRecord } from './queue.js';
 import { readPrinterStatus } from './printer-status.js';
 import { EscposFakePrinter } from './test-support/escpos-printer.js';
 import { jobBody, KITCHEN_PRINTER, LanHarness, RECEIPT_PRINTER } from './test-support/lan-harness.js';
@@ -15,6 +17,30 @@ beforeEach(() => {
   restoreLog = setLogSink(() => undefined);
 });
 afterEach(() => restoreLog?.());
+
+describe('certainty on /lan/v1/jobs/status can never invite a resend', () => {
+  const job = (status: JobRecord['status'], result?: JobRecord['result']): JobRecord =>
+    ({ job_id: 'j', status, updated_at: '2026-11-07T10:00:00.000Z', ...(result ? { result } : {}) }) as JobRecord;
+
+  it('every state that means bytes may be on the wire or paper may be out says unknown, never none', () => {
+    const cases: [string, JobRecord][] = [
+      ['sending', job('printing')],
+      ['bytes_written', job('done', { ok: true })],
+      ['confirmed', job('done', { ok: true, confirmed: true, readback: { answered: true } })],
+      ['unknown (interrupted)', job('failed', { ok: false, reason: 'write-timeout', printed_certainty: 'unknown' })],
+      ['unknown (printer fault)', job('failed', { ok: false, reason: 'printer-fault', printed_certainty: 'unknown', readback: { answered: true, fault: 'paper_out' } })],
+    ];
+    for (const [name, j] of cases) {
+      assert.equal(lanStatusOf('sale-0001-r0', j).certainty, 'unknown', name);
+    }
+  });
+
+  it('none is reserved for the states where nothing reached the printer', () => {
+    assert.equal(lanStatusOf('k', job('queued')).certainty, 'none');
+    assert.equal(lanStatusOf('k', job('failed', { ok: false, reason: 'connect-refused', printed_certainty: 'none' })).certainty, 'none');
+    assert.equal(lanStatusOf('k', null).certainty, 'none');
+  });
+});
 
 describe('LAN API with status readback', () => {
   let h: LanHarness;

@@ -299,6 +299,32 @@ let active: LanKeyStore | null = null;
 /** Set when the LAN API starts; null while it is off, which is how every other module tells. */
 export function setActiveLanKeys(store: LanKeyStore | null): void {
   active = store;
+  if (!store) backendLanProof = false;
+}
+
+/**
+ * Whether the backend that last answered this Bridge is one that accepts the failure reason
+ * `pin-mismatch` (it shipped with the M9 backend; an older one 422s an unfamiliar reason, and the
+ * job would then never settle).
+ *
+ * There is no version handshake, so this is inferred, conservatively, from the one field that
+ * changed in the same release: the key set in the last enrolment, heartbeat or ack answer. A
+ * non-empty `lan_keys` whose every entry has a NUMERIC `not_before` is the M9+ shape; the earlier
+ * backend sent `not_before: null`. No `lan_keys` at all (no signing key configured, an older
+ * backend, or the LAN API off here so the answer is not read) proves nothing and means "no".
+ */
+let backendLanProof = false;
+
+export function backendAcceptsPinMismatch(): boolean {
+  return backendLanProof;
+}
+
+function hasM9Proof(raw: unknown): boolean {
+  return (
+    Array.isArray(raw) &&
+    raw.length > 0 &&
+    raw.every((e) => !!e && typeof e === 'object' && typeof (e as { not_before?: unknown }).not_before === 'number' && Number.isFinite((e as { not_before: number }).not_before))
+  );
 }
 
 export function activeLanKeys(): LanKeyStore | null {
@@ -312,6 +338,10 @@ export function activeLanKeys(): LanKeyStore | null {
  * arrive again with the next heartbeat after it is switched on.
  */
 export function applyRelayLanKeys(raw: unknown): void {
-  if (raw === undefined || raw === null || !active) return;
+  if (!active) return;
+  // Each answer re-decides it: a backend rolled back, or one with its signing key removed, stops
+  // being trusted with `pin-mismatch` at the next heartbeat.
+  backendLanProof = hasM9Proof(raw);
+  if (raw === undefined || raw === null) return;
   active.setKeys(raw);
 }
