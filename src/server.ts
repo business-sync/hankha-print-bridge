@@ -45,6 +45,7 @@ import { defaultPrinter, findPrinter, loadRegistry, parseRegistry, registryPath,
 import { loadState, stateDir, statePath } from './identity.js';
 import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay, wakeRelay } from './relay.js';
 import { resolveSample, SAMPLE_DOCS, sampleFor, type SampleRequest } from './samples.js';
+import { activeLanPairing } from './lan-pair.js';
 import { pairingHandoffTarget, pairingSnapshot, restartPairing } from './pairing.js';
 import { qrSvg } from './qr.js';
 import { printerStatuses } from './status.js';
@@ -823,7 +824,7 @@ async function handleIdentify(res: ServerResponse, printerId: string): Promise<v
 function handlePutPrinters(res: ServerResponse, body: unknown): void {
   // Strict about the serial device: this is the network-facing way in, and an unvalidated path
   // here is what let a request name any file for a print job to overwrite.
-  const { registry, errors } = parseRegistry(body, { strictDevice: true });
+  const { registry, errors } = parseRegistry(body, { strictDevice: true, strict: true });
   if (errors.length > 0) {
     // Every problem at once. A registry is edited whole, so reporting the first mistake only turns
     // one round trip into four.
@@ -836,6 +837,8 @@ function handlePutPrinters(res: ServerResponse, body: unknown): void {
     sendJson(res, 500, { ok: false, reason: 'write-failed', detail: err instanceof Error ? err.message : String(err) });
     return;
   }
+  // Saving the printer list is how an operator says "try the status readback again".
+  queue().readback.clear();
   log.info(`registry: saved ${registry.printers.length} printer(s)`, {
     event: 'registry.saved', printers: registry.printers.length,
   });
@@ -1002,7 +1005,7 @@ export function createBridgeServer(): Server {
     // venue wifi would hand over the shop's printers to whoever asked first. Loopback is the
     // boundary, exactly as it is for `/enroll`.
     const isPairingPath =
-      path === '/pairing' || path === '/pairing/restart' || path === '/pairing/handoff';
+      path === '/pairing' || path === '/pairing/restart' || path === '/pairing/handoff' || path === '/pairing/lan';
     const openToAnyone =
       path === '/health' || path === '/enroll' || isPairingPath || isPageRequest;
     if ((path === '/enroll' || isPairingPath) && method !== 'OPTIONS') {
@@ -1087,6 +1090,9 @@ export function createBridgeServer(): Server {
         // relay is refused shows "removed", one with no credential at all shows a code, and one
         // that is simply offline shows neither.
         has_credential: Boolean(state.token),
+        // Additive, and absent unless `pairing_over_lan` is on: the code a terminal types to pair
+        // this computer over the shop network. Loopback only, like the rest of this route.
+        ...(activeLanPairing() ? { lan: activeLanPairing()?.localSnapshot() } : {}),
         relay: relayStatus(),
         qr_svg: snapshot.code ? qrSvg(snapshot.code, 320) : null,
       });
@@ -1260,6 +1266,30 @@ export function createBridgeServer(): Server {
 
       if (method === 'POST' && path === '/enroll') {
         await handleEnroll(res, record);
+        return;
+      }
+
+      /*
+       * The three things somebody standing at this computer can do about pairing over the shop
+       * network (M9). Loopback-gated above with the other `/pairing/*` routes, because each is a
+       * statement that a person is physically here: opening a re-pair window on a paired Bridge,
+       * and replacing the code (which also clears a lock-out). 404 while the feature is off.
+       */
+      if (method === 'POST' && path === '/pairing/lan') {
+        const pairing = activeLanPairing();
+        if (!pairing) {
+          sendJson(res, 404, { ok: false, reason: 'lan-pairing-off' });
+          return;
+        }
+        const action = record.action;
+        if (action === 'allow_repair') pairing.allowRepair();
+        else if (action === 'close_repair') pairing.closeRepair();
+        else if (action === 'new_code') pairing.newCode();
+        else {
+          sendJson(res, 400, { ok: false, reason: 'invalid-body', detail: "action must be 'allow_repair', 'close_repair' or 'new_code'" });
+          return;
+        }
+        sendJson(res, 200, { ok: true, lan: pairing.localSnapshot() });
         return;
       }
 

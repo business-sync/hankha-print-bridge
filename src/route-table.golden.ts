@@ -33,6 +33,12 @@ export const ROUTE_PROBES: RouteProbe[] = [
   { method: 'OPTIONS', path: '/print' },
   { method: 'OPTIONS', path: '/lan/v1/jobs' },
   { method: 'DELETE', path: '/jobs/x' },
+  // Added with M9 (recorded on the M9 build, not M1): the one new 9200 route, and the pairing
+  // routes that must not exist on 9200 at all. With pairing_over_lan off, /pairing/lan is a 404.
+  { method: 'GET', path: '/pairing' },
+  { method: 'POST', path: '/pairing/lan', body: { action: 'new_code' } },
+  { method: 'GET', path: '/lan/v1/pair-info' },
+  { method: 'POST', path: '/lan/v1/pair', body: {} },
 ];
 
 /** Recorded by replaying ROUTE_PROBES against the M1 build (commit 5218ed3), before any M5 change. */
@@ -58,4 +64,8 @@ export const ROUTE_STATUSES: Record<string, number> = {
   'OPTIONS /print': 204,
   'OPTIONS /lan/v1/jobs': 204,
   'DELETE /jobs/x': 404,
+  'GET /pairing': 200,
+  'POST /pairing/lan': 404,
+  'GET /lan/v1/pair-info': 404,
+  'POST /lan/v1/pair': 404,
 };

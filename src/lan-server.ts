@@ -21,6 +21,9 @@ import { LanKeyStore, setActiveLanKeys } from './lan-keys.js';
 import { log, LogGate } from './log.js';
 import { DEDUPE_KEY, SpoolWriteError, type JobRecord, type PrintQueue } from './queue.js';
 import type { PrinterReach } from './keepwarm.js';
+import { activeLanPairing, LanPairing, setActiveLanPairing, type PairingDeps } from './lan-pair.js';
+import { loadState, saveState } from './identity.js';
+import type { ReadbackSummary } from './printer-status.js';
 import { loadRegistry, type PrinterRecord } from './registry.js';
 
 export const LAN_PROTOCOL = 1;
@@ -37,6 +40,12 @@ const CORS_HEADERS = 'content-type, x-hankha-ticket, x-hankha-nonce, x-hankha-si
 export interface LanConfig {
   port: number;
   host: string;
+  /**
+   * `"pairing_over_lan": true` in lan.json: this Bridge may be enrolled over the shop network by a
+   * terminal carrying a backend-signed grant (`lan-pair.ts`). Absent or anything but `true` is OFF,
+   * and the two pairing routes then do not exist.
+   */
+  pairing_over_lan?: true;
 }
 
 /**
@@ -74,13 +83,14 @@ export function readLanConfig(dir: string = stateDir(), mainPort?: number): LanC
     });
     return null;
   }
-  return { port, host: host.trim() };
+  const pairing = (raw as { pairing_over_lan?: unknown }).pairing_over_lan === true;
+  return { port, host: host.trim(), ...(pairing ? { pairing_over_lan: true as const } : {}) };
 }
 
 // ---------------------------------------------------------------------- job states on the wire
 
 export type LanJobState =
-  | 'queued' | 'sending' | 'bytes_written' | 'failed' | 'unknown' | 'cancelled' | 'expired' | 'unseen';
+  | 'queued' | 'sending' | 'bytes_written' | 'confirmed' | 'failed' | 'unknown' | 'cancelled' | 'expired' | 'unseen';
 
 export interface LanJobStatus {
   dedupe_key: string;
@@ -88,6 +98,11 @@ export interface LanJobStatus {
   certainty: 'none' | 'unknown';
   error?: string;
   settled_at?: string;
+  /**
+   * Present only when a printer that opted in to status readback was asked about this job. See
+   * `printer-status.ts` and LAN_WIRE_CONTRACT.md section 4.
+   */
+  readback?: ReadbackSummary;
 }
 
 /**
@@ -106,8 +121,18 @@ export function lanStatusOf(key: string, job: JobRecord | null): LanJobStatus {
       return { dedupe_key: key, state: 'queued', certainty: 'none', ...error };
     case 'printing':
       return { dedupe_key: key, state: 'sending', certainty: 'unknown' };
-    case 'done':
-      return { dedupe_key: key, state: 'bytes_written', certainty: 'unknown', settled_at: job.updated_at };
+    case 'done': {
+      // `confirmed` keeps certainty `unknown`: the enum has no "printed" value and `unknown` is the
+      // one that forbids a resend. The state itself carries the evidence.
+      const rb = job.result?.readback ? { readback: job.result.readback } : {};
+      return {
+        dedupe_key: key,
+        state: job.result?.confirmed ? 'confirmed' : 'bytes_written',
+        certainty: 'unknown',
+        settled_at: job.updated_at,
+        ...rb,
+      };
+    }
     case 'expired':
       return { dedupe_key: key, state: 'expired', certainty: 'none', ...error, settled_at: job.updated_at };
     case 'failed': {
@@ -121,6 +146,7 @@ export function lanStatusOf(key: string, job: JobRecord | null): LanJobStatus {
         certainty: unknown ? 'unknown' : 'none',
         ...error,
         settled_at: job.updated_at,
+        ...(job.result?.readback ? { readback: job.result.readback } : {}),
       };
     }
   }
@@ -137,6 +163,11 @@ export interface LanServerDeps {
   /** What the printer probes last saw; keep-warm provides it. */
   reach: (printerId: string) => PrinterReach;
   printers?: () => PrinterRecord[];
+  /**
+   * The pairing-over-LAN handler (M9), or null/absent while `pairing_over_lan` is off. Asked per
+   * request, so the two routes exist exactly as long as the switch is on.
+   */
+  pairing?: () => LanPairing | null;
   /** `hello` calls allowed per remote address per minute. Past it: 429. */
   helloPerMinute?: number;
 }
@@ -182,7 +213,7 @@ function cors(res: ServerResponse): void {
   res.setHeader('Access-Control-Max-Age', '600');
 }
 
-type RouteName = 'hello' | 'jobs' | 'status' | 'cancel' | 'printers';
+type RouteName = 'hello' | 'jobs' | 'status' | 'cancel' | 'printers' | 'pair_info' | 'pair';
 
 interface Matched {
   route: RouteName;
@@ -193,7 +224,9 @@ interface Matched {
 const CANCEL_PATH = /^\/lan\/v1\/jobs\/([^/]+)\/cancel$/;
 
 /** The allow-list. Anything that is not one of these five (method and path) is a 404. */
-function matchRoute(method: string, pathname: string): Matched | null {
+function matchRoute(method: string, pathname: string, pairingOn = false): Matched | null {
+  if (pairingOn && method === 'GET' && pathname === '/lan/v1/pair-info') return { route: 'pair_info', method: 'GET' };
+  if (pairingOn && method === 'POST' && pathname === '/lan/v1/pair') return { route: 'pair', method: 'POST' };
   if (method === 'GET' && pathname === '/lan/v1/hello') return { route: 'hello', method: 'GET' };
   if (method === 'GET' && pathname === '/lan/v1/printers') return { route: 'printers', method: 'GET' };
   if (method === 'POST' && pathname === '/lan/v1/jobs') return { route: 'jobs', method: 'POST' };
@@ -205,7 +238,8 @@ function matchRoute(method: string, pathname: string): Matched | null {
   return null;
 }
 
-function isRoutePath(pathname: string): boolean {
+function isRoutePath(pathname: string, pairingOn = false): boolean {
+  if (pairingOn && (pathname === '/lan/v1/pair-info' || pathname === '/lan/v1/pair')) return true;
   return (
     pathname === '/lan/v1/hello' || pathname === '/lan/v1/printers' || pathname === '/lan/v1/jobs' ||
     pathname === '/lan/v1/jobs/status' || CANCEL_PATH.test(pathname)
@@ -214,11 +248,11 @@ function isRoutePath(pathname: string): boolean {
 
 type Body = { ok: true; bytes: Buffer } | { ok: false; reply: Reply };
 
-function readBody(req: IncomingMessage): Promise<Body> {
+function readBody(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<Body> {
   return new Promise((resolve) => {
     const declared = Number(req.headers['content-length']);
-    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-      resolve({ ok: false, reply: reject(413, 'payload_too_large', { max_body_bytes: MAX_BODY_BYTES }, { close: true }) });
+    if (Number.isFinite(declared) && declared > limit) {
+      resolve({ ok: false, reply: reject(413, 'payload_too_large', { max_body_bytes: limit }, { close: true }) });
       return;
     }
     const chunks: Buffer[] = [];
@@ -231,8 +265,8 @@ function readBody(req: IncomingMessage): Promise<Body> {
     };
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        end({ ok: false, reply: reject(413, 'payload_too_large', { max_body_bytes: MAX_BODY_BYTES }, { close: true }) });
+      if (size > limit) {
+        end({ ok: false, reply: reject(413, 'payload_too_large', { max_body_bytes: limit }, { close: true }) });
         return;
       }
       if (!done) chunks.push(chunk);
@@ -453,6 +487,7 @@ export function createLanServer(deps: LanServerDeps): Server {
         role: p.role ?? null,
         dots_per_line: p.dots_per_line ?? null,
         enabled: p.enabled,
+        status_readback: queue.readback.stateOf(p),
         reachable: reach.reachable,
         last_ok_at: okAt,
       };
@@ -469,11 +504,27 @@ export function createLanServer(deps: LanServerDeps): Server {
         protocol: LAN_PROTOCOL,
         install_id: deps.installId(),
         bridge_id: deps.bridgeId(),
-        capabilities: ['print_lan_v1'],
+        capabilities: deps.pairing?.() ? ['print_lan_v1', 'pair_lan_v1'] : ['print_lan_v1'],
         relay: { connected: deps.relayConnected() },
         nonce: deps.auth.issueNonce(),
         max_body_bytes: MAX_BODY_BYTES,
       });
+    }
+
+    if (matched.route === 'pair_info' || matched.route === 'pair') {
+      const pairing = deps.pairing?.();
+      if (!pairing) return reject(404, 'not_found');
+      if (!helloAllowed(req.socket.remoteAddress ?? 'unknown')) {
+        return reject(429, 'rate_limited', {}, { headers: { 'Retry-After': '60' } });
+      }
+      if (matched.route === 'pair_info') {
+        const answer = pairing.info();
+        return jsonReply(answer.status, answer.body, answer.headers ? { headers: answer.headers } : {});
+      }
+      const pairBody = await readBody(req, pairing.maxBodyBytes);
+      if (!pairBody.ok) return pairBody.reply;
+      const answer = pairing.pair(pairBody.bytes);
+      return jsonReply(answer.status, answer.body, answer.headers ? { headers: answer.headers } : {});
     }
 
     const header = (name: string): string | undefined => {
@@ -529,7 +580,7 @@ export function createLanServer(deps: LanServerDeps): Server {
 
     if (method === 'OPTIONS') {
       // Preflight is answered for the five paths only; anything else is not a route.
-      if (isRoutePath(pathname)) {
+      if (isRoutePath(pathname, Boolean(deps.pairing?.()))) {
         res.writeHead(204, { 'Content-Length': '0' });
         res.end();
       } else {
@@ -538,7 +589,7 @@ export function createLanServer(deps: LanServerDeps): Server {
       return;
     }
 
-    const matched = matchRoute(method, pathname);
+    const matched = matchRoute(method, pathname, Boolean(deps.pairing?.()));
     if (!matched) {
       // Unauthenticated and unread: a 404 reveals nothing and costs nothing.
       send(res, reject(404, 'not_found', {}, { close: true }));
@@ -586,6 +637,8 @@ export interface LanReport {
   listening: boolean;
   host: string;
   listen_error?: string;
+  /** Present (true) only while lan.json turns pairing over the LAN on; see LAN_WIRE_CONTRACT.md section 9. */
+  pairing_over_lan?: true;
 }
 
 let current: { config: LanConfig; keys: LanKeyStore; listening: boolean; error?: string } | null = null;
@@ -598,11 +651,12 @@ export function lanReport(): LanReport | null {
     protocol: LAN_PROTOCOL,
     port: current.config.port,
     pubkey: current.keys.publicKey(),
-    capabilities: ['print_lan_v1'],
+    capabilities: activeLanPairing() ? ['print_lan_v1', 'pair_lan_v1'] : ['print_lan_v1'],
     key_ids: current.keys.kids(),
     listening: current.listening,
     host: current.config.host,
     ...(current.error ? { listen_error: current.error } : {}),
+    ...(activeLanPairing() ? { pairing_over_lan: true as const } : {}),
   };
 }
 
@@ -618,6 +672,13 @@ export interface StartLanOptions extends Omit<LanServerDeps, 'auth'> {
   /** The port 9200 listens on, which `lan.json` must not also name. */
   mainPort?: number;
   dir?: string;
+  /**
+   * What pairing over the LAN needs from the rest of the Bridge. Without it `pairing_over_lan` in
+   * lan.json is ignored (and logged): the hooks that start the relay after a pairing live in
+   * `index.ts`, and a pairing that saved a credential and then never connected would be worse than
+   * none.
+   */
+  pairingDeps?: Pick<PairingDeps, 'relayBase'> & Partial<Pick<PairingDeps, 'loadState' | 'saveState' | 'onPaired' | 'describe' | 'mintCode' | 'mintToken'>>;
   /** Overrides `lan.json`; for tests. */
   config?: LanConfig | null;
   retryMs?: number;
@@ -634,7 +695,28 @@ export function startLan(options: StartLanOptions): LanHandle | null {
   keys.publicKey(); // create the Bridge's key now, so the first heartbeat can report it
   setActiveLanKeys(keys);
   const auth = new LanAuth({ keys, bridgeId: options.bridgeId, now: options.now });
-  const server = createLanServer({ ...options, auth });
+  let pairing: LanPairing | null = null;
+  if (config.pairing_over_lan) {
+    if (options.pairingDeps) {
+      pairing = new LanPairing({
+        dir,
+        keys,
+        loadState: options.pairingDeps.loadState ?? loadState,
+        saveState: options.pairingDeps.saveState ?? saveState,
+        relayBase: options.pairingDeps.relayBase,
+        now: options.now,
+        ...(options.pairingDeps.onPaired ? { onPaired: options.pairingDeps.onPaired } : {}),
+        ...(options.pairingDeps.describe ? { describe: options.pairingDeps.describe } : {}),
+        ...(options.pairingDeps.mintCode ? { mintCode: options.pairingDeps.mintCode } : {}),
+        ...(options.pairingDeps.mintToken ? { mintToken: options.pairingDeps.mintToken } : {}),
+      });
+      setActiveLanPairing(pairing);
+      log.info('lan: pairing over the shop network is ON (a paired Bridge still refuses)', { event: 'lan.pair.enabled' });
+    } else {
+      log.warn('lan: pairing_over_lan is set but this build did not wire it — pairing over the LAN stays OFF', { event: 'lan.pair.unwired' });
+    }
+  }
+  const server = createLanServer({ ...options, auth, pairing: () => pairing });
   current = { config, keys, listening: false };
 
   let stopped = false;
@@ -677,6 +759,7 @@ export function startLan(options: StartLanOptions): LanHandle | null {
         stopped = true;
         clearTimeout(retry);
         setActiveLanKeys(null);
+        setActiveLanPairing(null);
         current = null;
         if (!server.listening) {
           resolve();

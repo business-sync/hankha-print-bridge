@@ -66,6 +66,13 @@ export interface PrinterRecord {
   device?: string;
   baud?: number;
 
+  /**
+   * Ask the printer for its status after each job (paper out, cover open, error) and confirm the
+   * print on a healthy answer. OFF unless exactly `true`: some models print, swallow or choke on the
+   * status bytes. Only valid on a network ESC/POS receipt printer. See `printer-status.ts`.
+   */
+  status_readback?: boolean;
+
   /** receipts: printable width in dots. 384 on 58 mm paper, 576 on 80 mm. */
   dots_per_line?: number;
   /** ESC/POS `ESC t n`. Only affects the high half of a byte; ASCII is identical everywhere. */
@@ -227,6 +234,31 @@ function parsePrinter(value: unknown, index: number, errors: string[], options: 
   const gap_mm = optionalInt(raw.gap_mm, 'gap_mm', where, errors, 0, 100);
   const dpi = optionalInt(raw.dpi, 'dpi', where, errors, 100, 1200);
 
+  /*
+   * The opt-in is strict about its type for the same reason `enabled` is: the string "false" is
+   * truthy to a careless reader, and this switch turns on bytes that some printers print as text.
+   * It is also only meaningful on a network ESC/POS receipt printer; anywhere else it is refused
+   * when a person pushes it (PUT /printers) and merely dropped, with a warning, when it is read
+   * from a file already on disk, so an upgrade never makes a working printer vanish.
+   */
+  let status_readback: boolean | undefined;
+  if (raw.status_readback !== undefined && raw.status_readback !== null) {
+    if (typeof raw.status_readback !== 'boolean') {
+      errors.push(`${where}: status_readback must be true or false`);
+    } else if (raw.status_readback) {
+      const fits = transport === 'network' && type === 'receipt' && language === 'escpos';
+      if (fits) {
+        status_readback = true;
+      } else if (options.strict) {
+        errors.push(`${where}: status_readback needs a network ESC/POS receipt printer`);
+      } else {
+        log.warn(`printers.json: ${where} status_readback ignored — it needs a network ESC/POS receipt printer`, {
+          event: 'registry.status_readback_ignored', printer: id,
+        });
+      }
+    }
+  }
+
   if (type === 'label' && (width_mm === undefined || height_mm === undefined)) {
     errors.push(`${where}: a label printer needs width_mm and height_mm`);
   }
@@ -247,6 +279,8 @@ function parsePrinter(value: unknown, index: number, errors: string[], options: 
     device,
     baud: baud ?? (transport === 'serial' ? DEFAULT_BAUD : undefined),
     dots_per_line: dots_per_line ?? (type === 'receipt' ? DEFAULT_DOTS_PER_LINE : undefined),
+    // Present only when on, so a registry that never used it serialises exactly as before.
+    ...(status_readback ? { status_readback: true } : {}),
     codepage,
     width_mm,
     height_mm,
@@ -293,6 +327,11 @@ export interface ParseOptions {
    * working printer with an unusual device path vanish — that is logged instead.
    */
   strictDevice?: boolean;
+  /**
+   * Refuse a setting that does not fit the printer instead of quietly dropping it. Set for
+   * registries arriving over the network, for the same reason as `strictDevice`.
+   */
+  strict?: boolean;
 }
 
 export function parseRegistry(value: unknown, options: ParseOptions = {}): ParseResult {

@@ -1115,6 +1115,16 @@ export const PAGE_STRINGS: Record<string, Row> = {
     '또는 태블릿이나 휴대폰으로 스캔',
   ],
   'ps.orType': ['or type this code', 'ຫຼື ພິມລະຫັດນີ້', 'หรือพิมพ์รหัสนี้', '或输入此代码', 'hoặc nhập mã này', 'またはこのコードを入力', '또는 이 코드를 입력'],
+  // Label only. Translations are first-draft and want a native read before release.
+  'ps.lanCode': [
+    'Code for pairing over the shop network',
+    'ລະຫັດສຳລັບເຊື່ອມຕໍ່ຜ່ານເຄືອຂ່າຍຮ້ານ',
+    'รหัสสำหรับจับคู่ผ่านเครือข่ายร้าน',
+    '通过店内网络配对的代码',
+    'Mã ghép nối qua mạng cửa hàng',
+    '店内ネットワークでペアリングするコード',
+    '매장 네트워크로 페어링하는 코드',
+  ],
   'ps.waiting': ['Waiting', 'ກຳລັງລໍຖ້າ', 'กำลังรอ', '等待中', 'Đang chờ', '待機中', '대기 중'],
   'ps.requesting': ['Getting a code', 'ກຳລັງຂໍລະຫັດ', 'กำลังขอรหัส', '正在获取代码', 'Đang lấy mã', 'コードを取得中', '코드를 가져오는 중'],
   'ps.connectingLead': [

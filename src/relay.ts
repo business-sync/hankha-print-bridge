@@ -530,11 +530,28 @@ function markUp(transport: 'websocket' | 'long-poll'): void {
 }
 
 /** One POST of a result. Resolves with the status; throws only when no answer came back at all. */
+/**
+ * The result as the server's schema knows it.
+ *
+ * The queue records two things the server has no field for: the status readback (`confirmed`,
+ * `readback`) and the reason `printer-fault`. The reason enum on the server is closed, so an
+ * unfamiliar one is a 422 and the job would never settle; `spooler-error` (the printer refused
+ * the job) is the nearest accepted one, with `unknown` certainty and the real cause in `detail`.
+ * A result with neither field is returned untouched.
+ */
+export function wireResult(result: JobResult): Omit<JobResult, 'confirmed' | 'readback'> {
+  const { confirmed: _confirmed, readback: _readback, ...rest } = result;
+  void _confirmed;
+  void _readback;
+  if (rest.reason === ('printer-fault' as string)) return { ...rest, reason: 'spooler-error' };
+  return rest;
+}
+
 async function postResult(base: string, token: string, jobId: string, result: JobResult): Promise<number> {
   const res = await relayFetch(`${base}/api/v1/modules/print/bridge/jobs/${jobId}/result`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(result),
+    body: JSON.stringify(wireResult(result)),
     signal: AbortSignal.timeout(15_000),
   });
   // Release the pooled connection.

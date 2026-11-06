@@ -7,9 +7,9 @@ import { log } from './log.js';
 import { diagIntervalMs, startDiagnostics } from './diagnostics.js';
 import { keepWarmMs, startKeepWarm } from './keepwarm.js';
 import { startLan, type LanHandle } from './lan-server.js';
-import { enroll, isRelayRejected, isRelayRunning, markRelayShutdown, relayDiagnostics, relayStatus, startRelay } from './relay.js';
+import { enroll, isRelayRejected, isRelayRunning, markRelayShutdown, relayDiagnostics, relayStatus, relayUrl, startRelay, wakeRelay } from './relay.js';
 import { createWatchdog, fileBackoffStore, watchdogLimitMs } from './watchdog.js';
-import { startPairing } from './pairing.js';
+import { startPairing, stopPairing } from './pairing.js';
 import { queue } from './queue.js';
 import { defaultPrinter, findPrinter, loadRegistry, registryPath } from './registry.js';
 import { render } from './render/index.js';
@@ -19,6 +19,7 @@ import { loadState, stateDir, statePath } from './identity.js';
 import { warmTlsTrustStore } from './tls-warmup.js';
 import { driverFor } from './transports/index.js';
 import { BRIDGE_SERVICE, BRIDGE_VERSION, RUNTIME } from './version.js';
+import { arch as osArch, hostname as osHostname, platform as osPlatform } from 'node:os';
 
 const DEFAULT_PORT = 9200;
 /**
@@ -399,6 +400,17 @@ function runService(): void {
         bridgeId: () => identity().id,
         relayConnected: () => relayStatus().connected,
         reach: (id) => keepWarm?.reach(id) ?? { reachable: null, last_ok_at: null, checked_at: null },
+        // Only used when lan.json also says pairing_over_lan: true (M9). Same endings as the cloud
+        // pairing loop: stop asking the cloud for a code, and bring the relay up on the new token.
+        pairingDeps: {
+          relayBase: (state) => relayUrl(state),
+          describe: () => ({ hostname: osHostname(), platform: osPlatform(), arch: osArch(), version: BRIDGE_VERSION }),
+          onPaired: () => {
+            stopPairing();
+            if (!isRelayRunning()) startRelay();
+            else wakeRelay();
+          },
+        },
       });
     } catch (err) {
       log.error('lan: could not start the LAN print API — the Bridge carries on without it', {

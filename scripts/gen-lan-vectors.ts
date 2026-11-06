@@ -88,6 +88,32 @@ const canonicalJson = JSON.stringify(payload); // key order is the contract's; n
 const ticketSig = cryptoSign(null, Buffer.from(canonicalJson, 'utf8'), backend.priv);
 const ticket = `${b64u(Buffer.from(canonicalJson, 'utf8'))}.${b64u(ticketSig)}`;
 
+// ------------------------------------------------------------------ the pairing grant (M9)
+
+const PENDING_TOKEN = 'vector-pending-token-0123456789abcdefghijklmnopqrstuvwxyz';
+const PAIR_CODE = 'KXMW-4RT9';
+const grantPayload = {
+  v: 1,
+  kind: 'bridge_grant',
+  grant_id: 'grant-vector-0001',
+  org_id: '2',
+  branch_id: '8',
+  bridge_id: '77',
+  install_id: 'install-vector-0001',
+  token_hash: sha256(PENDING_TOKEN).toString('hex'),
+  bridge_pubkey: bridge.spki_b64u,
+  lan_keys: [] as unknown[],
+  kid: 'vec-backend-1',
+  iat: NOW - 60,
+  exp: NOW - 60 + 600,
+};
+const grantCanonical = JSON.stringify(grantPayload);
+const grantSig = cryptoSign(null, Buffer.from(grantCanonical, 'utf8'), backend.priv);
+const grant = `${b64u(Buffer.from(grantCanonical, 'utf8'))}.${b64u(grantSig)}`;
+// The same fields in another order, validly signed: a verifier MUST refuse it (not canonical).
+const reorderedJson = JSON.stringify({ kind: 'bridge_grant', v: 1, ...Object.fromEntries(Object.entries(grantPayload).slice(2)) });
+const reordered = `${b64u(Buffer.from(reorderedJson, 'utf8'))}.${b64u(cryptoSign(null, Buffer.from(reorderedJson, 'utf8'), backend.priv))}`;
+
 // ------------------------------------------------------------------ requests
 
 const HELLO_NONCE = 'dmVjdG9yLW5vbmNlLTAx'; // "vector-nonce-01"; real nonces are random 16 bytes
@@ -226,6 +252,25 @@ function build(outPath: string) {
       ...ack,
       signing_string: ackString,
       sig: ackSig,
+    },
+    grant: {
+      note: 'Pairing over the shop network (M9). A terminal posts {code, grant} to POST /lan/v1/pair.',
+      pending_token: PENDING_TOKEN,
+      pending_token_note: 'The Bridge keeps this secret; only token_hash (sha256 hex of this exact string) is published and signed.',
+      code: PAIR_CODE,
+      install_id: grantPayload.install_id,
+      payload: grantPayload,
+      canonical_json: grantCanonical,
+      signature_b64u: b64u(grantSig),
+      grant,
+      not_canonical: reordered,
+      negative: [
+        { name: 'grant-not-canonical', grant: 'not_canonical', expect: 'grant_invalid' },
+        { name: 'grant-expired', clock: grantPayload.exp + 600 + 1, expect: 'grant_expired' },
+        { name: 'grant-ok-inside-skew', clock: grantPayload.exp + 600 - 1, expect: 'accepted' },
+        { name: 'grant-wrong-code', code: 'ZZZZ-ZZZ9', expect: 'wrong_code' },
+        { name: 'grant-wrong-install', install_id: 'someone-elses-install', expect: 'grant_wrong_bridge' },
+      ],
     },
     /* Each of these MUST be refused by a verifier. `from` names the request vector it mutates. */
     negative: [

@@ -2019,6 +2019,19 @@ ${I18N_SCRIPT}
     $(id).hidden = !on;
   }
 
+  /*
+   * The code for pairing over the shop network (M9). /pairing includes it only for a loopback
+   * caller, only while that feature is switched on in lan.json, and only while this computer would
+   * accept a pairing at all, so its mere presence is the whole condition.
+   */
+  function psLanCode(state) {
+    if (state && state.lan && state.lan.code) {
+      $('ps-lanlabel').textContent = psText('lanCode');
+      $('ps-lancode').textContent = state.lan.code;
+      psShow('ps-lanwrap', true);
+    }
+  }
+
   function psRender() {
     var state = psState;
     var screen = psScreen(state);
@@ -2043,6 +2056,7 @@ ${I18N_SCRIPT}
 
     psShow('ps-qr', false);
     psShow('ps-codewrap', false);
+    psShow('ps-lanwrap', false);
     psShow('ps-meta', false);
     psShow('ps-here', false);
     psShow('ps-or', false);
@@ -2084,6 +2098,7 @@ ${I18N_SCRIPT}
       $('ps-metatext').textContent =
         state.phase === 'requesting' ? psText('requesting') : psText('waiting');
       psShow('ps-meta', true);
+      psLanCode(state);
       return;
     }
 
@@ -2115,6 +2130,9 @@ ${I18N_SCRIPT}
       /* Printing over the LAN is unaffected by the relay being unreachable, so the printer
          count is the useful half of this screen rather than a decoration on it. */
       psFacts();
+      /* No internet is exactly when pairing over the shop network is wanted, so the offline
+         screen shows its code too (only present when lan.json turns that on). */
+      psLanCode(state);
       return;
     }
 
@@ -2335,6 +2353,10 @@ export const INDEX_HTML = `<!doctype html>
     <div class="ps-codewrap" id="ps-codewrap" hidden>
       <span class="ps-codelabel" id="ps-codelabel"></span>
       <span class="ps-code" id="ps-code"></span>
+    </div>
+    <div class="ps-codewrap" id="ps-lanwrap" hidden>
+      <span class="ps-codelabel" id="ps-lanlabel"></span>
+      <span class="ps-code" id="ps-lancode"></span>
     </div>
     <p class="ps-sub" id="ps-sub"></p>
     <p class="ps-meta" id="ps-meta" hidden><span class="dot dot-warn ps-dot"></span><span id="ps-metatext"></span></p>

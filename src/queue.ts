@@ -39,6 +39,7 @@ import { SAFE_JOB_ID, isSafeJobId } from './job-id.js';
 import { KeyedRing, type KeyedEntry } from './keyed-ring.js';
 import { DEFAULT_PRINTER_PORT, type PrintOutcome, type PrintedCertainty } from './lan.js';
 import { log } from './log.js';
+import { FAULT_TEXT, readPrinterStatus, StatusReadback, type ReadbackSummary, type StatusReadOptions, type StatusReading } from './printer-status.js';
 import { findPrinter, loadRegistry, type PrinterRecord } from './registry.js';
 import { ResultOutbox } from './result-outbox.js';
 import { driverFor } from './transports/index.js';
@@ -68,6 +69,14 @@ export interface JobResult {
   printed_certainty?: PrintedCertainty;
   detail?: string;
   duration_ms?: number;
+  /**
+   * A status read after the bytes were accepted found the printer healthy (`GS r 1` answered, no
+   * fault anywhere). Only ever set for a printer that opted in; see `printer-status.ts`. Never
+   * sent to the relay: the wire result is built by `wireResult`.
+   */
+  confirmed?: boolean;
+  /** What the status read found, for a printer that opted in and was asked. */
+  readback?: ReadbackSummary;
 }
 
 export interface JobRecord {
@@ -240,6 +249,10 @@ export interface QueueOptions {
   resolvePrinter?: (id: string) => PrinterRecord | null;
   /** Retention knobs for the dedupe-key ring. Overridden in tests. */
   keyedRing?: ConstructorParameters<typeof KeyedRing>[1];
+  /** Reads a printer's status after a send (opt-in per printer). Overridden in tests. */
+  readStatus?: (printer: PrinterRecord) => Promise<StatusReading>;
+  /** Timeouts for the default status reader. */
+  statusRead?: StatusReadOptions;
 }
 
 // Job ids become filenames; see `job-id.ts` for why they are constrained.
@@ -301,6 +314,8 @@ export class PrintQueue {
   /** Outcomes of jobs that carry a `dedupe_key`; see `keyed-ring.ts`. */
   private readonly keyedRing: KeyedRing;
   private readonly resolveLive: (id: string) => PrinterRecord | null;
+  /** Opt-in status readback and its per-printer breaker. */
+  readonly readback: StatusReadback;
   /** Jobs whose bytes are on the wire right now. */
   private readonly sendingNow = new Set<JobRecord>();
   /** Lanes asleep between a failed attempt and the next one. */
@@ -324,6 +339,10 @@ export class PrintQueue {
     this.outbox = new ResultOutbox(this.dir);
     this.keyedRing = new KeyedRing(this.dir, options.keyedRing);
     this.resolveLive = options.resolvePrinter ?? ((id) => findPrinter(loadRegistry(), id));
+    this.readback = new StatusReadback(
+      options.readStatus ?? ((printer) => readPrinterStatus(printer, options.statusRead)),
+      this.resolveLive
+    );
     this.maxAttempts = options.maxAttempts ?? envInt('PRINT_BRIDGE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS, 1, 10);
     this.sendTimeoutMs = options.sendTimeoutMs ?? envInt('PRINT_BRIDGE_SEND_TIMEOUT_MS', DEFAULT_SEND_TIMEOUT_MS, 1000, 120_000);
     this.watchdogGraceMs = options.watchdogGraceMs ?? DEFAULT_WATCHDOG_GRACE_MS;
@@ -850,6 +869,38 @@ export class PrintQueue {
     }
   }
 
+  /**
+   * After a send the printer accepted, ask how it is, if its operator said we may.
+   *
+   * Holds the printer's lane for at most the reader's own limit, and changes the job's result in
+   * exactly two ways: a healthy `GS r 1` marks it `confirmed`; a paper-out, cover-open or error
+   * bit turns it into an UNKNOWN failure (`printer-fault`). Unknown, never `none`: the data is
+   * usually still in the printer and prints when the paper is replaced, so the retry rules, which
+   * resend only on `none`, must leave it alone. Silence, garbage and a closed socket change
+   * nothing. Skipped while the bridge is shutting down so a drain never waits on a printer.
+   */
+  private async applyReadback(job: JobRecord): Promise<void> {
+    if (this.draining || !job.result?.ok) return;
+    const verdict = await this.readback.check(job.printer);
+    if (!verdict) return;
+    if (verdict.fault) {
+      job.status = 'failed';
+      job.result = {
+        ok: false,
+        reason: 'printer-fault',
+        printed_certainty: 'unknown',
+        detail: `${FAULT_TEXT[verdict.fault]} (read after the printer accepted the data; it may still print once fixed, so it is not resent)`,
+        duration_ms: job.result.duration_ms,
+        readback: verdict.summary,
+      };
+      log.warn(`queue: job ${job.job_id} on ${job.printer.id}: ${FAULT_TEXT[verdict.fault]}`, {
+        event: 'queue.readback.fault', job_id: job.job_id, printer_id: job.printer.id, fault: verdict.fault,
+      });
+      return;
+    }
+    job.result = { ...job.result, ...(verdict.confirmed ? { confirmed: true } : {}), readback: verdict.summary };
+  }
+
   /** Returns true when the job is finished with (settled), false when it should be retried. */
   private async attempt(job: JobRecord): Promise<boolean> {
     if (job.expires_at && Date.now() > Date.parse(job.expires_at)) {
@@ -893,7 +944,8 @@ export class PrintQueue {
     if (outcome.ok) {
       job.status = 'done';
       job.result = { ok: true, duration_ms: outcome.duration_ms };
-      this.lastOk.set(job.printer.id, new Date().toISOString());
+      await this.applyReadback(job);
+      if (job.result.ok) this.lastOk.set(job.printer.id, new Date().toISOString());
       // The extra connections are the evidence of a printer that was slow to wake.
       const woke = outcome.connect_attempts
         ? ` (accepted connection ${outcome.connect_attempts} after ${outcome.connected_after_ms}ms)`

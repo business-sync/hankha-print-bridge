@@ -19,6 +19,14 @@ export interface RelayState {
   /** Opaque bearer token. The server only ever stored its hash. */
   token?: string;
   enrolled_at?: string;
+  /**
+   * Set only when the Bridge was paired over the shop network (M9, `lan-pair.ts`); a normal
+   * enrolment never writes them. They let a later LAN re-pair refuse to move the Bridge to
+   * another organisation.
+   */
+  org_id?: string;
+  branch_id?: string;
+  paired_via?: 'lan';
 }
 
 const FILE_NAME = 'relay.json';

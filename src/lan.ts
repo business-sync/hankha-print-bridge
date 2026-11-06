@@ -134,7 +134,13 @@ export type PrintFailureReason =
   /** `lp` / `WritePrinter` refused the job. */
   | 'spooler-error'
   /** The printer is configured but disabled in the registry, or the job was cancelled. */
-  | 'cancelled';
+  | 'cancelled'
+  /**
+   * A status read after the printer accepted the data found paper out, the cover open or an error
+   * (opt-in per printer, `printer-status.ts`). Always `unknown` certainty. Never sent to the server
+   * under this name: `wireResult` in the relay maps it to a reason the server accepts.
+   */
+  | 'printer-fault';
 
 export type PrintOutcome =
   | {

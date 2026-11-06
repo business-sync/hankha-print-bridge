@@ -15,7 +15,9 @@ describe('lan-vectors.json', () => {
   it('every vector verifies with plain crypto, and the Bridge accepts and refuses what the file says', () => {
     const passed = runVectorChecks(loadVectors());
     // 3 groups of file checks + 3 bridge checks + one per negative vector.
-    assert.equal(passed.length, 6 + loadVectors().negative.length, passed.join('\n'));
+    const grant = loadVectors().grant;
+    assert.equal(passed.length, 6 + loadVectors().negative.length + (grant ? 2 + grant.negative.length : 0), passed.join('\n'));
+    assert.ok(grant, 'the M9 grant vectors are present');
     assert.ok(passed.some((p) => p.startsWith('negative: der-signature')), 'the DER trap is covered');
   });
 

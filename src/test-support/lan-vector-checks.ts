@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LanAuth } from '../lan-auth.js';
 import { LanKeyStore } from '../lan-keys.js';
+import { LanPairing } from '../lan-pair.js';
 
 export interface VectorRequest {
   name: string;
@@ -40,6 +41,17 @@ export interface Vectors {
   requests: VectorRequest[];
   ack: { dedupe_key: string; job_id: string; accepted_at: string; nonce_header: string; signing_string: string; sig: string };
   negative: { name: string; from: string; mutate: Record<string, unknown>; expect: string }[];
+  grant?: {
+    pending_token: string;
+    code: string;
+    install_id: string;
+    payload: Record<string, unknown>;
+    canonical_json: string;
+    signature_b64u: string;
+    grant: string;
+    not_canonical: string;
+    negative: { name: string; grant?: string; clock?: number; code?: string; install_id?: string; expect: string }[];
+  };
 }
 
 export const VECTORS_PATH = join(dirname(fileURLToPath(import.meta.url)), 'lan-vectors.json');
@@ -163,6 +175,8 @@ export function runVectorChecks(v: Vectors): string[] {
     }
   }
 
+  if (v.grant) passed.push(...grantChecks(v, v.grant));
+
   for (const n of v.negative) {
     const base = v.requests.find((r) => r.name === n.from) as VectorRequest;
     const m = n.mutate as Record<string, unknown>;
@@ -188,6 +202,89 @@ export function runVectorChecks(v: Vectors): string[] {
     } finally {
       b.cleanup();
     }
+  }
+  return passed;
+}
+
+
+function writeBridgeKey(dir: string, v: Vectors): void {
+  writeFileSync(
+    join(dir, 'lan-key.json'),
+    JSON.stringify({ v: 1, private_key: v.bridge_key.pkcs8_b64u, public_key: v.bridge_key.spki_b64u }),
+    { mode: 0o600 }
+  );
+}
+
+/** The M9 grant vectors, run through the Bridge's own pairing code with the vector's token and code. */
+function grantChecks(v: Vectors, g: NonNullable<Vectors['grant']>): string[] {
+  const passed: string[] = [];
+  const [payloadPart, sigPart] = g.grant.split('.');
+  assert.equal(Buffer.from(payloadPart as string, 'base64url').toString('utf8'), g.canonical_json);
+  assert.equal(JSON.stringify(g.payload), g.canonical_json, 'canonical_json is JSON.stringify in contract key order');
+  assert.deepEqual(Object.keys(g.payload), [
+    'v', 'kind', 'grant_id', 'org_id', 'branch_id', 'bridge_id', 'install_id', 'token_hash', 'bridge_pubkey', 'lan_keys', 'kid', 'iat', 'exp',
+  ]);
+  assert.equal(sigPart, g.signature_b64u);
+  assert.ok(cryptoVerify(null, Buffer.from(g.canonical_json), spki(v.backend_key.spki_b64u), Buffer.from(g.signature_b64u, 'base64url')));
+  assert.equal(g.payload.token_hash, createHash('sha256').update(g.pending_token, 'utf8').digest('hex'));
+  passed.push('grant: canonical form, Ed25519 signature, token hash');
+
+  const run = (o: { grant?: string; clock?: number; code?: string; install_id?: string }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'hankha-grant-vectors-'));
+    try {
+      writeBridgeKey(dir, v);
+      const keys = new LanKeyStore(dir, []);
+      keys.setKeys([{ kid: v.backend_key.kid, pubkey: v.backend_key.spki_b64u, not_before: 0, not_after: null }]);
+      let state: { install_id: string; token?: string } = { install_id: g.install_id };
+      const p = new LanPairing({
+        dir,
+        keys,
+        loadState: () => ({ ...state }),
+        saveState: (s) => {
+          state = s;
+        },
+        relayBase: () => 'https://api.example.test',
+        now: () => (o.clock ?? v.now) * 1000,
+        mintToken: () => g.pending_token,
+        mintCode: () => g.code,
+      });
+      const text = o.grant === 'not_canonical' ? g.not_canonical : g.grant;
+      const reply = p.pair(Buffer.from(JSON.stringify({ code: o.code ?? g.code, grant: text })));
+      // A fresh Bridge reads its install id from `info()` first, exactly as a terminal would.
+      return { reply, state, installId: p.info().status };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  const happy = run({});
+  assert.equal(happy.reply.status, 200, JSON.stringify(happy.reply.body));
+  assert.equal(happy.state.token, g.pending_token);
+  passed.push('bridge: accepts the grant vector with the vector code');
+
+  for (const n of g.negative) {
+    const state = run({ ...(n.grant ? { grant: n.grant } : {}), ...(n.clock !== undefined ? { clock: n.clock } : {}), ...(n.code ? { code: n.code } : {}) });
+    const got = state.reply.status === 200 ? 'accepted' : (state.reply.body.reason as string);
+    if (n.install_id) {
+      // The Bridge whose install id differs from the one in the grant.
+      const dir = mkdtempSync(join(tmpdir(), 'hankha-grant-vectors-'));
+      try {
+        writeBridgeKey(dir, v);
+        const keys = new LanKeyStore(dir, []);
+        keys.setKeys([{ kid: v.backend_key.kid, pubkey: v.backend_key.spki_b64u, not_before: 0, not_after: null }]);
+        const p = new LanPairing({
+          dir, keys, loadState: () => ({ install_id: n.install_id as string }), saveState: () => undefined,
+          relayBase: () => 'x', now: () => v.now * 1000, mintToken: () => g.pending_token, mintCode: () => g.code,
+        });
+        const r = p.pair(Buffer.from(JSON.stringify({ code: g.code, grant: g.grant })));
+        assert.equal(r.body.reason, n.expect, n.name);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    } else {
+      assert.equal(got, n.expect, `grant vector ${n.name}`);
+    }
+    passed.push(`grant negative: ${n.name} -> ${n.expect}`);
   }
   return passed;
 }

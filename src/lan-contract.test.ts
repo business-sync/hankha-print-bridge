@@ -942,8 +942,9 @@ describe('GET /lan/v1/printers', () => {
     assert.deepEqual(res.json.printers.map((p: any) => p.id).sort(), ['kitchen', 'receipt']);
     const receipt = res.json.printers.find((p: any) => p.id === 'receipt');
     assert.deepEqual(Object.keys(receipt).sort(), [
-      'dots_per_line', 'enabled', 'id', 'last_ok_at', 'name', 'reachable', 'role', 'type',
+      'dots_per_line', 'enabled', 'id', 'last_ok_at', 'name', 'reachable', 'role', 'status_readback', 'type',
     ]);
+    assert.equal(receipt.status_readback, 'off', 'opt-in status readback is off unless the registry says so');
     assert.equal(receipt.dots_per_line, 576);
     assert.equal(receipt.enabled, true);
     assert.equal(receipt.reachable, null, 'no probe has run, which is not the same as down');

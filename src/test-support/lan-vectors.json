@@ -102,6 +102,59 @@
     "signing_string": "HANKHA-LAN1-ACK\nsale-1042-receipt-0\na3b1c2d4-0000-4000-8000-000000000001\n2025-10-09T08:53:21.000Z\ndmVjdG9yLW5vbmNlLTAx.1",
     "sig": "1-vzDOG0Yz8Jc0VMunXbipMeXpt1w784TvHzHu3HEje3h9PRalcafBvUzquzyGhLDwCNWamK_1T_TNoXhl4dCA"
   },
+  "grant": {
+    "note": "Pairing over the shop network (M9). A terminal posts {code, grant} to POST /lan/v1/pair.",
+    "pending_token": "vector-pending-token-0123456789abcdefghijklmnopqrstuvwxyz",
+    "pending_token_note": "The Bridge keeps this secret; only token_hash (sha256 hex of this exact string) is published and signed.",
+    "code": "KXMW-4RT9",
+    "install_id": "install-vector-0001",
+    "payload": {
+      "v": 1,
+      "kind": "bridge_grant",
+      "grant_id": "grant-vector-0001",
+      "org_id": "2",
+      "branch_id": "8",
+      "bridge_id": "77",
+      "install_id": "install-vector-0001",
+      "token_hash": "6f41de17fbbdbdc653140502ce08130cb786e0ca88c5bf3436842ac4d81dcc9e",
+      "bridge_pubkey": "MCowBQYDK2VwAyEAtTO8e0yK6EbgrgbxLF1OIpTZghYAPXJ5n_wNOpvP4lQ",
+      "lan_keys": [],
+      "kid": "vec-backend-1",
+      "iat": 1759999940,
+      "exp": 1760000540
+    },
+    "canonical_json": "{\"v\":1,\"kind\":\"bridge_grant\",\"grant_id\":\"grant-vector-0001\",\"org_id\":\"2\",\"branch_id\":\"8\",\"bridge_id\":\"77\",\"install_id\":\"install-vector-0001\",\"token_hash\":\"6f41de17fbbdbdc653140502ce08130cb786e0ca88c5bf3436842ac4d81dcc9e\",\"bridge_pubkey\":\"MCowBQYDK2VwAyEAtTO8e0yK6EbgrgbxLF1OIpTZghYAPXJ5n_wNOpvP4lQ\",\"lan_keys\":[],\"kid\":\"vec-backend-1\",\"iat\":1759999940,\"exp\":1760000540}",
+    "signature_b64u": "WcPhVc94ikRVjpP7euUQ9MfihkGjYOMLC9S9iJyRLg7CmKOrWmlTlfPQIGai3HU6YVM3duVX-MJ6xhdXnbVlBQ",
+    "grant": "eyJ2IjoxLCJraW5kIjoiYnJpZGdlX2dyYW50IiwiZ3JhbnRfaWQiOiJncmFudC12ZWN0b3ItMDAwMSIsIm9yZ19pZCI6IjIiLCJicmFuY2hfaWQiOiI4IiwiYnJpZGdlX2lkIjoiNzciLCJpbnN0YWxsX2lkIjoiaW5zdGFsbC12ZWN0b3ItMDAwMSIsInRva2VuX2hhc2giOiI2ZjQxZGUxN2ZiYmRiZGM2NTMxNDA1MDJjZTA4MTMwY2I3ODZlMGNhODhjNWJmMzQzNjg0MmFjNGQ4MWRjYzllIiwiYnJpZGdlX3B1YmtleSI6Ik1Db3dCUVlESzJWd0F5RUF0VE84ZTB5SzZFYmdyZ2J4TEYxT0lwVFpnaFlBUFhKNW5fd05PcHZQNGxRIiwibGFuX2tleXMiOltdLCJraWQiOiJ2ZWMtYmFja2VuZC0xIiwiaWF0IjoxNzU5OTk5OTQwLCJleHAiOjE3NjAwMDA1NDB9.WcPhVc94ikRVjpP7euUQ9MfihkGjYOMLC9S9iJyRLg7CmKOrWmlTlfPQIGai3HU6YVM3duVX-MJ6xhdXnbVlBQ",
+    "not_canonical": "eyJraW5kIjoiYnJpZGdlX2dyYW50IiwidiI6MSwiZ3JhbnRfaWQiOiJncmFudC12ZWN0b3ItMDAwMSIsIm9yZ19pZCI6IjIiLCJicmFuY2hfaWQiOiI4IiwiYnJpZGdlX2lkIjoiNzciLCJpbnN0YWxsX2lkIjoiaW5zdGFsbC12ZWN0b3ItMDAwMSIsInRva2VuX2hhc2giOiI2ZjQxZGUxN2ZiYmRiZGM2NTMxNDA1MDJjZTA4MTMwY2I3ODZlMGNhODhjNWJmMzQzNjg0MmFjNGQ4MWRjYzllIiwiYnJpZGdlX3B1YmtleSI6Ik1Db3dCUVlESzJWd0F5RUF0VE84ZTB5SzZFYmdyZ2J4TEYxT0lwVFpnaFlBUFhKNW5fd05PcHZQNGxRIiwibGFuX2tleXMiOltdLCJraWQiOiJ2ZWMtYmFja2VuZC0xIiwiaWF0IjoxNzU5OTk5OTQwLCJleHAiOjE3NjAwMDA1NDB9.p3b4vyvFOKyh_qnwscEmVWiWC5YDj2KnTfb-9AtAPwuPO1nXHO3KYvMqWGjftu6eBNBKgWL7XdAH6Z_07uTfBA",
+    "negative": [
+      {
+        "name": "grant-not-canonical",
+        "grant": "not_canonical",
+        "expect": "grant_invalid"
+      },
+      {
+        "name": "grant-expired",
+        "clock": 1760001141,
+        "expect": "grant_expired"
+      },
+      {
+        "name": "grant-ok-inside-skew",
+        "clock": 1760001139,
+        "expect": "accepted"
+      },
+      {
+        "name": "grant-wrong-code",
+        "code": "ZZZZ-ZZZ9",
+        "expect": "wrong_code"
+      },
+      {
+        "name": "grant-wrong-install",
+        "install_id": "someone-elses-install",
+        "expect": "grant_wrong_bridge"
+      }
+    ]
+  },
   "negative": [
     {
       "name": "body-tampered",
