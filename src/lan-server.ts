@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { stateDir } from './identity.js';
 import { prepareLan } from './jobs.js';
 import { LanAuth, type AuthOk } from './lan-auth.js';
+import { FailureLimiter, normalizeRemote } from './lan-ratelimit.js';
 import { BOOTSTRAP_KEYS, LanKeyStore, parseConfiguredBootstrap, setActiveLanKeys, type LanKeyEntry } from './lan-keys.js';
 import { log, LogGate } from './log.js';
 import { DEDUPE_KEY, SpoolWriteError, type JobRecord, type PrintQueue } from './queue.js';
@@ -192,6 +193,14 @@ export interface LanServerDeps {
   pairing?: () => LanPairing | null;
   /** `hello` calls allowed per remote address per minute. Past it: 429. */
   helloPerMinute?: number;
+  /**
+   * Failed authentications (and failed pairing attempts) allowed per remote address per minute
+   * before that address gets `429 rate_limited` for the next minute. Default 30. See
+   * `lan-ratelimit.ts` and LAN_WIRE_CONTRACT.md section 4.
+   */
+  failuresPerMinute?: number;
+  /** The clock the failure limiter reads; tests inject one. */
+  now?: () => number;
 }
 
 interface Reply {
@@ -383,7 +392,27 @@ export function createLanServer(deps: LanServerDeps): Server {
     return entry.count <= helloLimit;
   };
 
+  const failures = new FailureLimiter({
+    ...(deps.failuresPerMinute !== undefined ? { limit: deps.failuresPerMinute } : {}),
+    ...(deps.now ? { now: deps.now } : {}),
+  });
+  const remoteOf = (req: IncomingMessage): string => normalizeRemote(req.socket.remoteAddress);
+  /** The refusal for an address that is over its failure budget, or null. Costs no crypto and reads no body. */
+  const throttled = (req: IncomingMessage): Reply | null => {
+    const wait = failures.retryAfter(remoteOf(req));
+    if (wait === 0) return null;
+    return { ...reject(429, 'rate_limited', {}, { headers: { 'Retry-After': String(wait) } }), close: true };
+  };
+  const noteFailure = (req: IncomingMessage, what: string): void => {
+    if (failures.failure(remoteOf(req))) {
+      log.warn(`lan: ${remoteOf(req)} had too many failed ${what} in a minute — answering 429 to it for the next minute`, {
+        event: 'lan.auth.blocked', remote: remoteOf(req), kind: what,
+      });
+    }
+  };
+
   const authFailed = (req: IncomingMessage, status: number, reason: string, route: string): Reply => {
+    noteFailure(req, 'requests');
     const pass = authGate.hit(`lan.auth:${reason}`);
     if (pass) {
       log.warn(`lan: refused a request to ${route} — ${reason}${pass.repeated > 0 ? ` (repeated ${pass.repeated} times)` : ''}`, {
@@ -543,9 +572,15 @@ export function createLanServer(deps: LanServerDeps): Server {
         const answer = pairing.info();
         return jsonReply(answer.status, answer.body, answer.headers ? { headers: answer.headers } : {});
       }
+      // Beyond the pairing lock-out's own counter: a remote that keeps failing here is refused
+      // before the Bridge reads a body or checks a grant.
+      const slowDown = throttled(req);
+      if (slowDown) return slowDown;
       const pairBody = await readBody(req, pairing.maxBodyBytes);
       if (!pairBody.ok) return pairBody.reply;
       const answer = pairing.pair(pairBody.bytes);
+      if (answer.status === 200) failures.success(remoteOf(req));
+      else noteFailure(req, 'pairing attempts');
       return jsonReply(answer.status, answer.body, answer.headers ? { headers: answer.headers } : {});
     }
 
@@ -556,6 +591,8 @@ export function createLanServer(deps: LanServerDeps): Server {
 
     // The ticket alone says who is asking and whether they may; check it before reading a body of
     // up to 8 MiB for someone who has no business sending one.
+    const slowDown = throttled(req);
+    if (slowDown) return slowDown;
     const ticket = header('x-hankha-ticket');
     if (!ticket) return { ...authFailed(req, 401, 'ticket_missing', matched.route), close: true };
     const early = deps.auth.verifyTicket(ticket);
@@ -573,6 +610,7 @@ export function createLanServer(deps: LanServerDeps): Server {
       signature: header('x-hankha-signature'),
     });
     if (!auth.ok) return authFailed(req, auth.status, auth.reason, matched.route);
+    failures.success(remoteOf(req));
 
     switch (matched.route) {
       case 'jobs':

@@ -53,6 +53,8 @@ export interface RigOptions {
   http?: boolean;
   /** Extra keys the Bridge was told about before the test. */
   keyEntries?: LanKeyEntry[];
+  /** Failed requests per remote per minute before a 429 (http rigs only). The limiter reads the rig's clock. */
+  failuresPerMinute?: number;
 }
 
 export async function pairRig(opts: RigOptions = {}): Promise<PairRig> {
@@ -131,6 +133,9 @@ export async function pairRig(opts: RigOptions = {}): Promise<PairRig> {
       relayConnected: () => false,
       reach: () => ({ reachable: null, last_ok_at: null, checked_at: null }),
       pairing: () => rig.pairing,
+      // The failure limiter reads the rig's clock like the pairing does, so a test that moves time moves both.
+      now: clock.now,
+      ...(opts.failuresPerMinute !== undefined ? { failuresPerMinute: opts.failuresPerMinute } : {}),
     });
     await new Promise<void>((r) => rig.server?.listen(0, '127.0.0.1', r));
     rig.base = `http://127.0.0.1:${(rig.server.address() as { port: number }).port}`;

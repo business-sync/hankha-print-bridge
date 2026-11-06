@@ -239,6 +239,12 @@ export interface HarnessOptions {
   gate?: () => Promise<void> | undefined;
   now?: () => number;
   helloPerMinute?: number;
+  /** Failed authentications per remote per minute before a 429 (default: the server's own, 30). */
+  failuresPerMinute?: number;
+  /** The clock the failure limiter reads. */
+  limiterNow?: () => number;
+  /** Listen here instead of 127.0.0.1 (a test that needs a second remote address). */
+  host?: string;
   bridgeId?: string | null;
   dir?: string;
 }
@@ -319,8 +325,10 @@ export class LanHarness {
       relayConnected: () => false,
       reach: () => ({ reachable: null, last_ok_at: null, checked_at: null }),
       helloPerMinute: opts.helloPerMinute,
+      ...(opts.failuresPerMinute !== undefined ? { failuresPerMinute: opts.failuresPerMinute } : {}),
+      ...(opts.limiterNow ? { now: opts.limiterNow } : {}),
     });
-    await new Promise<void>((resolve) => this.server.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>((resolve) => this.server.listen(0, opts.host ?? '127.0.0.1', resolve));
     this.port = (this.server.address() as { port: number }).port;
 
     this.terminal = new TestTerminal(() => this.base);
