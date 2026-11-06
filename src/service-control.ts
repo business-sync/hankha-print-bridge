@@ -105,6 +105,30 @@ function siteAllowed(req: IncomingMessage): boolean {
 }
 
 /**
+ * The gate for `/enroll` and the pairing routes.
+ *
+ * Loopback alone was not enough. `/pairing` DISPLAYS a live pairing code and `/enroll` claims
+ * this computer into an organisation, and both answer with `Access-Control-Allow-Origin: *` — so
+ * any web page open in a browser on the till could read the code or post a claim, from the till's
+ * own loopback address. Two checks close that without touching the real flows:
+ *
+ *  - the `Host` must be a local name, which stops a DNS-rebinding page (it is "same origin" to
+ *    the browser, so it sends no `Origin` at all);
+ *  - an `Origin`, when one is sent, must be local, which stops a cross-site `fetch`.
+ *
+ * Deliberately NOT checked: `Sec-Fetch-Site`. The POS reaches `/pairing/handoff` by a top-level
+ * navigation from its own site, which is `cross-site` and carries no `Origin`; checking it would
+ * break the one supported way of pairing from the POS.
+ *
+ * Returns null when the request may proceed.
+ */
+export function gatePairingRequest(req: IncomingMessage): GateFailure | null {
+  if (!hostAllowed(req)) return { status: 403, reason: 'bad-host' };
+  if (!originAllowed(req)) return { status: 403, reason: 'cross-origin' };
+  return null;
+}
+
+/**
  * Everything but the confirmation, in one call.
  *
  * Returns null when the request may proceed. The reasons are stable identifiers rather than

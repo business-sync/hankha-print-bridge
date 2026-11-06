@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { localInterfaces } from './lan.js';
 import { discoverAll } from './discovery.js';
 import { ENROLL_CODE_HINT, isValidEnrollCode, normalizeEnrollCode } from './enroll-code.js';
@@ -6,14 +7,14 @@ import { log } from './log.js';
 import { diagIntervalMs, startDiagnostics } from './diagnostics.js';
 import { keepWarmMs, startKeepWarm } from './keepwarm.js';
 import { enroll, isRelayRejected, isRelayRunning, markRelayShutdown, relayDiagnostics, relayStatus, startRelay } from './relay.js';
-import { createWatchdog, watchdogLimitMs } from './watchdog.js';
+import { createWatchdog, fileBackoffStore, watchdogLimitMs } from './watchdog.js';
 import { startPairing } from './pairing.js';
 import { queue } from './queue.js';
 import { defaultPrinter, findPrinter, loadRegistry, registryPath } from './registry.js';
 import { render } from './render/index.js';
 import { resolveSample, sampleFor } from './samples.js';
 import { createBridgeServer, isTlsEnabled, parseTestPrintBody } from './server.js';
-import { statePath } from './identity.js';
+import { stateDir, statePath } from './identity.js';
 import { warmTlsTrustStore } from './tls-warmup.js';
 import { driverFor } from './transports/index.js';
 import { BRIDGE_SERVICE, BRIDGE_VERSION, RUNTIME } from './version.js';
@@ -78,6 +79,9 @@ Environment:
   PRINT_BRIDGE_KEEPWARM_MS      Connect to each network printer this often, without printing,
                                 so it never falls asleep between tickets. 0 turns it off.
                                 (default 60000)
+  PRINT_BRIDGE_WATCHDOG_MINUTES  Restart this process if the cloud has been unreachable this
+                                long (it waits while jobs are printing, and waits longer after
+                                each restart that did not help). 0 turns it off. (default 15)
   PRINT_BRIDGE_SERVICE_CONTROL  on | off. 'off' removes the /service routes and the
                                 "This computer" card from the page.       (default on)
   PRINT_BRIDGE_MANAGED          What supervises this process, stamped by the installer:
@@ -303,6 +307,19 @@ function runService(): void {
   let keepWarm: ReturnType<typeof startKeepWarm> | null = null;
 
   server.listen(PORT, HOST, () => {
+    /*
+     * Read the spool back and resume what a previous run left behind — HERE, once the port is ours.
+     *
+     * This used to run right after `server.listen()` was CALLED, which is before anyone knows it
+     * succeeded. A second copy of the bridge (a double-click on a shortcut, an installer racing
+     * the scheduled task) loses `EADDRINUSE` a moment later, but by then it had already loaded
+     * the spool and started printing from it: it settled the live copy's in-flight job as
+     * interrupted, deleted its file, and sent queued jobs to the printer a second time. Only the
+     * process that holds the port may touch the spool. `load()` is idempotent, and runs before
+     * the first request can arrive because this callback is what starts the accepting.
+     */
+    queue().load();
+
     const scheme = isTlsEnabled() ? 'https' : 'http';
     log.info(`${BRIDGE_SERVICE} v${BRIDGE_VERSION} listening on ${scheme}://${HOST}:${PORT}`, {
       event: 'server.listening', host: HOST, port: PORT, scheme, version: BRIDGE_VERSION,
@@ -360,12 +377,7 @@ function runService(): void {
     });
   });
 
-  // Reads the spool back and resumes anything a previous run left behind, before the first request
-  // can add to it. `queue()` loads on creation; this call is what forces that to happen HERE
-  // rather than lazily inside the first request, and `load()` is idempotent so the two cannot
-  // race into a double recovery.
-  queue().load();
-
+  // The spool is read back inside the `listen` callback above, not here: see the comment there.
 
   /*
    * Survive an unexpected throw instead of vanishing.
@@ -453,6 +465,11 @@ function runService(): void {
 
   createWatchdog({
     limitMs: watchdogLimitMs(),
+    // Not mid-service: a restart takes local printing down too, and local printing does not need
+    // the cloud that is being waited for. Five minutes of quiet is "between rushes".
+    inUse: () => queue().isInUse(5 * 60_000),
+    // So an outage that outlasts a restart does not restart the bridge again every 15 minutes.
+    backoff: fileBackoffStore(join(stateDir(), 'watchdog.json')),
     probe: () => {
       const st = relayStatus();
       return { enrolled: st.enrolled, connected: st.connected, rejected: isRelayRejected(), running: isRelayRunning() };

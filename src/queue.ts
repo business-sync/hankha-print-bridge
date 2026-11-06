@@ -24,15 +24,34 @@
  *     a successful print — the second delivery is ANSWERED, not reprinted.
  */
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { backoffMs } from './backoff.js';
+import { appendFileDurable, writeFileDurable } from './durable-fs.js';
 import { stateDir } from './identity.js';
+import { SAFE_JOB_ID, isSafeJobId } from './job-id.js';
 import type { PrintOutcome, PrintedCertainty } from './lan.js';
 import { log } from './log.js';
 import type { PrinterRecord } from './registry.js';
+import { ResultOutbox } from './result-outbox.js';
 import { driverFor } from './transports/index.js';
 import type { SendOptions } from './transports/transport.js';
+
+export { isSafeJobId };
+
+/**
+ * A job that had to be durable could not be written down.
+ *
+ * Thrown by `submit` only when the caller asked for durability (`requireDurable`), so that a
+ * `202 Accepted` always means "this will survive a crash". A full or read-only disk is reported
+ * as such instead of being swallowed into a promise that cannot be kept.
+ */
+export class SpoolWriteError extends Error {
+  constructor(jobId: string, cause: unknown) {
+    super(`could not write job ${jobId} to the spool: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'SpoolWriteError';
+  }
+}
 
 export type JobStatus = 'queued' | 'printing' | 'done' | 'failed' | 'expired';
 
@@ -112,6 +131,13 @@ export interface SubmitInput {
   copies?: number;
   ttl_s?: number;
   persistent?: boolean;
+  /**
+   * Refuse the job (throw `SpoolWriteError`) if it cannot be written to the spool, rather than
+   * carrying on in memory. For callers that tell their own client "accepted" and mean "will
+   * survive a crash". Callers whose upstream tracks the job anyway (the relay) leave it off:
+   * printing now with no crash safety beats refusing to print at all.
+   */
+  requireDurable?: boolean;
   retryable?: boolean;
   /** Sets `retry_until` this many ms from now. */
   retry_window_ms?: number;
@@ -166,25 +192,7 @@ export interface QueueOptions {
   watchdogGraceMs?: number;
 }
 
-/*
- * A job id becomes a filename, so it has to be constrained like one.
- *
- * `spoolPath` joins the id straight onto the spool directory, and `join` resolves `..` — so an
- * id of `../../../../tmp/x` wrote a caller-influenced JSON file outside the state directory and
- * then deleted that path when the job settled. Printer ids have been validated this way from the
- * start (`ID_PATTERN` in registry.ts); job ids arrived from `POST /jobs` and from the relay with
- * no check at all. Even an innocent `a/b` broke spooling with ENOENT.
- *
- * Deliberately wider than the registry's pattern: these ids are not ours. They are UUIDs from
- * this process, and opaque server-side identifiers from the relay, so uppercase and `.` are
- * allowed. What is not allowed is any kind of separator, and any leading dot — which is what
- * stops `..` matching at all.
- */
-const SAFE_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-
-export function isSafeJobId(value: string): boolean {
-  return SAFE_JOB_ID.test(value);
-}
+// Job ids become filenames; see `job-id.ts` for why they are constrained.
 
 const SPOOL_DIR = 'spool';
 const SETTLED_FILE = 'settled.jsonl';
@@ -244,9 +252,17 @@ export class PrintQueue {
   private draining = false;
   private loaded = false;
   private readonly sleepers = new Set<() => void>();
+  private lastActivity = 0;
+
+  /**
+   * Outcomes of relay jobs the server has not acknowledged yet. Written when a job settles, so a
+   * restart or a long outage cannot lose the answer; drained by the relay.
+   */
+  readonly outbox: ResultOutbox;
 
   constructor(options: QueueOptions = {}) {
     this.dir = options.dir ?? stateDir();
+    this.outbox = new ResultOutbox(this.dir);
     this.maxAttempts = options.maxAttempts ?? envInt('PRINT_BRIDGE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS, 1, 10);
     this.sendTimeoutMs = options.sendTimeoutMs ?? envInt('PRINT_BRIDGE_SEND_TIMEOUT_MS', DEFAULT_SEND_TIMEOUT_MS, 1000, 120_000);
     this.watchdogGraceMs = options.watchdogGraceMs ?? DEFAULT_WATCHDOG_GRACE_MS;
@@ -290,8 +306,10 @@ export class PrintQueue {
 
     let recovered = 0;
     let interrupted = 0;
+    let alreadySettled = 0;
     try {
       mkdirSync(this.spoolDir(), { recursive: true });
+      const found: JobRecord[] = [];
       for (const entry of readdirSync(this.spoolDir())) {
         if (!entry.endsWith('.json')) continue;
         const path = join(this.spoolDir(), entry);
@@ -305,9 +323,33 @@ export class PrintQueue {
           rmSync(path, { force: true });
           continue;
         }
-        if (!job.job_id || !job.printer) {
+        if (!job.job_id || !job.printer || !isSafeJobId(job.job_id)) {
           log.warn(`queue: discarded a spool file with no job in it ${entry}`, { event: 'queue.spool.invalid', file: entry });
           rmSync(path, { force: true });
+          continue;
+        }
+        found.push(job);
+      }
+
+      /*
+       * Oldest first.
+       *
+       * `readdir` order is the filesystem's, not the order jobs arrived in, and the lane is FIFO
+       * on purpose — kitchen tickets and numbered receipts must come out in the order they were
+       * sent. After a restart with several jobs waiting, directory order shuffled them.
+       */
+      found.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.job_id.localeCompare(b.job_id));
+
+      for (const job of found) {
+        // Settled before the crash but the spool file outlived it. `finish` records the outcome in
+        // the ring BEFORE removing the file for exactly this reason: finding the id there means
+        // the job already ran, and queueing it again would print it a second time.
+        if (this.settledResults.has(job.job_id)) {
+          alreadySettled += 1;
+          log.warn(`queue: spool file for job ${job.job_id} was already settled — discarding it, not reprinting`, {
+            event: 'queue.spool.already_settled', job_id: job.job_id,
+          });
+          this.removeSpool(job.job_id);
           continue;
         }
 
@@ -335,9 +377,9 @@ export class PrintQueue {
       });
     }
 
-    if (recovered > 0 || interrupted > 0) {
+    if (recovered > 0 || interrupted > 0 || alreadySettled > 0) {
       log.info(`queue: recovered ${recovered} job(s) from the spool, ${interrupted} were interrupted mid-print`, {
-        event: 'queue.load', recovered, interrupted,
+        event: 'queue.load', recovered, interrupted, already_settled: alreadySettled,
       });
     }
     for (const key of this.lanes.keys()) this.kick(key);
@@ -420,13 +462,11 @@ export class PrintQueue {
         const compacted = [...this.settledResults.entries()]
           .map(([job_id, result]) => JSON.stringify({ job_id, result }))
           .join('\n');
-        const temp = `${path}.${process.pid}.tmp`;
-        writeFileSync(temp, compacted ? `${compacted}\n` : '');
-        renameSync(temp, path);
+        writeFileDurable(path, compacted ? `${compacted}\n` : '', `${path}.${process.pid}.tmp`);
         this.settledLines = this.settledResults.size;
         return;
       }
-      appendFileSync(path, `${JSON.stringify({ job_id: job.job_id, result: job.result })}\n`);
+      appendFileDurable(path, `${JSON.stringify({ job_id: job.job_id, result: job.result })}\n`);
       this.settledLines += 1;
     } catch (err) {
       log.warn(`queue: could not record job ${job.job_id} as settled (${err instanceof Error ? err.message : String(err)})`, {
@@ -435,20 +475,40 @@ export class PrintQueue {
     }
   }
 
-  private persist(job: JobRecord): void {
-    if (!job.persistent) return;
+  /**
+   * Remove a job's spool file. Never throws.
+   *
+   * `rmSync(..., { force })` only forgives a missing file. With the spool directory itself gone,
+   * unreadable, or replaced by a file, it throws — and `finish` runs this AFTER the job has
+   * printed, before it wakes whoever is waiting on the result. A throw there left a printed job
+   * that never settled, so its caller waited out its own deadline and reported a failure for a
+   * slip that was sitting in the printer's tray.
+   */
+  private removeSpool(jobId: string): void {
+    try {
+      rmSync(this.spoolPath(jobId), { force: true });
+    } catch (err) {
+      log.warn(`queue: could not remove the spool file for job ${jobId} (${err instanceof Error ? err.message : String(err)})`, {
+        event: 'queue.spool.remove_failed', job_id: jobId, err,
+      });
+    }
+  }
+
+  /** Returns whether the job is now safely on disk. A job that is not persistent trivially is. */
+  private persist(job: JobRecord): { ok: true } | { ok: false; error: unknown } {
+    if (!job.persistent) return { ok: true };
     try {
       mkdirSync(this.spoolDir(), { recursive: true });
-      const path = this.spoolPath(job.job_id);
-      const temp = `${path}.tmp`;
-      // Temp plus rename: a power cut leaves the previous complete file or the new complete one,
-      // never a half-written record that `load()` would then have to guess about.
-      writeFileSync(temp, JSON.stringify(job));
-      renameSync(temp, path);
+      // Temp, flush, rename, flush the directory: a power cut leaves the previous complete file
+      // or the new complete one, never a half-written or empty record that `load()` would then
+      // have to guess about.
+      writeFileDurable(this.spoolPath(job.job_id), JSON.stringify(job));
+      return { ok: true };
     } catch (err) {
       log.warn(`queue: could not spool job ${job.job_id} (${err instanceof Error ? err.message : String(err)})`, {
-        event: 'queue.spool.write_failed', job_id: job.job_id,
+        event: 'queue.spool.write_failed', job_id: job.job_id, err,
       });
+      return { ok: false, error: err };
     }
   }
 
@@ -527,8 +587,13 @@ export class PrintQueue {
       ...(input.connect_stagger_ms ? { connect_stagger_ms: input.connect_stagger_ms } : {}),
     };
 
+    const spooled = this.persist(job);
+    if (!spooled.ok && input.requireDurable) {
+      // Not queued at all: the caller is about to say "accepted", and this would make that a lie.
+      throw new SpoolWriteError(jobId, spooled.error);
+    }
     this.active.set(jobId, job);
-    this.persist(job);
+    this.lastActivity = Date.now();
     this.laneFor(job).push(job);
     log.info(`queue: job ${jobId} queued for ${job.printer.id} (${job.printer.transport})`, {
       event: 'queue.submit', job_id: jobId, printer_id: job.printer.id, source: job.source,
@@ -765,8 +830,21 @@ export class PrintQueue {
   private finish(job: JobRecord): void {
     this.active.delete(job.job_id);
     job.updated_at = new Date().toISOString();
-    if (job.persistent) rmSync(this.spoolPath(job.job_id), { force: true });
+    this.lastActivity = Date.now();
+    /*
+     * Order matters, and it is the reverse of what this used to do.
+     *
+     * The spool file is the only thing saying "this job has not run". Removing it first and
+     * recording the outcome second leaves a window in which a crash loses both facts: the job is
+     * neither waiting nor remembered, so a redelivery from the server prints it again. Record
+     * first, remove second, and the worst a crash can leave is a file `load()` recognises as
+     * already settled and discards.
+     */
     this.rememberSettled(job);
+    // The server has not been told yet. Written before anything can go wrong with the report, and
+    // before the spool file goes, so a job whose answer is lost is still reported after a restart.
+    if (job.source === 'relay' && job.result) this.outbox.save(job.job_id, job.result);
+    if (job.persistent) this.removeSpool(job.job_id);
 
     // A COPY without the payload. Retaining the base64 would make the history ring hold up to
     // 200 x 1 MiB of bytes nobody will ever send again.
@@ -820,6 +898,15 @@ export class PrintQueue {
   /** Jobs waiting or in flight, which is what "queue depth" means to an operator. */
   pending(): number {
     return this.active.size;
+  }
+
+  /**
+   * Whether anything has been printing or arriving lately: jobs in the queue, or one that was
+   * submitted or settled within `withinMs`. The watchdog uses it to avoid restarting the process
+   * in the middle of service.
+   */
+  isInUse(withinMs: number, now = Date.now()): boolean {
+    return this.active.size > 0 || (this.lastActivity > 0 && now - this.lastActivity <= withinMs);
   }
 
   /** True while this printer's lane is sending or has jobs waiting. The keep-warm probe stays off it. */

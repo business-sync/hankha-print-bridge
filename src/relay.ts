@@ -70,6 +70,32 @@ const RECONNECT_FLOOR_MS = 1_000;
  * and accepted before the claim lapses and the sweeper writes UNKNOWN over it.
  */
 const RESULT_RESERVE_MS = 10_000;
+/**
+ * Deadline for a relay job whose claim time cannot be used: the server's default 60 s lease less
+ * RESERVE_MS. Longer than that and the bridge would still be retrying after the server's sweeper
+ * has written the job off.
+ */
+export const FALLBACK_JOB_TTL_S = 50;
+
+/**
+ * How long a relay job may wait to be printed, in seconds. Always finite.
+ *
+ * The server's claim is the real deadline, less RESERVE_MS. When the claim cannot be trusted —
+ * missing, unparseable, or with less than the reserve left (which is also what a local clock
+ * running ahead of the server's looks like) — the answer is FALLBACK_JOB_TTL_S.
+ *
+ * This used to return `undefined` in those cases, meaning "no deadline at all". A job with no
+ * deadline that is then recovered from the spool after a long outage prints whenever the printer
+ * comes back: hours late, long after the server wrote it off and the till moved on. A bridge with
+ * a badly wrong clock still prints a job it has just received, because the fallback starts from
+ * the moment of receipt.
+ */
+export function jobTtlSeconds(claimExpiresAt: string | null | undefined, now = Date.now()): number {
+  const claimMs = claimExpiresAt ? Date.parse(claimExpiresAt) - now : Number.NaN;
+  return Number.isFinite(claimMs) && claimMs > RESULT_RESERVE_MS
+    ? Math.max(1, Math.floor((claimMs - RESULT_RESERVE_MS) / 1000))
+    : FALLBACK_JOB_TTL_S;
+}
 /** Silence on the websocket for this long means the link is dead, whatever the socket says. */
 const WS_IDLE_TIMEOUT_MS = 45_000;
 /** Longest wait between attempts once the server has rejected the token. */
@@ -611,7 +637,7 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
     //
     // Not awaited, here or below: a report that has to retry must not hold up the next poll.
     // `reportResult` never rejects and logs a report it had to give up on.
-    void reportResult(base, token, job.job_id, {
+    void reportKept(base, token, job.job_id, {
       ok: false,
       reason: 'device-missing',
       printed_certainty: 'none',
@@ -630,11 +656,7 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
   // knows within milliseconds that nothing printed, and UNKNOWN is precisely the state that
   // withholds the retry button. Giving up early leaves room for the truthful result to land
   // first, and costs one retry of a printer that was not answering anyway.
-  const claimMs = job.claim_expires_at ? Date.parse(job.claim_expires_at) - Date.now() : Number.NaN;
-  const ttl_s =
-    Number.isFinite(claimMs) && claimMs > RESULT_RESERVE_MS
-      ? Math.max(1, Math.floor((claimMs - RESULT_RESERVE_MS) / 1000))
-      : undefined;
+  const ttl_s = jobTtlSeconds(job.claim_expires_at);
 
   // Bytes or a document — one of the two, resolved against the printer we just picked so a
   // document is rendered for the head that will actually print it.
@@ -645,7 +667,7 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
       // `printed_certainty: 'none'` is the whole point of reporting this properly: nothing was
       // ever sent to the printer, so the POS may safely offer to print again once the document
       // is fixed. Reporting it as a device fault would send someone to check a cable.
-      void reportResult(base, token, job.job_id, {
+      void reportKept(base, token, job.job_id, {
         ok: false,
         reason: 'payload-rejected',
         printed_certainty: 'none',
@@ -657,7 +679,7 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
   } else if (typeof job.payload_base64 === 'string') {
     payload = Buffer.from(job.payload_base64, 'base64');
   } else {
-    void reportResult(base, token, job.job_id, {
+    void reportKept(base, token, job.job_id, {
       ok: false,
       reason: 'payload-rejected',
       printed_certainty: 'none',
@@ -686,9 +708,68 @@ export async function handlePrint(base: string, token: string, work: Extract<Wor
   // `reportResult` retries what can be retried and never rejects; a report lost for good is
   // logged there. The server's own sweeper moves an unreported job to UNKNOWN, and it never
   // re-queues one, so nothing prints twice as a result of a lost report.
+  //
+  // The outcome is written down before the first report is tried and removed only once the
+  // server has accepted it (`reportKept`). `queue().finish` already saves it for any job that
+  // settles normally; this covers the replay path, where a redelivered job is answered from the
+  // ring and never passes through `finish`. If every retry fails, or the process dies mid-report,
+  // the pump (`pumpResultOutbox`) delivers it later instead of the answer being lost.
   void submission.settled.then((settled) =>
-    reportResult(base, token, job.job_id, settled.result ?? { ok: false, reason: 'unknown', printed_certainty: 'unknown' })
+    reportKept(base, token, job.job_id, settled.result ?? { ok: false, reason: 'unknown', printed_certainty: 'unknown' })
   );
+}
+
+/**
+ * Report an outcome the server is owed, keeping a copy until it has accepted it.
+ *
+ * `reportResult` alone gives up after about seven seconds, and then the only record of the answer
+ * is gone. Saving first means a lost report is delivered later by the pump, and a process that
+ * dies mid-report delivers it after the restart. Never rejects.
+ */
+async function reportKept(base: string, token: string, jobId: string, result: JobResult): Promise<void> {
+  const outbox = queue().outbox;
+  outbox.save(jobId, result);
+  if (await reportResult(base, token, jobId, result)) outbox.remove(jobId);
+}
+
+/*
+ * Deliver outcomes that never reached the server.
+ *
+ * Runs on a timer and once shortly after start-up, so it also reports jobs a PREVIOUS process
+ * printed or recovered from the spool — the case that had no report path at all. Entries younger
+ * than a short grace are left to the live report that is probably in flight right now. Entries
+ * older than OUTBOX_MAX_AGE_MS are dropped: the server's sweeper wrote those jobs off long ago,
+ * and a report that late cannot change what anyone does about them.
+ */
+const OUTBOX_MAX_AGE_MS = 6 * 3_600_000;
+const OUTBOX_GRACE_MS = 30_000;
+const OUTBOX_PUMP_MS = 30_000;
+
+export async function pumpResultOutbox(base: string, token: string, now = Date.now()): Promise<number> {
+  const outbox = queue().outbox;
+  outbox.expire(OUTBOX_MAX_AGE_MS, now);
+  let delivered = 0;
+  let failures = 0;
+  for (const entry of outbox.list()) {
+    if (now - Date.parse(entry.saved_at) < OUTBOX_GRACE_MS) continue;
+    if (await reportResult(base, token, entry.job_id, entry.result)) {
+      outbox.remove(entry.job_id);
+      delivered += 1;
+      failures = 0;
+      continue;
+    }
+    // A server that is unreachable fails every entry the same way, so stop early. But not on the
+    // first: one job the server has refused for good (404, 422) must not hold up the ones behind
+    // it. Those age out after OUTBOX_MAX_AGE_MS.
+    failures += 1;
+    if (failures >= 3) break;
+  }
+  if (delivered > 0) {
+    log.info(`relay: reported ${delivered} outcome(s) that were waiting from earlier`, {
+      event: 'relay.result.outbox_drained', delivered,
+    });
+  }
+  return delivered;
 }
 
 async function handleScan(base: string, token: string, work: Extract<Work, { type: 'scan' }>) {
@@ -1145,6 +1226,25 @@ export function startRelay(): void {
   const beat = setInterval(beatOnce, HEARTBEAT_INTERVAL_MS);
   beat.unref();
 
+  // Outcomes still owed to the server — from a previous run, or a report that ran out of retries.
+  // One pump at a time; `base` and `token` are read when it fires so a re-pair is picked up.
+  let pumping = false;
+  const pumpOnce = async () => {
+    if (pumping || shuttingDown) return;
+    pumping = true;
+    try {
+      await pumpResultOutbox(base, token);
+    } catch (err) {
+      log.warn(`relay: draining the result outbox failed (${describeError(err)})`, { event: 'relay.result.pump_failed', err });
+    } finally {
+      pumping = false;
+    }
+  };
+  const pump = setInterval(() => void pumpOnce(), OUTBOX_PUMP_MS);
+  pump.unref();
+  // Shortly after start, once the first heartbeat has had a chance to prove the server reachable.
+  setTimeout(() => void pumpOnce(), OUTBOX_GRACE_MS + 1000).unref();
+
   const mode = relayMode();
   // `poll` pins the old behaviour; `ws` refuses to fall back, for testing a server that does
   // implement the socket. `auto` — the default — prefers the socket and quietly degrades.
@@ -1354,6 +1454,7 @@ export function startRelay(): void {
       // rejected bridge was impossible without restarting the service, which is exactly the
       // state an operator cannot diagnose from the POS.
       clearInterval(beat);
+      clearInterval(pump);
       relayRunning = false;
       markDown();
       log.error('relay: the relay loop has exited — the bridge is offline until it is restarted', {

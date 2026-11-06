@@ -127,7 +127,7 @@ function optionalInt(
  * A registry is edited by hand or pushed whole through `PUT /printers`, so telling an operator
  * about all four mistakes at once is the difference between one round trip and four.
  */
-function parsePrinter(value: unknown, index: number, errors: string[]): PrinterRecord | null {
+function parsePrinter(value: unknown, index: number, errors: string[], options: ParseOptions = {}): PrinterRecord | null {
   const raw = asRecord(value);
   const where = `printers[${index}]`;
   if (!raw) {
@@ -208,6 +208,17 @@ function parsePrinter(value: unknown, index: number, errors: string[]): PrinterR
   if (transport === 'network' && !address) errors.push(`${where}: a network printer needs an address`);
   if (transport === 'usb' && !queue) errors.push(`${where}: a usb printer needs a queue name`);
   if (transport === 'serial' && !device) errors.push(`${where}: a serial printer needs a device path`);
+  if (device !== undefined && !isAllowedSerialDevice(device)) {
+    if (options.strictDevice) {
+      errors.push(
+        `${where}: device '${device}' is not a serial port path (expected ${process.platform === 'win32' ? 'COM3' : '/dev/cu.* or /dev/tty*'})`
+      );
+    } else {
+      log.warn(`printers.json: ${where} device '${device}' is outside the usual serial port paths — kept, but check it`, {
+        event: 'registry.device_unusual', device,
+      });
+    }
+  }
 
   const dots_per_line = optionalInt(raw.dots_per_line, 'dots_per_line', where, errors, 8, 4096);
   const codepage = optionalInt(raw.codepage, 'codepage', where, errors, 0, 255);
@@ -255,7 +266,36 @@ export const DEFAULT_LABEL_DPI = 203;
 /** The die-cut gap between labels on a roll. */
 export const DEFAULT_LABEL_GAP_MM = 2;
 
-export function parseRegistry(value: unknown): ParseResult {
+/*
+ * Which serial `device` values a registry may name.
+ *
+ * The serial driver opens the path write-only, as whatever account runs the bridge — SYSTEM on a
+ * Windows till, root in the macOS daemon. With nothing constraining the value, anyone who could
+ * reach `PUT /printers` (every device on the venue network, when the LAN option is on and no
+ * token is set) could point a "printer" at any existing file and have a print job overwrite it.
+ * A printer's device node has one of a handful of shapes, so only those are accepted.
+ *
+ * Not a security boundary on its own — the LAN needs a token and a separate print-only listener
+ * (later milestones) — but it removes the worst thing an unauthenticated request could do here.
+ */
+const POSIX_DEVICE =
+  /^\/dev\/(?:(?:tty|cu)[A-Za-z0-9._-]+|rfcomm\d+|usb\/lp\d+|lp\d+|serial\/by-(?:id|path)\/[A-Za-z0-9._:+-]+)$/;
+const WINDOWS_DEVICE = /^(?:\\\\\.\\)?COM(?:[1-9]|[1-9]\d{1,2})$/i;
+
+export function isAllowedSerialDevice(device: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform === 'win32' ? WINDOWS_DEVICE.test(device) : POSIX_DEVICE.test(device);
+}
+
+export interface ParseOptions {
+  /**
+   * Refuse a serial device outside the allow-list. Set for registries arriving over the network
+   * (`PUT /printers`). Left off when READING the file already on disk: an upgrade must not make a
+   * working printer with an unusual device path vanish — that is logged instead.
+   */
+  strictDevice?: boolean;
+}
+
+export function parseRegistry(value: unknown, options: ParseOptions = {}): ParseResult {
   const errors: string[] = [];
   const raw = asRecord(value);
   if (!raw) return { registry: { ...EMPTY_REGISTRY, printers: [] }, errors: ['registry must be an object'] };
@@ -266,7 +306,7 @@ export function parseRegistry(value: unknown): ParseResult {
   const printers: PrinterRecord[] = [];
   const seen = new Set<string>();
   for (const [index, entry] of list.entries()) {
-    const printer = parsePrinter(entry, index, errors);
+    const printer = parsePrinter(entry, index, errors, options);
     if (!printer) continue;
     if (seen.has(printer.id)) {
       errors.push(`printers[${index}]: duplicate id '${printer.id}'`);

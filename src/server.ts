@@ -22,6 +22,7 @@ import {
   consumeConfirmToken,
   currentAction,
   endAction,
+  gatePairingRequest,
   gateServiceRequest,
   issueConfirmToken,
 } from './service-control.js';
@@ -39,7 +40,7 @@ import {
   type ActionOutcome,
   type UninstallScope,
 } from './service-actions.js';
-import { describeJob, isSafeJobId, queue, type JobRecord } from './queue.js';
+import { describeJob, isSafeJobId, queue, SpoolWriteError, type JobRecord } from './queue.js';
 import { defaultPrinter, findPrinter, loadRegistry, parseRegistry, registryPath, saveRegistry } from './registry.js';
 import { loadState, stateDir, statePath } from './identity.js';
 import { enroll, isRelayRejected, isRelayRunning, relayStatus, startRelay, wakeRelay } from './relay.js';
@@ -633,14 +634,35 @@ async function handleSubmitJob(res: ServerResponse, body: unknown): Promise<void
     return;
   }
 
-  const submission = queue().submit({
-    job_id: prepared.job_id,
-    source: 'local',
-    printer: prepared.printer,
-    payload: prepared.payload,
-    copies: prepared.copies,
-    ttl_s: prepared.ttl_s,
-  });
+  let submission: ReturnType<ReturnType<typeof queue>['submit']>;
+  try {
+    submission = queue().submit({
+      job_id: prepared.job_id,
+      source: 'local',
+      printer: prepared.printer,
+      payload: prepared.payload,
+      copies: prepared.copies,
+      ttl_s: prepared.ttl_s,
+      // 202 below means "this will survive a crash". If the spool cannot be written, say so
+      // rather than accept a job that a restart would silently lose.
+      requireDurable: true,
+    });
+  } catch (err) {
+    if (err instanceof SpoolWriteError) {
+      // Nothing was queued and nothing was sent, so the caller keeps the job and may retry.
+      log.error(`jobs: refused ${prepared.job_id ?? 'a job'} — the spool is not writable (${err.message})`, {
+        event: 'jobs.spool_unwritable', job_id: prepared.job_id, err,
+      });
+      answer(507, {
+        ok: false,
+        reason: 'spool-write-failed',
+        printed_certainty: 'none',
+        detail: 'this computer could not store the job (disk full or read-only?)',
+      });
+      return;
+    }
+    throw err;
+  }
 
   // 202: accepted, not printed. A caller that needs the outcome polls `GET /jobs/:id`, or uses the
   // synchronous `/print` route instead.
@@ -799,7 +821,9 @@ async function handleIdentify(res: ServerResponse, printerId: string): Promise<v
 }
 
 function handlePutPrinters(res: ServerResponse, body: unknown): void {
-  const { registry, errors } = parseRegistry(body);
+  // Strict about the serial device: this is the network-facing way in, and an unvalidated path
+  // here is what let a request name any file for a print job to overwrite.
+  const { registry, errors } = parseRegistry(body, { strictDevice: true });
   if (errors.length > 0) {
     // Every problem at once. A registry is edited whole, so reporting the first mistake only turns
     // one round trip into four.
@@ -981,9 +1005,19 @@ export function createBridgeServer(): Server {
       path === '/pairing' || path === '/pairing/restart' || path === '/pairing/handoff';
     const openToAnyone =
       path === '/health' || path === '/enroll' || isPairingPath || isPageRequest;
-    if ((path === '/enroll' || isPairingPath) && method !== 'OPTIONS' && !isLoopbackRequest(req)) {
-      sendJson(res, 403, { ok: false, reason: 'not-loopback' });
-      return;
+    if ((path === '/enroll' || isPairingPath) && method !== 'OPTIONS') {
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, reason: 'not-loopback' });
+        return;
+      }
+      const refused = gatePairingRequest(req);
+      if (refused) {
+        log.warn(`pairing: refused ${method} ${path} (${refused.reason})`, {
+          event: 'pairing.refused', reason: refused.reason, origin: req.headers.origin, host: req.headers.host,
+        });
+        sendJson(res, refused.status, { ok: false, reason: refused.reason });
+        return;
+      }
     }
 
     /*
