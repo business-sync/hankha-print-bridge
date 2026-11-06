@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { stateDir } from './identity.js';
 import { prepareLan } from './jobs.js';
 import { LanAuth, type AuthOk } from './lan-auth.js';
-import { LanKeyStore, setActiveLanKeys } from './lan-keys.js';
+import { BOOTSTRAP_KEYS, LanKeyStore, parseConfiguredBootstrap, setActiveLanKeys, type LanKeyEntry } from './lan-keys.js';
 import { log, LogGate } from './log.js';
 import { DEDUPE_KEY, SpoolWriteError, type JobRecord, type PrintQueue } from './queue.js';
 import type { PrinterReach } from './keepwarm.js';
@@ -46,6 +46,12 @@ export interface LanConfig {
    * and the two pairing routes then do not exist.
    */
   pairing_over_lan?: true;
+  /**
+   * `"bootstrap_keys": [{kid, pubkey, not_before?, not_after?}]` in lan.json: backend ticket keys
+   * this Bridge trusts from the first start, so one that has never been online can verify a
+   * pairing grant. Validated like key-set entries; absent when none are usable.
+   */
+  bootstrap_keys?: LanKeyEntry[];
 }
 
 /**
@@ -84,7 +90,23 @@ export function readLanConfig(dir: string = stateDir(), mainPort?: number): LanC
     return null;
   }
   const pairing = (raw as { pairing_over_lan?: unknown }).pairing_over_lan === true;
-  return { port, host: host.trim(), ...(pairing ? { pairing_over_lan: true as const } : {}) };
+  const boot = parseConfiguredBootstrap((raw as { bootstrap_keys?: unknown }).bootstrap_keys);
+  if (boot.testKeyRefused) {
+    log.error(`lan: ${LAN_CONFIG_FILE} bootstrap_keys names the published TEST key from lan-vectors.json — REFUSED: its private half is public, so trusting it would let anyone mint tickets and pairing grants`, {
+      event: 'lan.bootstrap.test_key_refused', expected: false,
+    });
+  }
+  if (boot.rejected.length > 0) {
+    log.warn(`lan: ${boot.rejected.length} bootstrap key(s) in ${LAN_CONFIG_FILE} were ignored: ${boot.rejected.join('; ')}`, {
+      event: 'lan.bootstrap.rejected', rejected: boot.rejected,
+    });
+  }
+  return {
+    port,
+    host: host.trim(),
+    ...(pairing ? { pairing_over_lan: true as const } : {}),
+    ...(boot.keys.length > 0 ? { bootstrap_keys: boot.keys } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------- job states on the wire
@@ -639,6 +661,11 @@ export interface LanReport {
   listen_error?: string;
   /** Present (true) only while lan.json turns pairing over the LAN on; see LAN_WIRE_CONTRACT.md section 9. */
   pairing_over_lan?: true;
+  /**
+   * A real backend trust anchor is pinned (built in or in lan.json `bootstrap_keys`). False means
+   * the Bridge verifies nothing until the backend delivers its key set. Additive; section 6.1.
+   */
+  bootstrap_pinned: boolean;
 }
 
 let current: { config: LanConfig; keys: LanKeyStore; listening: boolean; error?: string } | null = null;
@@ -653,6 +680,7 @@ export function lanReport(): LanReport | null {
     pubkey: current.keys.publicKey(),
     capabilities: activeLanPairing() ? ['print_lan_v1', 'pair_lan_v1'] : ['print_lan_v1'],
     key_ids: current.keys.kids(),
+    bootstrap_pinned: current.keys.bootstrapPinned(),
     listening: current.listening,
     host: current.config.host,
     ...(current.error ? { listen_error: current.error } : {}),
@@ -691,11 +719,18 @@ export function startLan(options: StartLanOptions): LanHandle | null {
   const config = options.config === undefined ? readLanConfig(dir, options.mainPort) : options.config;
   if (!config) return null;
 
-  const keys = new LanKeyStore(dir);
+  const keys = new LanKeyStore(dir, [...BOOTSTRAP_KEYS, ...(config.bootstrap_keys ?? [])]);
   keys.publicKey(); // create the Bridge's key now, so the first heartbeat can report it
   setActiveLanKeys(keys);
   const auth = new LanAuth({ keys, bridgeId: options.bridgeId, now: options.now });
   let pairing: LanPairing | null = null;
+  if (config.pairing_over_lan && !keys.bootstrapPinned()) {
+    // Not an error (a Bridge that was online has been given its keys), but for a router that never
+    // has internet this is the line that explains why every grant is refused as `grant_unknown_kid`.
+    log.warn('lan: LAN pairing cannot verify any grant until a bootstrap key is configured (lan.json "bootstrap_keys"; see scripts/gen-lan-signing-key.mjs). Only keys the backend has already delivered count.', {
+      event: 'lan.pair.no_bootstrap_key', delivered_keys: keys.kids().length - BOOTSTRAP_KEYS.length,
+    });
+  }
   if (config.pairing_over_lan) {
     if (options.pairingDeps) {
       pairing = new LanPairing({
@@ -726,6 +761,12 @@ export function startLan(options: StartLanOptions): LanHandle | null {
     server.listen(config.port, config.host);
   };
   server.on('listening', () => {
+    // `listen` resolves the host asynchronously, so a `stop()` that arrives first finds nothing to
+    // close and would leave the port bound for the life of the process.
+    if (stopped) {
+      server.close();
+      return;
+    }
     if (!current) return;
     current.listening = true;
     delete current.error;

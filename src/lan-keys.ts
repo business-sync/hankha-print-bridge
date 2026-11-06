@@ -73,6 +73,60 @@ export const BOOTSTRAP_KEYS: readonly LanKeyEntry[] = [
 const KID = /^[A-Za-z0-9._:-]{1,64}$/;
 const MAX_KEYS = 16;
 
+/** The public half of the placeholder above. A Bridge pinning only this one verifies nothing. */
+export const PLACEHOLDER_PUBKEY = 'MCowBQYDK2VwAyEAwfDr56-VFRF-9AZHUchksUzqEjUySSGh34hYGPTboUs';
+
+/**
+ * The most keys `lan.json` may pin (`bootstrap_keys`). A venue pins the current key and, during a
+ * rotation, the next one; more than that is a mistake or an attempt to widen trust.
+ */
+export const MAX_CONFIGURED_BOOTSTRAP = 4;
+
+/**
+ * Ed25519 public keys whose PRIVATE half is published in `lan-vectors.json` (the backend ticket key
+ * and the Bridge acknowledgement key of the test vectors). Anyone can sign with them, so a Bridge
+ * must never pin one as a trust anchor. A test checks this list against the vectors file.
+ */
+export const PUBLISHED_TEST_PUBKEYS: readonly string[] = [
+  'MCowBQYDK2VwAyEAdb3yFqZCDLImgXavPZidUFSZehvfUpSUwBTycZbbYoc', // vec-backend-1
+  'MCowBQYDK2VwAyEAtTO8e0yK6EbgrgbxLF1OIpTZghYAPXJ5n_wNOpvP4lQ', // vector Bridge key
+];
+
+/**
+ * Validate the `bootstrap_keys` an operator wrote in `lan.json`.
+ *
+ * Each entry is validated exactly like a key-set entry. A malformed one is dropped and described in
+ * `rejected` (the rest still count); the published test-vector keys are refused by public key; a
+ * repeated or placeholder `kid` is refused; only the first {@link MAX_CONFIGURED_BOOTSTRAP} are read.
+ * `testKeyRefused` is set when a published key was offered, so the caller can say so loudly.
+ */
+export function parseConfiguredBootstrap(raw: unknown): { keys: LanKeyEntry[]; rejected: string[]; testKeyRefused: boolean } {
+  const keys: LanKeyEntry[] = [];
+  const rejected: string[] = [];
+  let testKeyRefused = false;
+  if (raw === undefined) return { keys, rejected, testKeyRefused };
+  if (!Array.isArray(raw)) return { keys, rejected: ['bootstrap_keys must be an array'], testKeyRefused };
+  const taken = new Set(BOOTSTRAP_KEYS.map((k) => k.kid));
+  for (const item of raw.slice(0, MAX_CONFIGURED_BOOTSTRAP)) {
+    const entry = parseKeyEntry(item);
+    if (typeof entry === 'string') {
+      rejected.push(entry);
+    } else if (PUBLISHED_TEST_PUBKEYS.includes(entry.pubkey)) {
+      testKeyRefused = true;
+      rejected.push(`key ${entry.kid}: this is the published TEST key (its private half is public in lan-vectors.json); it is never trusted`);
+    } else if (entry.pubkey === PLACEHOLDER_PUBKEY) {
+      rejected.push(`key ${entry.kid}: this is the build's placeholder key, which nobody can sign with`);
+    } else if (taken.has(entry.kid)) {
+      rejected.push(`key ${entry.kid}: the kid is listed twice or belongs to a key pinned in this build`);
+    } else {
+      taken.add(entry.kid);
+      keys.push(entry);
+    }
+  }
+  if (raw.length > MAX_CONFIGURED_BOOTSTRAP) rejected.push(`only the first ${MAX_CONFIGURED_BOOTSTRAP} bootstrap keys are read`);
+  return { keys, rejected, testKeyRefused };
+}
+
 function publicKeyOf(spki: string): KeyObject | null {
   const der = fromB64u(spki, 512);
   if (!der) return null;
@@ -260,6 +314,15 @@ export class LanKeyStore {
       });
     }
     return { accepted: keys.length, rejected, changed };
+  }
+
+  /**
+   * Whether a REAL trust anchor is pinned (built in or configured in `lan.json`), as opposed to the
+   * placeholder nobody can sign with. Without one, a Bridge that has never been online cannot
+   * verify a pairing grant, and a ticket only after the backend has delivered its key.
+   */
+  bootstrapPinned(): boolean {
+    return this.bootstrap.some((k) => k.pubkey !== PLACEHOLDER_PUBKEY);
   }
 
   /** Every key this Bridge would verify with: the pinned ones, then the delivered ones. */
