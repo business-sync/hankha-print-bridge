@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { localInterfaces } from './lan.js';
 import { discoverAll } from './discovery.js';
@@ -15,7 +16,7 @@ import { defaultPrinter, findPrinter, loadRegistry, registryPath } from './regis
 import { render } from './render/index.js';
 import { resolveSample, sampleFor } from './samples.js';
 import { createBridgeServer, isTlsEnabled, parseTestPrintBody } from './server.js';
-import { loadState, stateDir, statePath } from './identity.js';
+import { loadState, saveState, stateDir, statePath } from './identity.js';
 import { warmTlsTrustStore } from './tls-warmup.js';
 import { driverFor } from './transports/index.js';
 import { BRIDGE_SERVICE, BRIDGE_VERSION, RUNTIME } from './version.js';
@@ -384,6 +385,14 @@ function runService(): void {
      * A failure to start it is logged and survived; the Bridge's job is to print.
      */
     try {
+      /*
+       * An unpaired Bridge has no relay.json, and `loadState()` invents a NEW install id on every
+       * call that finds none. The cache below re-reads every 2 s, so `hello` told a terminal a
+       * different identity every couple of seconds, and a different one again from `pair-info`
+       * (which saves its own). Save the first one now so every answer, and every restart, agrees.
+       * Only when the LAN API is on: nothing else reads the id before enrolment, which overwrites it.
+       */
+      if (!existsSync(statePath())) saveState(loadState());
       let idCache: { at: number; id: string | null; install: string } | null = null;
       const identity = () => {
         // relay.json is a file read; a request must not pay for one each time.
