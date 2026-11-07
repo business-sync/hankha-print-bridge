@@ -28,6 +28,7 @@ import { mock } from 'node:test';
 import { PrintQueue, queue as globalQueue, type QueueOptions } from '../queue.js';
 import { networkTransport } from '../transports/index.js';
 import { resetRegistryCache, type PrinterRecord } from '../registry.js';
+import { httpsFetcher } from './https-fetch.js';
 
 const b64u = (b: Buffer | Uint8Array | string) => Buffer.from(b).toString('base64url');
 
@@ -157,10 +158,14 @@ export class TestTerminal {
   private nonce: string | null = null;
   private counter = 0;
 
-  constructor(private readonly base: () => string) {}
+  /**
+   * `fetcher` lets a test reach an https listener with its own trust: the global `fetch` only
+   * trusts the system store.
+   */
+  constructor(private readonly base: () => string, private readonly fetcher: typeof fetch = fetch) {}
 
   async hello(): Promise<any> {
-    const res = await fetch(`${this.base()}/lan/v1/hello`);
+    const res = await this.fetcher(`${this.base()}/lan/v1/hello`);
     const json = (await res.json()) as any;
     this.nonce = json.nonce;
     this.counter = 0;
@@ -188,7 +193,7 @@ export class TestTerminal {
       headers['x-hankha-signature'] =
         o.signature ?? this.signature(o.signedMethod ?? method, o.signedPath ?? path, signed, nonceHeader ?? '');
     }
-    const res = await fetch(`${this.base()}${path}`, { method, headers, ...(sent !== '' ? { body: sent } : {}) });
+    const res = await this.fetcher(`${this.base()}${path}`, { method, headers, ...(sent !== '' ? { body: sent } : {}) });
     const text = await res.text();
     let json: any = null;
     try {
@@ -245,6 +250,8 @@ export interface HarnessOptions {
   limiterNow?: () => number;
   /** Listen here instead of 127.0.0.1 (a test that needs a second remote address). */
   host?: string;
+  /** Serve https with this certificate and key. The harness's `terminal` then trusts `ca`. */
+  tls?: { cert: Buffer; key: Buffer; ca: Buffer };
   bridgeId?: string | null;
   dir?: string;
 }
@@ -266,8 +273,11 @@ export class LanHarness {
   private transportMock: { mock: { restore(): void } } | null = null;
   private queueOptions: QueueOptions = {};
 
+  /** Set when the listener serves https: what a client must trust to reach it. */
+  ca: Buffer | null = null;
+
   get base(): string {
-    return `http://127.0.0.1:${this.port}`;
+    return `${this.ca ? 'https' : 'http'}://127.0.0.1:${this.port}`;
   }
 
   static async start(opts: HarnessOptions = {}): Promise<LanHarness> {
@@ -327,11 +337,13 @@ export class LanHarness {
       helloPerMinute: opts.helloPerMinute,
       ...(opts.failuresPerMinute !== undefined ? { failuresPerMinute: opts.failuresPerMinute } : {}),
       ...(opts.limiterNow ? { now: opts.limiterNow } : {}),
+      ...(opts.tls ? { tls: { cert: opts.tls.cert, key: opts.tls.key } } : {}),
     });
+    this.ca = opts.tls?.ca ?? null;
     await new Promise<void>((resolve) => this.server.listen(0, opts.host ?? '127.0.0.1', resolve));
     this.port = (this.server.address() as { port: number }).port;
 
-    this.terminal = new TestTerminal(() => this.base);
+    this.terminal = new TestTerminal(() => this.base, this.ca ? httpsFetcher(this.ca) : fetch);
     this.terminal.ticket = this.ticketFor(this.terminal);
   }
 

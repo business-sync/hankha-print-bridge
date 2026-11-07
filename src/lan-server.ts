@@ -12,12 +12,14 @@
  * writes no file.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { stateDir } from './identity.js';
 import { prepareLan } from './jobs.js';
 import { LanAuth, type AuthOk } from './lan-auth.js';
 import { FailureLimiter, normalizeRemote } from './lan-ratelimit.js';
+import { loadLanTls, parseTlsConfig, type LanTlsMaterial } from './lan-tls.js';
 import { BOOTSTRAP_KEYS, LanKeyStore, parseConfiguredBootstrap, setActiveLanKeys, type LanKeyEntry } from './lan-keys.js';
 import { log, LogGate } from './log.js';
 import { DEDUPE_KEY, SpoolWriteError, type JobRecord, type PrintQueue } from './queue.js';
@@ -53,7 +55,16 @@ export interface LanConfig {
    * pairing grant. Validated like key-set entries; absent when none are usable.
    */
   bootstrap_keys?: LanKeyEntry[];
+  /**
+   * `"tls": {"cert_path", "key_path"}` in lan.json: serve HTTPS on the LAN port instead of http
+   * (`lan-tls.ts`). Present only when configured AND loadable; a configured-but-broken `tls` turns
+   * the whole LAN API off rather than falling back to plain http.
+   */
+  tls?: LanTlsMaterial;
 }
+
+/** The LAN listener is http, or https when TLS is configured. */
+export type LanHttpServer = Server | HttpsServer;
 
 /**
  * Read `<stateDir>/lan.json`: `{ "enabled": true, "port"?: 9201, "host"?: "0.0.0.0" }`.
@@ -102,11 +113,26 @@ export function readLanConfig(dir: string = stateDir(), mainPort?: number): LanC
       event: 'lan.bootstrap.rejected', rejected: boot.rejected,
     });
   }
+  let tls: LanTlsMaterial | undefined;
+  const tlsCfg = parseTlsConfig((raw as { tls?: unknown }).tls);
+  if (tlsCfg !== null) {
+    // Configured, so it must work: no fallback to http on a port the operator asked to be https.
+    const loaded = 'error' in tlsCfg ? ({ ok: false, reason: tlsCfg.error } as const) : loadLanTls(tlsCfg, dir);
+    if (!loaded.ok) {
+      log.error(`lan: ${LAN_CONFIG_FILE} asks for TLS but it cannot be used (${loaded.reason}) — the LAN print API stays OFF rather than serve plain http`, {
+        event: 'lan.tls.unusable', reason: loaded.reason, expected: false,
+      });
+      return null;
+    }
+    for (const w of loaded.tls.warnings) log.warn(`lan: TLS certificate: ${w}`, { event: 'lan.tls.warning', warning: w });
+    tls = loaded.tls;
+  }
   return {
     port,
     host: host.trim(),
     ...(pairing ? { pairing_over_lan: true as const } : {}),
     ...(boot.keys.length > 0 ? { bootstrap_keys: boot.keys } : {}),
+    ...(tls ? { tls } : {}),
   };
 }
 
@@ -201,6 +227,8 @@ export interface LanServerDeps {
   failuresPerMinute?: number;
   /** The clock the failure limiter reads; tests inject one. */
   now?: () => number;
+  /** Serve HTTPS with this certificate and key instead of http. `hello` then says `scheme:"https"`. */
+  tls?: { cert: Buffer; key: Buffer };
 }
 
 interface Reply {
@@ -376,7 +404,7 @@ function validateJobBody(value: unknown): { ok: true; body: JobBody } | { ok: fa
   };
 }
 
-export function createLanServer(deps: LanServerDeps): Server {
+export function createLanServer(deps: LanServerDeps): LanHttpServer {
   const helloLimit = deps.helloPerMinute ?? 120;
   const helloCalls = new Map<string, { windowStart: number; count: number }>();
 
@@ -559,6 +587,8 @@ export function createLanServer(deps: LanServerDeps): Server {
         relay: { connected: deps.relayConnected() },
         nonce: deps.auth.issueNonce(),
         max_body_bytes: MAX_BODY_BYTES,
+        // Only when TLS is on, so a Bridge without it answers byte-for-byte as before.
+        ...(deps.tls ? { scheme: 'https' } : {}),
       });
     }
 
@@ -626,7 +656,7 @@ export function createLanServer(deps: LanServerDeps): Server {
     }
   }
 
-  const server = createServer((req, res) => {
+  const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
     cors(res);
     const target = req.url ?? '';
     // A request target is a path. Anything else (an absolute-form URL, `*`, empty) is not ours.
@@ -670,7 +700,26 @@ export function createLanServer(deps: LanServerDeps): Server {
         if (!res.headersSent) send(res, reject(500, 'internal_error'));
         else res.end();
       });
-  });
+  };
+
+  // One listener, one scheme: with TLS configured there is no plain-http server on this port at all.
+  const server: LanHttpServer = deps.tls
+    ? createHttpsServer({ cert: deps.tls.cert, key: deps.tls.key, minVersion: 'TLSv1.2', handshakeTimeout: 10_000 }, onRequest)
+    : createServer(onRequest);
+  if (deps.tls) {
+    // A client that speaks plain HTTP to the TLS port (or any garbage) gets its connection dropped,
+    // never an answer. Node already destroys such sockets; the handler makes that explicit and quiet.
+    const tlsGate = new LogGate(10 * 60_000);
+    (server as HttpsServer).on('tlsClientError', (err, socket) => {
+      const pass = tlsGate.hit('lan.tls.client_error');
+      if (pass) {
+        log.debug('lan: dropped a connection that failed the TLS handshake', {
+          event: 'lan.tls.client_error', code: (err as NodeJS.ErrnoException).code, remote: socket.remoteAddress, repeated: pass.repeated || undefined,
+        });
+      }
+      socket.destroy();
+    });
+  }
 
   // A slow or stalled client must not hold a connection (or a nonce's worth of attention) forever.
   server.headersTimeout = 10_000;
@@ -699,6 +748,10 @@ export interface LanReport {
   listen_error?: string;
   /** Present (true) only while lan.json turns pairing over the LAN on; see LAN_WIRE_CONTRACT.md section 9. */
   pairing_over_lan?: true;
+  /** Present (`"https"`) only while the listener serves TLS. Absent means plain http. */
+  scheme?: 'https';
+  /** When the served certificate expires (ISO), present with `scheme`. Public information. */
+  tls_valid_to?: string;
   /**
    * A real backend trust anchor is pinned (built in or in lan.json `bootstrap_keys`). False means
    * the Bridge verifies nothing until the backend delivers its key set. Additive; section 6.1.
@@ -719,6 +772,7 @@ export function lanReport(): LanReport | null {
     capabilities: activeLanPairing() ? ['print_lan_v1', 'pair_lan_v1'] : ['print_lan_v1'],
     key_ids: current.keys.kids(),
     bootstrap_pinned: current.keys.bootstrapPinned(),
+    ...(current.config.tls ? { scheme: 'https' as const, tls_valid_to: new Date(current.config.tls.info.valid_to).toISOString() } : {}),
     listening: current.listening,
     host: current.config.host,
     ...(current.error ? { listen_error: current.error } : {}),
@@ -727,7 +781,7 @@ export function lanReport(): LanReport | null {
 }
 
 export interface LanHandle {
-  server: Server;
+  server: LanHttpServer;
   config: LanConfig;
   auth: LanAuth;
   keys: LanKeyStore;
@@ -789,7 +843,7 @@ export function startLan(options: StartLanOptions): LanHandle | null {
       log.warn('lan: pairing_over_lan is set but this build did not wire it — pairing over the LAN stays OFF', { event: 'lan.pair.unwired' });
     }
   }
-  const server = createLanServer({ ...options, auth, pairing: () => pairing });
+  const server = createLanServer({ ...options, auth, pairing: () => pairing, ...(config.tls ? { tls: { cert: config.tls.cert, key: config.tls.key } } : {}) });
   current = { config, keys, listening: false };
 
   let stopped = false;
@@ -808,8 +862,8 @@ export function startLan(options: StartLanOptions): LanHandle | null {
     if (!current) return;
     current.listening = true;
     delete current.error;
-    log.info(`lan: print API listening on ${config.host}:${config.port}`, {
-      event: 'lan.listening', host: config.host, port: config.port,
+    log.info(`lan: print API listening on ${config.host}:${config.port}${config.tls ? ` over HTTPS (certificate ${config.tls.info.subject}, valid until ${config.tls.info.valid_to})` : ''}`, {
+      event: 'lan.listening', host: config.host, port: config.port, scheme: config.tls ? 'https' : 'http',
     });
   });
   server.on('error', (err: NodeJS.ErrnoException) => {
