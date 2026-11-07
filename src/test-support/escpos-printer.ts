@@ -39,11 +39,12 @@ export class EscposFakePrinter {
   private server: Server | null = null;
   private readonly sockets = new Set<Socket>();
 
-  async start(port = 0): Promise<this> {
+  /** `host` defaults to loopback; a test that needs the Bridge to dial it as a LAN printer passes a private address. */
+  async start(port = 0, host = '127.0.0.1'): Promise<this> {
     await new Promise<void>((resolve, reject) => {
       const server = createServer((socket) => this.onConnection(socket));
       server.once('error', reject);
-      server.listen(port, '127.0.0.1', () => {
+      server.listen(port, host, () => {
         this.server = server;
         this.port = (server.address() as { port: number }).port;
         resolve();

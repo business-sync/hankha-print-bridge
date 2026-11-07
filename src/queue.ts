@@ -942,9 +942,12 @@ export class PrintQueue {
     }
 
     if (outcome.ok) {
-      job.status = 'done';
+      // Still `printing` while the readback runs (it can hold the lane for a second or more): a
+      // terminal asking now must hear "sending", not "bytes_written" and then, a moment later,
+      // "confirmed" or a printer fault. `done` is set only once the verdict is in.
       job.result = { ok: true, duration_ms: outcome.duration_ms };
       await this.applyReadback(job);
+      if (job.result.ok) job.status = 'done';
       if (job.result.ok) this.lastOk.set(job.printer.id, new Date().toISOString());
       // The extra connections are the evidence of a printer that was slow to wake.
       const woke = outcome.connect_attempts

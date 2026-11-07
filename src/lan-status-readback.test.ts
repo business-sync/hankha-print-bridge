@@ -125,3 +125,58 @@ describe('LAN API with status readback', () => {
     assert.equal(status.statusConnections, before);
   });
 });
+
+describe('while the readback is still running the job is not yet bytes_written', () => {
+  let h: LanHarness;
+  let release: ((fault: 'none' | 'paper_out') => void) | null = null;
+  let reading: Promise<void> | null = null;
+  let enteredReader: (() => void) | null = null;
+
+  before(async () => {
+    h = await LanHarness.start({
+      printers: [{ ...RECEIPT_PRINTER, status_readback: true }, KITCHEN_PRINTER],
+      queue: {
+        // A reader that answers only when the test lets it, so the window between "bytes written" and
+        // "verdict" is as long as the test wants.
+        readStatus: async () => {
+          enteredReader?.();
+          const fault = await new Promise<'none' | 'paper_out'>((resolve) => { release = resolve; });
+          return {
+            answered: true, dle_eot: true, gs_r: true, online: true, cover_open: false,
+            paper_end: fault === 'paper_out', paper_near_end: false, error: false, took_ms: 1,
+          };
+        },
+      },
+    });
+  });
+  after(async () => {
+    await h.stop();
+  });
+
+  const state = async (key: string) => (await h.terminal.call('POST', '/lan/v1/jobs/status', { keys: [key] })).json.jobs[0];
+  const readerEntered = () => new Promise<void>((resolve) => { enteredReader = resolve; });
+
+  it('a healthy verdict: sending until the verdict, then confirmed; never bytes_written in between', async () => {
+    reading = readerEntered();
+    await h.terminal.call('POST', '/lan/v1/jobs', jobBody('readback-window-01'));
+    await reading;
+    const during = await state('readback-window-01');
+    assert.equal(during.state, 'sending', JSON.stringify(during));
+    assert.equal(during.certainty, 'unknown');
+    release?.('none');
+    await h.idle();
+    assert.equal((await state('readback-window-01')).state, 'confirmed');
+  });
+
+  it('a paper-out verdict: sending, then unknown; it never shows bytes_written first', async () => {
+    reading = readerEntered();
+    await h.terminal.call('POST', '/lan/v1/jobs', jobBody('readback-window-02', 'WINDOW-SLIP-2'));
+    await reading;
+    assert.equal((await state('readback-window-02')).state, 'sending');
+    release?.('paper_out');
+    await h.idle();
+    const after = await state('readback-window-02');
+    assert.equal(after.state, 'unknown');
+    assert.equal(after.readback.fault, 'paper_out');
+  });
+});
