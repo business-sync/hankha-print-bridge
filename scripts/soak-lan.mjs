@@ -63,7 +63,7 @@ const VECTORS = join(REPO, 'src', 'test-support', 'lan-vectors.json');
 // ---------------------------------------------------------------------- arguments
 
 function parseArgs(argv) {
-  const o = { minutes: 10, rate: 2, out: null, keep: false, report: null, chaos: true, ip: null, seed: Date.now() };
+  const o = { minutes: 10, rate: 2, out: null, keep: false, report: null, chaos: true, ip: null, bin: null, seed: Date.now() };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -74,8 +74,9 @@ function parseArgs(argv) {
     else if (a === '--report') o.report = next();
     else if (a === '--no-chaos') o.chaos = false;
     else if (a === '--ip') o.ip = next();
+    else if (a === '--bridge-bin') o.bin = next();
     else if (a === '--help' || a === '-h') {
-      console.log('usage: soak-lan.mjs [--minutes 10] [--rate 2 (jobs/s)] [--out <dir>] [--keep] [--report <file>] [--no-chaos] [--ip <private ipv4>]');
+      console.log('usage: soak-lan.mjs [--minutes 10] [--rate 2 (jobs/s)] [--out <dir>] [--keep] [--report <file>] [--no-chaos] [--ip <private ipv4>] [--bridge-bin <compiled binary>]');
       process.exit(0);
     } else throw new Error(`unknown argument ${a}`);
   }
@@ -262,7 +263,10 @@ const bridgeLog = createWriteStream(bridgeLogPath, { flags: 'a' });
 const bridge = { child: null, pid: null, epoch: 0, starts: 0, up: false };
 
 async function startBridge() {
-  const child = spawn(process.execPath, ['--import', 'tsx', join(REPO, 'src', 'index.ts')], {
+  // `--bridge-bin` drives a COMPILED build (dist-bin/hankha-print-bridge) instead of the TypeScript source,
+  // so a release artifact can be soaked as shipped.
+  const [cmd, cmdArgs] = opts.bin ? [resolve(opts.bin), []] : [process.execPath, ['--import', 'tsx', join(REPO, 'src', 'index.ts')]];
+  const child = spawn(cmd, cmdArgs, {
     cwd: REPO,
     env: {
       ...process.env,
