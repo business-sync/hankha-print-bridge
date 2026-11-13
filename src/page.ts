@@ -57,12 +57,13 @@ export const INDEX_CSP =
   "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; " +
   "img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'";
 
-/** The icon the installers ship, redrawn small enough to inline. Saves a request and a 404. */
+/** The hankha Print icon the installers ship (Mist tile, Ink Doorway mark), inlined: saves a request and a 404. */
 const FAVICON =
-  'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiNFQzZDMTgiLz48cGF0aCBkPSJNMjMgMTFoMTh2MTRIMjN6IiBmaWxsPSIjZmZmIi8+PHJlY3QgeD0iMTQiIHk9IjI1IiB3aWR0aD0iMzYiIGhlaWdodD0iMjAiIHJ4PSI1IiBmaWxsPSIjZmZmIi8+PHJlY3QgeD0iMjIiIHk9IjMwIiB3aWR0aD0iMjAiIGhlaWdodD0iNCIgcng9IjIiIGZpbGw9IiNERjU2MEIiLz48Y2lyY2xlIGN4PSI0MiIgY3k9IjM5IiByPSIyLjUiIGZpbGw9IiNERjU2MEIiLz48cGF0aCBkPSJNMjIgNTMuNWExNCAxNCAwIDAgMSAyMCAwIiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iNSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PGNpcmNsZSBjeD0iMzIiIGN5PSI1OCIgcj0iMy4yIiBmaWxsPSIjZmZmIi8+PC9zdmc+';
+  'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0Ij48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNC4zMiIgZmlsbD0iI0Y0RjRGNCIvPjxyZWN0IHg9IjIiIHk9IjIiIHdpZHRoPSI2MCIgaGVpZ2h0PSI2MCIgcng9IjEyLjMyIiBmaWxsPSJub25lIiBzdHJva2U9IiNFNUU1RTUiIHN0cm9rZS13aWR0aD0iNCIvPjxwYXRoIGZpbGw9IiMxNDE0MTQiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDExLjUyIDEwLjc1KSBzY2FsZSgwLjE2MDAwKSIgZD0iTTM2LDIwIEg3OCBBMTYgMTYgMCAwIDEgOTQsMzYgVjc2IEE4IDggMCAwIDAgMTAyLDg0IEgxNTQgQTggOCAwIDAgMCAxNjIsNzYgVjM2IEExNiAxNiAwIDAgMSAxNzgsMjAgSDIyMCBBMTYgMTYgMCAwIDEgMjM2LDM2IFYyMjAgQTE2IDE2IDAgMCAxIDIyMCwyMzYgSDE3OCBBMTYgMTYgMCAwIDEgMTYyLDIyMCBWMTYyIEEzNCAzNCAwIDAgMCA5NCwxNjIgVjIyMCBBMTYgMTYgMCAwIDEgNzgsMjM2IEgzNiBBMTYgMTYgMCAwIDEgMjAsMjIwIFYzNiBBMTYgMTYgMCAwIDEgMzYsMjBaIi8+PC9zdmc+';
 
 /*
- * Palette sampled from the installer's own app icon (#F88229 → #DF560B), so the page and the thing
+ * Palette first sampled from the old installer icon (#F88229 → #DF560B); the icon is now the hankha
+ * Print tile, and the accent stays the brand orange family. Originally chosen so the page and the thing
  * in the Applications folder are recognisably one product.
  *
  * Both schemes are defined in full rather than as a dark-mode patch: a till screen is as often a
@@ -2259,15 +2260,7 @@ export const INDEX_HTML = `<!doctype html>
 
   <header class="top">
     <div class="brand">
-      <svg viewBox="0 0 64 64" aria-hidden="true">
-        <rect width="64" height="64" rx="14" fill="#EC6C18"/>
-        <path d="M23 11h18v14H23z" fill="#fff"/>
-        <rect x="14" y="25" width="36" height="20" rx="5" fill="#fff"/>
-        <rect x="22" y="30" width="20" height="4" rx="2" fill="#DF560B"/>
-        <circle cx="42" cy="39" r="2.5" fill="#DF560B"/>
-        <path d="M22 53.5a14 14 0 0 1 20 0" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
-        <circle cx="32" cy="58" r="3.2" fill="#fff"/>
-      </svg>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14.32" fill="#F4F4F4"/><rect x="2" y="2" width="60" height="60" rx="12.32" fill="none" stroke="#E5E5E5" stroke-width="4"/><path fill="#141414" transform="translate(11.52 10.75) scale(0.16000)" d="M36,20 H78 A16 16 0 0 1 94,36 V76 A8 8 0 0 0 102,84 H154 A8 8 0 0 0 162,76 V36 A16 16 0 0 1 178,20 H220 A16 16 0 0 1 236,36 V220 A16 16 0 0 1 220,236 H178 A16 16 0 0 1 162,220 V162 A34 34 0 0 0 94,162 V220 A16 16 0 0 1 78,236 H36 A16 16 0 0 1 20,220 V36 A16 16 0 0 1 36,20Z"/></svg>
       <div>
         <h1 class="title">Hankha Print Bridge</h1>
         <div class="sub" id="sub"></div>

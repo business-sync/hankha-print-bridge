@@ -196,7 +196,8 @@ function compile(target, outfile) {
       '--windows-publisher=Hankha',
       '--windows-description=Lets the POS terminal print to network printers',
       `--windows-version=${VERSION}.0`,
-      '--windows-copyright=Hankha'
+      '--windows-copyright=Hankha',
+      `--windows-icon=${join(INSTALLER, 'windows/app-icon.ico')}`
     );
   }
   run('bun', flags);
