@@ -51,6 +51,10 @@ VIAddVersionKey "LegalCopyright"  "${PUBLISHER}"
 !include "LogicLib.nsh"
 
 !define MUI_ABORTWARNING
+; The hankha Print icon (Mist tile, Ink Doorway mark) for the wizard and the uninstaller. Paths
+; are relative to this .nsi, which is where makensis runs from on the host and in the container.
+!define MUI_ICON   "app-icon.ico"
+!define MUI_UNICON "app-icon.ico"
 !define MUI_WELCOMEPAGE_TITLE "${APPNAME} ${VERSION}"
 !define MUI_WELCOMEPAGE_TEXT "This installs the small helper the POS terminal needs to print to a NETWORK receipt or kitchen printer. A browser cannot open a printer socket itself, so it asks this helper to do it.$\r$\n$\r$\nThe helper starts automatically whenever this computer boots, and the POS reaches it at http://127.0.0.1:${PORT}.$\r$\n$\r$\nInstall it on EVERY till that prints -- not on one shared computer. A POS page served over https is only allowed to talk to a helper on the same machine.$\r$\n$\r$\nAdministrator rights are required."
 
@@ -107,6 +111,9 @@ Section "Print Bridge (required)" SecCore
   File "${STAGE}\install.ps1"
   File "${STAGE}\uninstall.ps1"
   File "${STAGE}\status.ps1"
+  ; Its own file because the exe only carries an icon when it was compiled on Windows: the
+  ; shortcuts and Add/Remove Programs point here so a cross-built install shows it too.
+  File "app-icon.ico"
 
   CreateDirectory "$APPDATA\Hankha\PrintBridge\logs"
 
@@ -124,6 +131,7 @@ Section "Print Bridge (required)" SecCore
   WriteRegStr   HKLM "${REGKEY}" "DisplayName"     "${APPNAME}"
   WriteRegStr   HKLM "${REGKEY}" "DisplayVersion"  "${VERSION}"
   WriteRegStr   HKLM "${REGKEY}" "Publisher"       "${PUBLISHER}"
+  WriteRegStr   HKLM "${REGKEY}" "DisplayIcon"     "$INSTDIR\app-icon.ico"
   WriteRegStr   HKLM "${REGKEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr   HKLM "${REGKEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr   HKLM "${REGKEY}" "QuietUninstallString" '"$INSTDIR\Uninstall.exe" /S'
@@ -141,11 +149,11 @@ Section "Print Bridge (required)" SecCore
   ; whoever is diagnosing, which is a rarer and more technical errand.
   CreateShortcut "$SMPROGRAMS\Hankha\Print Bridge.lnk" \
     "$SYSDIR\rundll32.exe" "url.dll,FileProtocolHandler http://127.0.0.1:${PORT}/" \
-    "$INSTDIR\hankha-print-bridge.exe" 0
+    "$INSTDIR\app-icon.ico" 0
   CreateShortcut "$SMPROGRAMS\Hankha\Print Bridge status.lnk" \
     "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" \
     '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$INSTDIR\status.ps1"' \
-    "$INSTDIR\hankha-print-bridge.exe" 0
+    "$INSTDIR\app-icon.ico" 0
 SectionEnd
 
 Section /o "Serve other terminals on this network" SecLan
@@ -200,6 +208,7 @@ Section "Uninstall"
   Delete "$INSTDIR\install.ps1"
   Delete "$INSTDIR\uninstall.ps1"
   Delete "$INSTDIR\status.ps1"
+  Delete "$INSTDIR\app-icon.ico"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   RMDir "$PROGRAMFILES64\Hankha"
